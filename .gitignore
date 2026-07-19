@@ -1,0 +1,44 @@
+# =============================================================================
+# MarketMathics.ai — strict ignore rules (secrets, runtime state, artifacts)
+# =============================================================================
+
+# --- Secrets (never commit credentials) ---
+.env
+.env.*
+!.env.example
+*.pem
+
+# --- Runtime / crash-recovery state (local only) ---
+data/system_state.json
+
+# --- Generated performance & simulation exports ---
+reports/
+
+# --- Python bytecode & caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Build artifacts ---
+dist/
+build/
+*.egg-info/
+
+# --- IDE & OS noise ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log

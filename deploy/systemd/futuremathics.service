@@ -1,0 +1,32 @@
+[Unit]
+Description=FutureMathics MES Orchestrator (internal paper)
+After=network-online.target futuremathics_dashboard.service
+Wants=network-online.target futuremathics_dashboard.service
+Requires=futuremathics_dashboard.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONPATH=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONUNBUFFERED=1
+# Removed FM_IGNORE_MARKET_HOURS=1 to respect CME MES futures trading hours
+# Market hours: Sun 6PM ET - Fri 5PM ET (closed weekends)
+EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env
+ExecStartPre=/bin/sleep 5
+ExecStartPre=/home/ubuntu/FutureMathics.ai/.venv/bin/python /home/ubuntu/FutureMathics.ai/scripts/bootstrap_system_state.py
+ExecStart=/home/ubuntu/FutureMathics.ai/.venv/bin/python /home/ubuntu/FutureMathics.ai/scripts/run_daily_session.py
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=futuremathics
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,159 @@
+"""
+FutureMathics — shared configuration (MES micro E-mini S&P 500 futures).
+
+Mirrors MarketMathics risk architecture; instrument constants are futures-specific.
+"""
+
+from __future__ import annotations
+
+import os
+
+# Instrument — CME Micro E-mini S&P 500
+EXECUTION_SYMBOL = "MES"
+POINT_VALUE = 5.0  # USD per index point per contract
+TICK_SIZE = 0.25  # index points
+TICK_VALUE = POINT_VALUE * TICK_SIZE  # $1.25 per tick per contract
+
+# Capital baseline
+STARTING_NAV = 100_000.0
+HANDSHAKE_EQUITY_BASE = 100_000.0
+
+MAX_DAILY_LOSS_PCT = 0.02
+HARD_DAILY_STOP = 2_000.0
+FIXED_FRACTIONAL_RISK_PCT = 0.005
+MAX_CONCURRENT_RISK_PCT = 0.05
+PER_TRADE_RISK_MIN = 400.0
+PER_TRADE_RISK_MAX = 600.0
+
+# Paper forward-test — cap contract count (1% of $100k / $10 stop = 100 MES is not realistic)
+FORWARD_TEST_MAX_CONCURRENT_RISK_PCT = 0.05
+FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.005
+FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
+PAPER_MAX_MES_CONTRACTS = 3
+PAPER_MAX_OPEN_MES_POSITIONS = 1
+
+# Live — $1k affordable loss cap (when FORWARD_TEST_MODE=false)
+LIVE_RISK_NAV_CAP = 1_000.0
+LIVE_MAX_DAILY_LOSS = 1_000.0
+LIVE_MAX_CONCURRENT_RISK_PCT = 0.50
+LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.05
+
+DRAWDOWN_BRAKE_PCT = 0.10
+CAPITAL_DRAG_MULTIPLIER = 0.5
+RISK_BUDGET_TOLERANCE_PCT = 0.15
+SANDBOX_FALLBACK_RISK_BUDGET_TOLERANCE_PCT = 0.75
+
+LATENCY_CEILING_MS = 200.0
+SANDBOX_LATENCY_CEILING_MS = 600.0
+MAX_ALLOWED_SPREAD_TICKS = 2  # max bid/ask spread in ticks for entry
+
+# Strategy defaults
+DEFAULT_STOP_TICKS = 8  # 8 ticks = 2.0 points = $10/contract
+DEFAULT_TARGET_TICKS = 12  # 1.5:1 R:R (was 16 for 2:1) - easier to hit, better win rate
+VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (was 4) - more selective
+MIN_CONFIDENCE_THRESHOLD = 0.60  # Only take signals with 60%+ confidence
+MIN_SECONDS_BETWEEN_TRADES = 60  # Cooldown period to prevent overtrading
+
+FORWARD_TEST_MODE = True
+FORWARD_TEST_CYCLE_INTERVAL_S = 2.0
+FORWARD_TEST_RECONNECT_SLEEP_S = 60.0
+
+# CME MES Futures Market Hours (America/Chicago native, converted to ET for consistency)
+# Trading: Sunday 6:00 PM ET through Friday 5:00 PM ET
+# Daily maintenance break: 5:00 PM - 6:00 PM ET (Mon-Thu)
+# Weekend closure: Friday 5:00 PM ET - Sunday 6:00 PM ET
+FORWARD_TEST_MARKET_OPEN_HOUR = 18  # 6:00 PM ET (Sunday open)
+FORWARD_TEST_MARKET_OPEN_MINUTE = 0
+FORWARD_TEST_MARKET_CLOSE_HOUR = 17  # 5:00 PM ET (Friday close)
+FORWARD_TEST_MARKET_CLOSE_MINUTE = 0
+FORWARD_TEST_MAINTENANCE_START_HOUR = 17  # 5:00 PM ET (daily break start)
+FORWARD_TEST_MAINTENANCE_END_HOUR = 18     # 6:00 PM ET (daily break end)
+FORWARD_TEST_TIMEZONE = "America/New_York"
+
+# Simulated MES price anchor (updated from live feed when wired)
+WARMUP_MES_PRICE = 6200.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def forward_test_force_paper() -> bool:
+    return bool(FORWARD_TEST_MODE)
+
+
+def risk_mode_paper() -> bool:
+    return forward_test_force_paper()
+
+
+def effective_risk_nav(account_nav: float) -> float:
+    nav = max(float(account_nav or 0.0), 0.0)
+    if risk_mode_paper():
+        return nav
+    return min(nav, LIVE_RISK_NAV_CAP)
+
+
+def concurrent_risk_pct() -> float:
+    if risk_mode_paper():
+        return _env_float("FM_PAPER_MAX_CONCURRENT_RISK_PCT", FORWARD_TEST_MAX_CONCURRENT_RISK_PCT)
+    return _env_float("FM_LIVE_MAX_CONCURRENT_RISK_PCT", LIVE_MAX_CONCURRENT_RISK_PCT)
+
+
+def fixed_fractional_risk_pct() -> float:
+    if risk_mode_paper():
+        return _env_float("FM_PAPER_PER_TRADE_RISK_PCT", FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT)
+    return _env_float("FM_LIVE_PER_TRADE_RISK_PCT", LIVE_FIXED_FRACTIONAL_RISK_PCT)
+
+
+def concurrent_risk_cap(account_nav: float) -> float:
+    return round(effective_risk_nav(account_nav) * concurrent_risk_pct(), 2)
+
+
+def max_daily_loss_cap(account_nav: float) -> float:
+    enav = effective_risk_nav(account_nav)
+    if risk_mode_paper():
+        pct = _env_float("FM_PAPER_MAX_DAILY_LOSS_PCT", FORWARD_TEST_MAX_DAILY_LOSS_PCT)
+        return round(enav * pct, 2)
+    return min(round(enav * MAX_DAILY_LOSS_PCT, 2), LIVE_MAX_DAILY_LOSS)
+
+
+def latency_ceiling_ms(*, sandbox: bool = False) -> float:
+    return SANDBOX_LATENCY_CEILING_MS if sandbox else LATENCY_CEILING_MS
+
+
+def risk_budget_tolerance_pct(*, sandbox_fallback: bool = False) -> float:
+    return SANDBOX_FALLBACK_RISK_BUDGET_TOLERANCE_PCT if sandbox_fallback else RISK_BUDGET_TOLERANCE_PCT
+
+
+def paper_max_mes_contracts() -> int:
+    raw = os.getenv("FM_PAPER_MAX_MES_CONTRACTS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return PAPER_MAX_MES_CONTRACTS
+
+
+def paper_max_open_mes_positions() -> int:
+    raw = os.getenv("FM_PAPER_MAX_OPEN_MES_POSITIONS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return PAPER_MAX_OPEN_MES_POSITIONS
+
+
+def ticks_to_dollars(ticks: float, contracts: int = 1) -> float:
+    return round(ticks * TICK_VALUE * contracts, 2)
+
+
+def points_to_dollars(points: float, contracts: int = 1) -> float:
+    return round(points * POINT_VALUE * contracts, 2)

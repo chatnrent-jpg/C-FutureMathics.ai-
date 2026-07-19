@@ -1,0 +1,17 @@
+[Unit]
+Description=FutureMathics Cloudflare Tunnel (public HTTPS :8502)
+After=network-online.target futuremathics_dashboard.service
+Wants=network-online.target futuremathics_dashboard.service
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/cloudflared tunnel --url http://127.0.0.1:8502 --no-autoupdate
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=futuremathics_tunnel
+
+[Install]
+WantedBy=multi-user.target

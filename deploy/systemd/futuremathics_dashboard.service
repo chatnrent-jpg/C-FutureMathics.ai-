@@ -1,0 +1,28 @@
+[Unit]
+Description=FutureMathics Streamlit Dashboard (MES paper)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONPATH=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONUNBUFFERED=1
+Environment=FM_EXTERNAL_ORCHESTRATOR=1
+EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env
+ExecStartPre=/home/ubuntu/FutureMathics.ai/.venv/bin/python /home/ubuntu/FutureMathics.ai/scripts/bootstrap_system_state.py
+ExecStart=/home/ubuntu/FutureMathics.ai/.venv/bin/python -m streamlit run /home/ubuntu/FutureMathics.ai/scripts/sandbox_streamlit.py --server.port 8502 --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=futuremathics_dashboard
+
+[Install]
+WantedBy=multi-user.target
