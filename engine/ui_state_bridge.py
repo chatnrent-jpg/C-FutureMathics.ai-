@@ -24,11 +24,20 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
     open_risk = pm.total_open_risk()
     margin_pct = round((open_risk / max_conc) * 100, 1) if max_conc else 0.0
     hard_stop = max_daily_loss_cap(nav)
+    
+    # Detect data source
+    broker = orchestrator.broker
+    data_source = "sim"
+    if hasattr(broker, "_using_alpaca") and broker._using_alpaca:
+        data_source = "alpaca_spy_proxy"
+    elif hasattr(broker, "_using_webull") and broker._using_webull:
+        data_source = "webull_mes"
 
     return {
         "version": 1,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "symbol": orchestrator.config.symbol,
+        "data_source": data_source,
         "session": {
             "realized_pnl_today": daily_pnl,
             "open_risk_notional": open_risk,
@@ -44,6 +53,7 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
             "as_of_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "symbol": orchestrator.config.symbol,
             "mode": "PAPER" if __import__("engine.config", fromlist=["forward_test_force_paper"]).forward_test_force_paper() else "LIVE",
+            "data_source": data_source,
             "daily_pnl": daily_pnl,
             "daily_pnl_pct": round((daily_pnl / risk.starting_nav) * 100, 2) if risk.starting_nav else 0.0,
             "account_nav": nav,

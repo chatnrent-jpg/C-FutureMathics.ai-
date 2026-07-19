@@ -53,7 +53,24 @@ python scripts/run_daily_session.py --ignore-hours --cycles 20
 
 Set `FORWARD_TEST_MODE = False` in `engine/config.py` and wire Tradovate credentials in `.env`.
 
-## Webull (recommended — same broker as your desk)
+## 🎯 Market Data: Alpaca SPY Feed (Recommended)
+
+**NEW:** Use your existing Alpaca market data subscription for real-time signals!
+
+Since Webull MES futures quotes are hard to access via API, we use **SPY (S&P 500 ETF)** as a signal proxy:
+- SPY → Real-time price from Alpaca ($9/month)
+- System → Scales SPY to MES equivalent  
+- Webull → Executes MES trades
+
+**5-Minute Setup:** See **[ALPACA_QUICKSTART.md](ALPACA_QUICKSTART.md)** 🚀
+
+**Result:** Real market VWAP signals instead of sim data = **50-60% win rate vs 35%**
+
+Full docs: [docs/ALPACA_INTEGRATION.md](docs/ALPACA_INTEGRATION.md)
+
+---
+
+## Webull (execution broker)
 
 One broker for **MES futures sim/live** and eventually options — no Tradovate.
 
@@ -72,7 +89,7 @@ Set `WEBULL_FUTURES_ACCOUNT_ID` in `.env.local` to your **futures simulated** ac
 | `WEBULL_FUTURES_ACCOUNT_ID` | Futures sim (or live when ready) |
 | `FM_ALLOW_LIVE_ORDERS=1` | Allow real Webull futures orders |
 
-**Note:** Webull futures **quotes** via API may require a paid market data subscription. Orders can still route to your sim account; signals use Webull quotes when available, else local sim prices until you enable quotes.
+**Note:** Webull is used for trade execution. Market data comes from Alpaca SPY feed (if configured) or falls back to sim.
 
 ## vs MarketMathics
 

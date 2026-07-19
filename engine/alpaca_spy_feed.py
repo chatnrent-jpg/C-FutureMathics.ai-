@@ -1,0 +1,228 @@
+"""
+Alpaca SPY real-time feed as MES signal proxy.
+
+Uses your existing Alpaca market data subscription to feed SPY prices,
+which are then scaled to approximate MES futures movements.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Auto-load .env files if running standalone
+if __name__ == "__main__":
+    from engine.env_loader import load_project_env
+    load_project_env(Path(__file__).resolve().parent.parent)
+
+# SPY tracks S&P 500 at ~1/10th the index value
+# MES tracks S&P 500 at 5x the index value  
+# Approximate scaling: MES ≈ SPY × 12.5 (this gets refined in production)
+SPY_TO_MES_SCALE = 12.5
+
+
+@dataclass
+class AlpacaSPYFeed:
+    """Real-time SPY feed via Alpaca WebSocket or REST API."""
+    
+    api_key: str = field(default="")
+    api_secret: str = field(default="")
+    base_url: str = field(default="https://paper-api.alpaca.markets")
+    data_url: str = field(default="https://data.alpaca.markets")
+    
+    _last_spy_price: float = 500.0  # Typical SPY price
+    _last_mes_proxy: float = 6250.0  # SPY × 12.5
+    _connected: bool = False
+    _sequence: int = 0
+    
+    def __post_init__(self) -> None:
+        if not self.api_key:
+            self.api_key = os.getenv("ALPACA_API_KEY", "").strip()
+        if not self.api_secret:
+            self.api_secret = os.getenv("ALPACA_API_SECRET", "").strip()
+        
+        # Check if using live or paper
+        if os.getenv("ALPACA_LIVE", "").strip().lower() in ("1", "true"):
+            self.base_url = "https://api.alpaca.markets"
+        
+        if self.api_key and self.api_secret:
+            logger.info("Alpaca SPY feed initialized (data_url=%s)", self.data_url)
+        else:
+            logger.warning("Alpaca credentials not set - SPY feed unavailable")
+    
+    def is_configured(self) -> bool:
+        """Check if Alpaca credentials are available."""
+        return bool(self.api_key and self.api_secret)
+    
+    async def health_check(self) -> tuple[bool, str]:
+        """Verify Alpaca API connectivity."""
+        if not self.is_configured():
+            return False, "alpaca_not_configured"
+        
+        try:
+            # Simple REST API health check
+            import aiohttp
+            headers = {
+                "APCA-API-KEY-ID": self.api_key,
+                "APCA-API-SECRET-KEY": self.api_secret,
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                # Get latest SPY quote
+                url = f"{self.data_url}/v2/stocks/SPY/quotes/latest"
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "quote" in data:
+                            self._connected = True
+                            return True, f"alpaca_ok spy={data['quote'].get('ap', 'N/A')}"
+                    return False, f"alpaca_status_{resp.status}"
+        except Exception as e:
+            logger.error("Alpaca health check failed: %s", e)
+            return False, f"alpaca_error: {str(e)[:50]}"
+    
+    async def fetch_spy_quote(self) -> dict[str, Any] | None:
+        """Fetch latest SPY quote via REST API."""
+        if not self.is_configured():
+            return None
+        
+        try:
+            import aiohttp
+            headers = {
+                "APCA-API-KEY-ID": self.api_key,
+                "APCA-API-SECRET-KEY": self.api_secret,
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.data_url}/v2/stocks/SPY/quotes/latest"
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status != 200:
+                        logger.warning("Alpaca SPY quote status %s", resp.status)
+                        return None
+                    
+                    data = await resp.json()
+                    quote = data.get("quote", {})
+                    
+                    if not quote:
+                        return None
+                    
+                    # Extract bid/ask/last
+                    bid_price = float(quote.get("bp", 0))
+                    ask_price = float(quote.get("ap", 0))
+                    
+                    # Use mid-price as "last" if no trade price available
+                    last_price = (bid_price + ask_price) / 2 if bid_price and ask_price else 0
+                    
+                    if last_price <= 0:
+                        return None
+                    
+                    self._last_spy_price = last_price
+                    self._last_mes_proxy = round(last_price * SPY_TO_MES_SCALE, 2)
+                    self._sequence += 1
+                    
+                    return {
+                        "spy_bid": bid_price,
+                        "spy_ask": ask_price,
+                        "spy_last": last_price,
+                        "spy_size": quote.get("as", 0),  # ask size
+                        "timestamp": quote.get("t", datetime.now().isoformat()),
+                    }
+        except Exception as e:
+            logger.error("Failed to fetch SPY quote: %s", e)
+            return None
+    
+    def scale_spy_to_mes(self, spy_price: float) -> float:
+        """Convert SPY price to approximate MES futures price."""
+        return round(spy_price * SPY_TO_MES_SCALE, 2)
+    
+    def get_mes_proxy_tick(self, spy_quote: dict[str, Any] | None) -> dict[str, Any]:
+        """Convert SPY quote to MES-compatible tick format."""
+        if not spy_quote:
+            # Return last known value
+            return {
+                "symbol": "MES_PROXY",
+                "price": self._last_mes_proxy,
+                "last": self._last_mes_proxy,
+                "bid": round(self._last_mes_proxy - 0.25, 2),
+                "ask": round(self._last_mes_proxy + 0.25, 2),
+                "size": 1,
+                "latency_ms": 0,
+                "sequence_id": self._sequence,
+                "source": "alpaca_spy_proxy",
+                "spy_price": self._last_spy_price,
+            }
+        
+        # Scale SPY to MES
+        mes_price = self.scale_spy_to_mes(spy_quote["spy_last"])
+        mes_bid = self.scale_spy_to_mes(spy_quote["spy_bid"])
+        mes_ask = self.scale_spy_to_mes(spy_quote["spy_ask"])
+        
+        self._last_spy_price = spy_quote["spy_last"]
+        self._last_mes_proxy = mes_price
+        
+        return {
+            "symbol": "MES_PROXY",
+            "price": mes_price,
+            "last": mes_price,
+            "bid": mes_bid,
+            "ask": mes_ask,
+            "size": spy_quote.get("spy_size", 0),
+            "latency_ms": 50,  # REST API latency estimate
+            "sequence_id": self._sequence,
+            "source": "alpaca_spy_proxy",
+            "spy_price": spy_quote["spy_last"],
+            "spy_timestamp": spy_quote.get("timestamp", ""),
+        }
+    
+    @property
+    def last_mes_proxy_price(self) -> float:
+        """Get last known MES proxy price."""
+        return self._last_mes_proxy
+    
+    @property
+    def last_spy_price(self) -> float:
+        """Get last known SPY price."""
+        return self._last_spy_price
+
+
+async def test_alpaca_feed() -> None:
+    """Test the Alpaca SPY feed integration."""
+    feed = AlpacaSPYFeed()
+    
+    print(f"Configured: {feed.is_configured()}")
+    
+    if not feed.is_configured():
+        print("❌ Set ALPACA_API_KEY and ALPACA_API_SECRET environment variables")
+        return
+    
+    print("\n🔍 Health check...")
+    ok, msg = await feed.health_check()
+    print(f"   {'✅' if ok else '❌'} {msg}")
+    
+    if not ok:
+        return
+    
+    print("\n📊 Fetching SPY quote...")
+    spy_quote = await feed.fetch_spy_quote()
+    
+    if spy_quote:
+        print(f"   SPY: ${spy_quote['spy_last']:.2f}")
+        print(f"   Bid: ${spy_quote['spy_bid']:.2f} | Ask: ${spy_quote['spy_ask']:.2f}")
+        
+        mes_tick = feed.get_mes_proxy_tick(spy_quote)
+        print(f"\n📈 MES Proxy: ${mes_tick['price']:.2f}")
+        print(f"   Bid: ${mes_tick['bid']:.2f} | Ask: ${mes_tick['ask']:.2f}")
+        print(f"   Scaling: SPY × {SPY_TO_MES_SCALE} = MES")
+    else:
+        print("   ❌ Failed to fetch SPY quote")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_alpaca_feed())
