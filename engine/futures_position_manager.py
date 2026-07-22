@@ -31,6 +31,10 @@ class ManagedPosition:
     nav_at_entry: float = 0.0
     daily_pnl_at_entry: float = 0.0
     cycle_at_entry: int = 0
+    # Swing trading additions
+    peak_profit_ticks: float = 0.0  # Track best profit for trailing stop
+    trailing_stop_active: bool = False
+    trailing_stop_ticks: int = 30  # Trail by 30 ticks once activated
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +49,8 @@ class ManagedPosition:
             "max_loss": self.max_loss,
             "entry_time": self.entry_time,
             "nav_at_entry": self.nav_at_entry,
+            "peak_profit_ticks": self.peak_profit_ticks,
+            "trailing_stop_active": self.trailing_stop_active,
         }
 
 
@@ -131,9 +137,41 @@ class FuturesPositionManager:
         exits: list[ExitRequest] = []
         for pid in list(self.positions.keys()):
             pos = self.positions[pid]
-            reason = evaluate_exit(last_price=last_price, levels=pos.levels)
+            
+            # Calculate current profit in ticks
+            from engine.config import TICK_SIZE
+            if pos.direction.upper() == "LONG":
+                profit_ticks = (last_price - pos.entry_price) / TICK_SIZE
+            else:
+                profit_ticks = (pos.entry_price - last_price) / TICK_SIZE
+            
+            # Update peak profit
+            if profit_ticks > pos.peak_profit_ticks:
+                pos.peak_profit_ticks = profit_ticks
+            
+            # Activate trailing stop if reached 50% of target
+            if not pos.trailing_stop_active and profit_ticks >= pos.target_ticks * 0.5:
+                pos.trailing_stop_active = True
+                logger.info("Trailing stop activated for %s at %.1f ticks profit", pid, profit_ticks)
+            
+            # Check trailing stop (if active)
+            reason = None
+            if pos.trailing_stop_active:
+                trail_distance = pos.peak_profit_ticks - pos.trailing_stop_ticks
+                if profit_ticks <= trail_distance:
+                    reason = "trailing_stop"
+            
+            # Check standard exit levels if no trailing stop hit
+            if reason is None:
+                reason = evaluate_exit(last_price=last_price, levels=pos.levels)
+            
+            # Check time-based exit (4-hour minimum hold for swing trades)
+            if reason is None:
+                reason = self._check_time_based_exit(pos, last_price)
+            
             if reason is None:
                 continue
+            
             pnl = realized_pnl(
                 entry_price=pos.entry_price,
                 exit_price=last_price,
@@ -155,8 +193,39 @@ class FuturesPositionManager:
                 )
             )
             del self.positions[pid]
-            logger.info("position_exit id=%s reason=%s pnl=%.2f", pid, reason, pnl)
+            logger.info("position_exit id=%s reason=%s pnl=%.2f peak_ticks=%.1f", 
+                       pid, reason, pnl, pos.peak_profit_ticks)
         return MonitorResult(exit_requests=exits, open_positions=len(self.positions))
+    
+    def _check_time_based_exit(self, pos: ManagedPosition, current_price: float) -> str | None:
+        """
+        Check if position should exit based on time rules.
+        
+        Rules:
+        1. End-of-day exit: Close all positions by 3:50 PM ET
+        2. Don't exit before 4 hours unless stop/target hit
+        """
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        
+        # Parse entry time
+        entry_dt = datetime.fromisoformat(pos.entry_time)
+        now_utc = datetime.now(timezone.utc)
+        now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+        
+        # Calculate hours in position
+        hours_in_position = (now_utc - entry_dt).total_seconds() / 3600
+        
+        # Rule 1: End-of-day exit (3:50 PM ET)
+        if now_et.hour == 15 and now_et.minute >= 50:
+            if hours_in_position >= 0.5:  # At least 30 minutes
+                return "end_of_day"
+        
+        # Rule 2: Minimum 4-hour hold (unless stop/target already hit)
+        # This is enforced by not returning any time-based exit before 4 hours
+        # The standard stop/target checks will still work
+        
+        return None
 
     def total_open_risk(self) -> float:
         return round(sum(p.max_loss for p in self.positions.values()), 2)

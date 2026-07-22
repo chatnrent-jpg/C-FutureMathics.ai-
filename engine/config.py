@@ -48,14 +48,21 @@ SANDBOX_LATENCY_CEILING_MS = 600.0
 MAX_ALLOWED_SPREAD_TICKS = 2  # max bid/ask spread in ticks for entry
 
 # Strategy defaults
-DEFAULT_STOP_TICKS = 8  # 8 ticks = 2.0 points = $10/contract
-DEFAULT_TARGET_TICKS = 12  # 1.5:1 R:R (was 16 for 2:1) - easier to hit, better win rate
-VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (was 4) - more selective
-MIN_CONFIDENCE_THRESHOLD = 0.60  # Only take signals with 60%+ confidence
-MIN_SECONDS_BETWEEN_TRADES = 60  # Cooldown period to prevent overtrading
+DEFAULT_STOP_TICKS = 60  # 60 ticks = 15 points = $75/contract risk (SWING)
+DEFAULT_TARGET_TICKS = 120  # 120 ticks = 30 points = $150/contract profit (2:1 R:R SWING)
+VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (legacy, not used in swing)
+MIN_CONFIDENCE_THRESHOLD = 0.65  # Only take signals with 65%+ confidence (SWING quality)
+MIN_SECONDS_BETWEEN_TRADES = 14400  # 4 hours between trades (SWING frequency)
+
+# Swing trading parameters
+SWING_MODE = True  # Toggle between swing (True) and scalp (False) strategies
+SWING_MIN_TREND_STRENGTH = 0.60  # Minimum trend strength for entry (0-1.0)
+SWING_MAX_TRADES_PER_DAY = 5  # Maximum 5 swing trades per day
+SWING_TRAILING_STOP_TICKS = 30  # Trail by 30 ticks after 50% to target
+SWING_CONTRACTS = 1  # Start with 1 contract (change to 2 after validation)
 
 FORWARD_TEST_MODE = True
-FORWARD_TEST_CYCLE_INTERVAL_S = 2.0
+FORWARD_TEST_CYCLE_INTERVAL_S = 900.0  # 15 minutes for swing (was 2.0 for scalping)
 FORWARD_TEST_RECONNECT_SLEEP_S = 60.0
 
 # CME MES Futures Market Hours (America/Chicago native, converted to ET for consistency)
