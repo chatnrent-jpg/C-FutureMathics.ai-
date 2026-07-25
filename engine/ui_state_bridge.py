@@ -14,7 +14,24 @@ from engine.config import (
 from manus.capital_protection import RiskVerdict
 
 
-def build_system_state(orchestrator: Any) -> dict[str, Any]:
+def _unrealized_pnl(positions: list[dict[str, Any]], last_price: float | None) -> float:
+    if not last_price or last_price <= 0:
+        return 0.0
+    from engine.config import POINT_VALUE
+
+    total = 0.0
+    for p in positions:
+        entry = float(p.get("entry_price") or 0)
+        contracts = int(p.get("contracts") or 0)
+        direction = str(p.get("direction") or "LONG").upper()
+        if entry <= 0 or contracts <= 0:
+            continue
+        points = (last_price - entry) if direction == "LONG" else (entry - last_price)
+        total += points * POINT_VALUE * contracts
+    return round(total, 2)
+
+
+def build_system_state(orchestrator: Any, last_price: float | None = None) -> dict[str, Any]:
     session = orchestrator.session
     risk = orchestrator.risk
     pm = orchestrator.position_manager
@@ -24,7 +41,9 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
     open_risk = pm.total_open_risk()
     margin_pct = round((open_risk / max_conc) * 100, 1) if max_conc else 0.0
     hard_stop = max_daily_loss_cap(nav)
-    
+    positions = pm.open_positions_list()
+    unrealized = _unrealized_pnl(positions, last_price)
+
     # Detect data source
     broker = orchestrator.broker
     data_source = "sim"
@@ -38,6 +57,8 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "symbol": orchestrator.config.symbol,
         "data_source": data_source,
+        "last_price": last_price,
+        "unrealized_pnl": unrealized,
         "session": {
             "realized_pnl_today": daily_pnl,
             "open_risk_notional": open_risk,
@@ -47,7 +68,7 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
             "last_risk_verdict": session.last_risk_verdict,
             "last_risk_reason": session.last_risk_reason,
         },
-        "open_positions": pm.open_positions_list(),
+        "open_positions": positions,
         "account_nav": nav,
         "dashboard": {
             "as_of_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -56,6 +77,8 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
             "data_source": data_source,
             "daily_pnl": daily_pnl,
             "daily_pnl_pct": round((daily_pnl / risk.starting_nav) * 100, 2) if risk.starting_nav else 0.0,
+            "unrealized_pnl": unrealized,
+            "last_price": last_price,
             "account_nav": nav,
             "starting_nav": risk.starting_nav,
             "hard_stop_limit": hard_stop,
@@ -69,7 +92,7 @@ def build_system_state(orchestrator: Any) -> dict[str, Any]:
             "risk_reason": session.last_risk_reason,
             "boot_status": "running",
             "heartbeat_state": "GREEN",
-            "open_positions": pm.open_positions_list(),
+            "open_positions": positions,
         },
     }
 

@@ -61,6 +61,28 @@ SWING_MAX_TRADES_PER_DAY = 5  # Maximum 5 swing trades per day
 SWING_TRAILING_STOP_TICKS = 30  # Trail by 30 ticks after 50% to target
 SWING_CONTRACTS = 1  # Start with 1 contract (change to 2 after validation)
 
+# ---------------------------------------------------------------------------
+# VolumeWatch grade-path MES strategy (PRIMARY for directional futures)
+# Rising (from down): cash 0–65 → LONG ≥65 → EXIT ≥85 → SHORT ≥90
+# Falling (from up): EXIT SHORT ≤50 → cash below 50
+# ---------------------------------------------------------------------------
+GRADE_MODE = True
+GRADE_LONG_ENTRY = 50.0  # recovery gate (was 55; enter as soon as washout recovers above 50)
+GRADE_LONG_EXIT = 85.0
+GRADE_SHORT_ENTRY = 90.0
+GRADE_SHORT_EXIT = 50.0
+GRADE_PATH_EPSILON = 0.35
+GRADE_SCORE_SOURCE = "overall"  # "overall" | "1m"
+GRADE_STALE_SECONDS = 300.0
+GRADE_ALLOW_STALE = False
+GRADE_CONTRACTS = 2  # size toward $1k/day target once validated (start 1 if preferred)
+# Protective only — grade owns the real exit (≥85). Wide so MES turbulence does not stop out rising-path longs.
+# 200 ticks = 50 pts = $250/contract = $500 for 2 contracts.
+GRADE_HARD_STOP_TICKS = 200
+GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
+GRADE_DAILY_PROFIT_LOCK = 1_000.0  # halt new entries after +$1000 day
+GRADE_DAILY_LOSS_HALT = 500.0  # matches one full hard-stop on 2 contracts
+
 FORWARD_TEST_MODE = True
 FORWARD_TEST_CYCLE_INTERVAL_S = 900.0  # 15 minutes for swing (was 2.0 for scalping)
 FORWARD_TEST_RECONNECT_SLEEP_S = 60.0

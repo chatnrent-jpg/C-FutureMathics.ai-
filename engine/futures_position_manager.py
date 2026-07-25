@@ -35,6 +35,7 @@ class ManagedPosition:
     peak_profit_ticks: float = 0.0  # Track best profit for trailing stop
     trailing_stop_active: bool = False
     trailing_stop_ticks: int = 30  # Trail by 30 ticks once activated
+    manage_mode: str = "ticks"  # "ticks" | "grade" — grade uses hard stop only; exits via grade engine
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -51,6 +52,7 @@ class ManagedPosition:
             "nav_at_entry": self.nav_at_entry,
             "peak_profit_ticks": self.peak_profit_ticks,
             "trailing_stop_active": self.trailing_stop_active,
+            "manage_mode": self.manage_mode,
         }
 
 
@@ -106,6 +108,7 @@ class FuturesPositionManager:
         nav_at_entry: float = 0.0,
         daily_pnl_at_entry: float = 0.0,
         cycle_at_entry: int = 0,
+        manage_mode: str = "ticks",
     ) -> ManagedPosition:
         pos_id = f"POS-{uuid.uuid4().hex[:8].upper()}"
         levels = build_exit_levels(
@@ -129,9 +132,43 @@ class FuturesPositionManager:
             nav_at_entry=nav_at_entry,
             daily_pnl_at_entry=daily_pnl_at_entry,
             cycle_at_entry=cycle_at_entry,
+            manage_mode=manage_mode,
         )
         self.positions[pos_id] = pos
         return pos
+
+    def force_close(
+        self,
+        *,
+        position_id: str,
+        exit_price: float,
+        reason: str,
+    ) -> ExitRequest | None:
+        """Close a position by id (grade-engine exits)."""
+        pos = self.positions.get(position_id)
+        if pos is None:
+            return None
+        pnl = realized_pnl(
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            direction=pos.direction,
+            contracts=pos.contracts,
+        )
+        self.realized_pnl_today = round(self.realized_pnl_today + pnl, 2)
+        req = ExitRequest(
+            position_id=pos.position_id,
+            trade_id=pos.trade_id,
+            reason=reason,
+            contracts=pos.contracts,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            max_loss=pos.max_loss,
+            realized_pnl=pnl,
+        )
+        del self.positions[position_id]
+        logger.info("position_force_close id=%s reason=%s pnl=%.2f", position_id, reason, pnl)
+        return req
 
     def monitor_tick(self, last_price: float) -> MonitorResult:
         exits: list[ExitRequest] = []
@@ -149,28 +186,49 @@ class FuturesPositionManager:
             if profit_ticks > pos.peak_profit_ticks:
                 pos.peak_profit_ticks = profit_ticks
             
-            # Activate trailing stop if reached 50% of target
-            if not pos.trailing_stop_active and profit_ticks >= pos.target_ticks * 0.5:
-                pos.trailing_stop_active = True
-                logger.info("Trailing stop activated for %s at %.1f ticks profit", pid, profit_ticks)
-            
-            # Check trailing stop (if active)
             reason = None
-            if pos.trailing_stop_active:
-                trail_distance = pos.peak_profit_ticks - pos.trailing_stop_ticks
-                if profit_ticks <= trail_distance:
-                    reason = "trailing_stop"
-            
-            # Check standard exit levels if no trailing stop hit
-            if reason is None:
-                reason = evaluate_exit(last_price=last_price, levels=pos.levels)
-            
-            # Check time-based exit (4-hour minimum hold for swing trades)
-            if reason is None:
-                reason = self._check_time_based_exit(pos, last_price)
-            
-            if reason is None:
-                continue
+
+            # Grade-managed: protective hard stop only (grade engine owns TP/path exits).
+            # Always use live GRADE_HARD_STOP_TICKS so widening the stop applies to open trades too.
+            if pos.manage_mode == "grade":
+                from engine.config import GRADE_HARD_STOP_TICKS, TICK_SIZE as _TS, ticks_to_dollars
+
+                stop_ticks = int(GRADE_HARD_STOP_TICKS)
+                if pos.stop_ticks != stop_ticks:
+                    pos.stop_ticks = stop_ticks
+                    pos.max_loss = ticks_to_dollars(stop_ticks, pos.contracts)
+                    pos.levels = build_exit_levels(
+                        entry_price=pos.entry_price,
+                        direction=pos.direction,
+                        stop_ticks=stop_ticks,
+                        target_ticks=pos.target_ticks,
+                    )
+                d = pos.direction.upper()
+                if d == "LONG" and last_price <= pos.levels.stop_price:
+                    reason = "STOP_LOSS_TICKS"
+                elif d != "LONG" and last_price >= pos.levels.stop_price:
+                    reason = "STOP_LOSS_TICKS"
+                if reason is None:
+                    continue
+            else:
+                # Activate trailing stop if reached 50% of target
+                if not pos.trailing_stop_active and profit_ticks >= pos.target_ticks * 0.5:
+                    pos.trailing_stop_active = True
+                    logger.info("Trailing stop activated for %s at %.1f ticks profit", pid, profit_ticks)
+                
+                if pos.trailing_stop_active:
+                    trail_distance = pos.peak_profit_ticks - pos.trailing_stop_ticks
+                    if profit_ticks <= trail_distance:
+                        reason = "trailing_stop"
+                
+                if reason is None:
+                    reason = evaluate_exit(last_price=last_price, levels=pos.levels)
+                
+                if reason is None:
+                    reason = self._check_time_based_exit(pos, last_price)
+                
+                if reason is None:
+                    continue
             
             pnl = realized_pnl(
                 entry_price=pos.entry_price,
@@ -232,3 +290,44 @@ class FuturesPositionManager:
 
     def open_positions_list(self) -> list[dict[str, Any]]:
         return [p.to_dict() for p in self.positions.values()]
+
+    def restore_from_dicts(self, rows: list[dict[str, Any]]) -> int:
+        """Reload open paper/live positions after process restart (keeps dashboard continuous)."""
+        restored = 0
+        for row in rows or []:
+            try:
+                direction = str(row.get("direction") or "LONG")
+                entry_price = float(row.get("entry_price") or 0)
+                stop_ticks = int(row.get("stop_ticks") or 80)
+                target_ticks = int(row.get("target_ticks") or 10000)
+                if entry_price <= 0:
+                    continue
+                levels = build_exit_levels(
+                    entry_price=entry_price,
+                    direction=direction,
+                    stop_ticks=stop_ticks,
+                    target_ticks=target_ticks,
+                )
+                pos_id = str(row.get("position_id") or f"POS-{uuid.uuid4().hex[:8].upper()}")
+                pos = ManagedPosition(
+                    position_id=pos_id,
+                    trade_id=str(row.get("trade_id") or f"GW-{uuid.uuid4().hex[:10].upper()}"),
+                    symbol=str(row.get("symbol") or "MES"),
+                    direction=direction,
+                    contracts=int(row.get("contracts") or 1),
+                    entry_price=entry_price,
+                    stop_ticks=stop_ticks,
+                    target_ticks=target_ticks,
+                    max_loss=float(row.get("max_loss") or 0),
+                    entry_time=str(row.get("entry_time") or datetime.now(timezone.utc).isoformat()),
+                    levels=levels,
+                    nav_at_entry=float(row.get("nav_at_entry") or 0),
+                    peak_profit_ticks=float(row.get("peak_profit_ticks") or 0),
+                    trailing_stop_active=bool(row.get("trailing_stop_active") or False),
+                    manage_mode=str(row.get("manage_mode") or "ticks"),
+                )
+                self.positions[pos_id] = pos
+                restored += 1
+            except Exception as exc:
+                logger.warning("skip_restore_position err=%s row=%s", exc, row)
+        return restored

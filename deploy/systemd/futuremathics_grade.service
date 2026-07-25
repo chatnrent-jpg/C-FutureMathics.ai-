@@ -1,0 +1,18 @@
+[Unit]
+Description=FutureMathics MES — VolumeWatch Grade Path
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONPATH=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONUNBUFFERED=1
+Environment=FM_VOLUMEWATCH_STATE_PATH=/home/ubuntu/FutureMathics.ai/data/shared_volumewatch_marketmathics_state.json
+EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env.local
+ExecStart=/usr/bin/python3 /home/ubuntu/FutureMathics.ai/scripts/run_grade_futures.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

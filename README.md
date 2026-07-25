@@ -70,6 +70,24 @@ Full docs: [docs/ALPACA_INTEGRATION.md](docs/ALPACA_INTEGRATION.md)
 
 ---
 
+## 🏆 PRIMARY STRATEGY: VolumeWatch Grade-Path MES
+
+**Brain = VolumeWatch F→A grade · Body = MES futures**
+
+| Path | Rules |
+|------|--------|
+| Rising (from down) | Cash &lt;50 → **LONG ≥50** → exit ≥85 → **SHORT ≥90** |
+| Falling (from up) | Exit short ≤50 → cash below 50 |
+
+```powershell
+python scripts/test_grade_path_engine.py
+python scripts/run_grade_futures.py
+```
+
+See [docs/GRADE_PATH_MES.md](docs/GRADE_PATH_MES.md).
+
+---
+
 ## Webull (execution broker)
 
 One broker for **MES futures sim/live** and eventually options — no Tradovate.

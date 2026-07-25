@@ -1,0 +1,20 @@
+[Unit]
+Description=VolumeWatch headless macro grade publisher (for FutureMathics)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Volumewatch
+Environment=PYTHONPATH=/home/ubuntu/Volumewatch
+Environment=PYTHONUNBUFFERED=1
+Environment=FM_VOLUMEWATCH_STATE_PATH=/home/ubuntu/FutureMathics.ai/data/shared_volumewatch_marketmathics_state.json
+Environment=VOLUMEWATCH_STATE_PATH=/home/ubuntu/FutureMathics.ai/data/shared_volumewatch_marketmathics_state.json
+EnvironmentFile=-/home/ubuntu/Volumewatch/.env.local
+EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env.local
+ExecStart=/usr/bin/python3 /home/ubuntu/Volumewatch/scripts/publish_macro_grade_headless.py --interval 60
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
