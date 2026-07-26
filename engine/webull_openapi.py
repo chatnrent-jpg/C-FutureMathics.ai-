@@ -76,42 +76,66 @@ def generate_signature(
     return base64.b64encode(digest).decode("utf-8")
 
 
+# Default request timeout for signed Webull calls (virtue path uses 5s)
+DEFAULT_WEBULL_TIMEOUT_S = 5.0
+
+
 def signed_request(
     method: str,
     uri: str,
     *,
     query: dict[str, str] | None = None,
     body: dict[str, Any] | None = None,
-    timeout: float = 20.0,
+    timeout: float = DEFAULT_WEBULL_TIMEOUT_S,
 ) -> tuple[int, Any, str | None]:
+    """
+    Sign and send a Webull OpenAPI request.
+
+    Signature algorithm matches Webull's official US recipe / test vector.
+    Returns ``(status_code, json_or_text, error)``.
+    """
     app_key = _env_first("WEBULL_APP_KEY", "WEBULL_API_KEY")
     app_secret = _env_first("WEBULL_APP_SECRET", "WEBULL_API_SECRET")
     if not app_key or not app_secret:
         return 0, None, "Webull App Key / App Secret missing."
 
     host = webull_api_host().strip()
-    headers: dict[str, str] = {
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    nonce = uuid.uuid4().hex
+    body_string = _body_json(body) if body else None
+
+    # Headers used for signature computation (must include host)
+    sign_headers: dict[str, str] = {
         "x-app-key": app_key,
         "x-signature-algorithm": "HMAC-SHA1",
         "x-signature-version": "1.0",
-        "x-signature-nonce": uuid.uuid4().hex,
-        "x-timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "x-signature-nonce": nonce,
+        "x-timestamp": timestamp,
         "host": host,
-        "Content-Type": "application/json",
+    }
+    signature = generate_signature(
+        uri,
+        query_params=query,
+        body=body,
+        headers=sign_headers,
+        app_secret=app_secret,
+    )
+
+    # Outbound request headers — match official recipe (host is signed, not sent as custom header)
+    headers: dict[str, str] = {
+        "x-app-key": app_key,
+        "x-timestamp": timestamp,
+        "x-signature": signature,
+        "x-signature-algorithm": "HMAC-SHA1",
+        "x-signature-version": "1.0",
+        "x-signature-nonce": nonce,
         "x-version": "v2",
     }
     token = _env_first("WEBULL_ACCESS_TOKEN", "WEBULL_TOKEN")
     if token:
         headers["x-access-token"] = token
-
-    signature = generate_signature(
-        uri,
-        query_params=query,
-        body=body,
-        headers=headers,
-        app_secret=app_secret,
-    )
-    headers["x-signature"] = signature
+    if body_string is not None:
+        headers["Content-Type"] = "application/json"
 
     url = f"https://{host}{uri}"
     try:
@@ -119,7 +143,7 @@ def signed_request(
             method.upper(),
             url,
             params=query or None,
-            data=_body_json(body) if body else None,
+            data=body_string,
             headers=headers,
             timeout=timeout,
         )

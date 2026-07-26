@@ -1,5 +1,5 @@
 [Unit]
-Description=VolumeWatch headless macro grade publisher (for FutureMathics)
+Description=Macro Hub live grade publisher for FutureMathics (AWS SoT)
 After=network.target
 
 [Service]

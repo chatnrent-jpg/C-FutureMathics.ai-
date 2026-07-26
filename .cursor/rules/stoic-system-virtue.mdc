@@ -1,0 +1,17 @@
+---
+description: Stoic System Virtue — FutureMathics trading brain and execution boundaries
+alwaysApply: true
+---
+
+# Stoic System Virtue (HARD)
+
+FutureMathics must do the right thing @ the right time @ all times (long/short/flat) from its own market-condition brain — no VolumeWatch dependency, no silent error.
+
+When writing or reviewing trading code, enforce:
+
+1. **Wisdom** — ATR/volatility regime: trend long/short, mean-revert, or STAND ASIDE in chaos. Never force trades when aside.
+2. **Courage** — Valid signals execute without hesitation, delay theater, or manual override in the hot path.
+3. **Temperance** — Risk sized before entry; no over-leverage; shrink size on losing streaks; daily halt/lock enforced.
+4. **Justice** — Reject false/stale/malformed data; explicit try/catch on all network/IO; never log or persist false state.
+
+Subagents (explore / bugbot / security-review) must apply the matching pillar checks from `.cursorrules` Team Cohesion.

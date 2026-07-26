@@ -181,6 +181,97 @@ class AlpacaSPYFeed:
             "spy_timestamp": spy_quote.get("timestamp", ""),
         }
     
+    async def fetch_spy_bars(
+        self,
+        *,
+        timeframe: str = "5Min",
+        limit: int = 120,
+        lookback_days: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch recent SPY OHLCV bars from Alpaca (for Wisdom warmup).
+        Alpaca requires start/end — bare limit-only requests return bars=null.
+        Returns list of dicts: open, high, low, close, timestamp.
+        """
+        if not self.is_configured():
+            return []
+        try:
+            import aiohttp
+            from datetime import datetime, timedelta, timezone
+
+            headers = {
+                "APCA-API-KEY-ID": self.api_key,
+                "APCA-API-SECRET-KEY": self.api_secret,
+            }
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=max(1, int(lookback_days)))
+            params = {
+                "timeframe": timeframe,
+                "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "limit": str(max(20, min(int(limit), 1000))),
+                "adjustment": "raw",
+                "feed": "iex",
+                "sort": "asc",
+            }
+            url = f"{self.data_url}/v2/stocks/SPY/bars"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.warning("Alpaca bars status=%s body=%s", resp.status, text[:160])
+                        return []
+                    data = await resp.json()
+                    bars = data.get("bars") or []
+                    out: list[dict[str, Any]] = []
+                    for row in bars:
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            out.append(
+                                {
+                                    "open": float(row["o"]),
+                                    "high": float(row["h"]),
+                                    "low": float(row["l"]),
+                                    "close": float(row["c"]),
+                                    "timestamp": row.get("t"),
+                                }
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                    if not out:
+                        logger.warning(
+                            "Alpaca bars empty timeframe=%s start=%s end=%s",
+                            timeframe,
+                            params["start"],
+                            params["end"],
+                        )
+                    return out
+        except Exception as exc:
+            logger.exception("fetch_spy_bars_failed err=%s", exc)
+            return []
+
+    def mes_proxy_bars_from_spy(self, spy_bars: list[dict[str, Any]]) -> list[dict[str, float]]:
+        """Scale SPY OHLC bars to MES proxy OHLC."""
+        out: list[dict[str, float]] = []
+        for row in spy_bars:
+            try:
+                out.append(
+                    {
+                        "high": self.scale_spy_to_mes(float(row["high"])),
+                        "low": self.scale_spy_to_mes(float(row["low"])),
+                        "close": self.scale_spy_to_mes(float(row["close"])),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
     @property
     def last_mes_proxy_price(self) -> float:
         """Get last known MES proxy price."""

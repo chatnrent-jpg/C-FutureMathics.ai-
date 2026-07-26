@@ -7,12 +7,71 @@ Mirrors MarketMathics risk architecture; instrument constants are futures-specif
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
-# Instrument — CME Micro E-mini S&P 500
+from engine.env_loader import load_project_env
+
+load_project_env(Path(__file__).resolve().parent.parent)
+
+# Instrument — CME Micro E-mini S&P 500 (Webull futures product root)
 EXECUTION_SYMBOL = "MES"
 POINT_VALUE = 5.0  # USD per index point per contract
 TICK_SIZE = 0.25  # index points
 TICK_VALUE = POINT_VALUE * TICK_SIZE  # $1.25 per tick per contract
+
+# ---------------------------------------------------------------------------
+# Webull OpenAPI — exclusive broker for FutureMathics virtue execution
+# Credentials load from .env.local (WEBULL_APP_KEY / WEBULL_APP_SECRET / account ids)
+# ---------------------------------------------------------------------------
+WEBULL_NETWORK_TIMEOUT_S = 5.0  # hard socket timeout (Justice)
+WEBULL_PRODUCT_ROOT = EXECUTION_SYMBOL  # maps to Webull US_FUTURES code (MES → MESU6 etc.)
+
+
+def _env_str(*names: str, default: str = "") -> str:
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            return raw
+    return default
+
+
+def webull_app_key() -> str:
+    return _env_str("WEBULL_APP_KEY", "WEBULL_API_KEY")
+
+
+def webull_app_secret() -> str:
+    return _env_str("WEBULL_APP_SECRET", "WEBULL_API_SECRET")
+
+
+def webull_api_host_name() -> str:
+    return _env_str("WEBULL_API_HOST", default="api.webull.com")
+
+
+def webull_access_token() -> str:
+    return _env_str("WEBULL_ACCESS_TOKEN", "WEBULL_TOKEN")
+
+
+def webull_futures_account_id() -> str | None:
+    """Prefer futures OpenAPI account id; fall back to long-form WEBULL_ACCOUNT_ID."""
+    futures = _env_str("WEBULL_FUTURES_ACCOUNT_ID")
+    if futures:
+        return futures
+    legacy = _env_str("WEBULL_ACCOUNT_ID")
+    # OpenAPI ids are long opaque strings; short UI account numbers are not usable alone
+    if legacy and len(legacy) >= 20:
+        return legacy
+    return None
+
+
+def webull_futures_symbol() -> str | None:
+    """Optional forced front-month symbol (e.g. MESU6); else resolve via Webull instrument list."""
+    forced = _env_str("WEBULL_FUTURES_SYMBOL", "FM_EXECUTION_CONTRACT")
+    return forced.upper() if forced else None
+
+
+def webull_credentials_configured() -> bool:
+    return bool(webull_app_key() and webull_app_secret())
+
 
 # Capital baseline
 STARTING_NAV = 100_000.0

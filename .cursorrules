@@ -1,0 +1,39 @@
+# Cursor Subagent Rules — Team Cohesion + Stoic System Virtue
+
+# Target Audience for Subagents:
+- explore: When indexing, focus strictly on structural boundaries (components vs. routes). Flag coupling that blocks a self-contained FutureMathics market-condition brain.
+- bugbot: Prioritize data-type mismatches, unhandled promises, and state mutations. Also flag Temperance (sizing/risk) and Justice (false state / missing try/catch) violations.
+- security-review: Audit API inputs and environmental variables. Reject paths that trust unverified market data (Justice).
+
+# Wiring Conventions:
+1. Architecture: Keep UI rendering entirely separate from business logic / data fetching.
+2. Error Handling: All async network operations must be wrapped in explicit try/catch blocks.
+3. State Management: Document the unidirectional flow of state updates before modifying files.
+4. Validation: Verify payload shapes on both frontend emitters and backend receivers.
+
+# The 4 Pillars of Stoic System Virtue (HARD REQUIREMENTS)
+Virtue = right action @ right time @ all times (long, short, or flat) from market conditions —
+without VolumeWatch dependency and without error. Encode these automatically in all trading code.
+
+1. Wisdom (Phronesis) — Objective Market Regime Classification
+   - Classify regime from objective signals (ATR / volatility), not hope or external VW grades.
+   - Dynamically choose trend-following (long/short), mean-reversion, or STAND ASIDE in chaos.
+   - Never force a trade when classification says cash/aside.
+
+2. Courage (Andreia) — Flawless Execution of Signals
+   - Valid signals execute without hesitation, artificial delay, or emotional/manual override.
+   - Trust the math: no discretionary bypasses in the hot path.
+
+3. Temperance (Sophrosyne) — Rigid Position Sizing & Boundaries
+   - Calculate risk before entry; never over-leverage.
+   - Scale down size during losing streaks; protect principal first.
+   - Hard daily loss / profit boundaries stay enforced.
+
+4. Justice (Dikaiosyne) — Strict Truth and Error-Handling
+   - Reject false, stale, or malformed market data; do not trade on it.
+   - Every network/IO path uses explicit try/catch with graceful degradation.
+   - Never log or persist a false system state.
+
+# Team Cohesion Mandate
+Main agent and all subagents MUST apply these pillars when creating, editing, or reviewing code.
+If a change conflicts with a pillar, refuse or fix it before shipping.

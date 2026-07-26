@@ -1,0 +1,18 @@
+[Unit]
+Description=FutureMathics MES — Virtue Wisdom Brain (Alpaca data + Webull execution)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONPATH=/home/ubuntu/FutureMathics.ai
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env.local
+# Interval between virtue cycles (seconds)
+ExecStart=/usr/bin/python3 /home/ubuntu/FutureMathics.ai/main.py --interval 30
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

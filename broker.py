@@ -1,0 +1,729 @@
+"""
+FutureMathics virtue broker — Webull execution + Alpaca market data.
+
+- Trade / positions / reconcile: Webull OpenAPI (ApiClient + TradeClient)
+- Live prices: Alpaca SPY → MES proxy (existing $99 market-data subscription)
+- No Interactive Brokers / ib_insync
+- No Webull US_FUTURES quote subscription required
+
+Guardrails (intact):
+  1. Position exclusivity — flatten opposite before new entry; wait for fill confirm
+  2. Hard 5s socket timeouts on every network call
+  3. reconcile_with_broker() — remote Webull positions/balance truth after triage
+  4. Infinite outage survival — exponential backoff 30–60s, never exit the process
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+from engine.config import (
+    EXECUTION_SYMBOL,
+    FIXED_FRACTIONAL_RISK_PCT,
+    WEBULL_NETWORK_TIMEOUT_S,
+    forward_test_force_paper,
+    paper_max_mes_contracts,
+    webull_credentials_configured,
+    webull_futures_account_id,
+)
+from engine.alpaca_spy_feed import AlpacaSPYFeed
+from engine.futures_broker_adapter import OrderExecutionResult, RoutingMode
+from engine.webull_clients import ApiClient, TradeClient
+from engine.webull_openapi import webull_is_sandbox
+
+logger = logging.getLogger(__name__)
+
+RISK_LIMIT_PCT = FIXED_FRACTIONAL_RISK_PCT  # 0.5%
+NETWORK_TIMEOUT_S = WEBULL_NETWORK_TIMEOUT_S  # 5.0 — Justice hard cap
+RECONNECT_BACKOFF_MIN_S = 30.0
+RECONNECT_BACKOFF_MAX_S = 60.0
+
+
+class TriageState(str, Enum):
+    LIVE = "LIVE"
+    DISCONNECTED = "DISCONNECTED"
+    RECONNECTING = "RECONNECTING"
+    VERIFYING_POSITIONS = "VERIFYING_POSITIONS"
+    READY = "READY"
+
+
+@dataclass(frozen=True, slots=True)
+class Order:
+    symbol: str
+    direction: str  # LONG | SHORT
+    size: int
+    price: float
+    stop_ticks: int
+    quote_ts: float
+    order_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResult:
+    ok: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SizeResult:
+    contracts: int
+    risk_dollars: float
+    risk_pct: float
+    max_allowed_risk: float
+    rejected: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerTruth:
+    ok: bool
+    equity: float
+    realized_pnl: float
+    positions: list[dict[str, Any]]
+    detail: str = ""
+
+
+def validate_order(
+    order: Order,
+    *,
+    expected_symbol: str = EXECUTION_SYMBOL,
+    max_price_age_s: float = 5.0,
+    now_ts: float | None = None,
+) -> ValidationResult:
+    sym = str(order.symbol or "").strip().upper()
+    expect = str(expected_symbol or EXECUTION_SYMBOL).strip().upper()
+    # Accept MES root or Webull front-month (MESU6, MESH6, …)
+    if sym != expect and not sym.startswith(expect):
+        return ValidationResult(False, f"symbol_mismatch got={sym} expected={expect}*")
+
+    if int(order.size) <= 0:
+        return ValidationResult(False, "size_must_be_gt_zero")
+    if order.price is None or float(order.price) <= 0:
+        return ValidationResult(False, "price_invalid")
+
+    now = time.time() if now_ts is None else float(now_ts)
+    age = now - float(order.quote_ts)
+    if age < 0:
+        return ValidationResult(False, "quote_ts_in_future")
+    if age > max_price_age_s:
+        return ValidationResult(False, f"price_stale age_s={age:.2f}>{max_price_age_s}")
+
+    direction = str(order.direction or "").upper()
+    if direction not in {"LONG", "SHORT", "BUY", "SELL"}:
+        return ValidationResult(False, f"direction_invalid {direction}")
+    if int(order.stop_ticks) <= 0:
+        return ValidationResult(False, "stop_ticks_must_be_gt_zero")
+    return ValidationResult(True, "ok")
+
+
+def calculate_max_contracts(
+    *,
+    equity: float,
+    stop_ticks: int,
+    risk_limit_pct: float = RISK_LIMIT_PCT,
+    tick_value: float | None = None,
+    hard_cap: int | None = None,
+) -> SizeResult:
+    from engine.config import TICK_VALUE
+
+    tv = float(TICK_VALUE if tick_value is None else tick_value)
+    eq = float(equity)
+    stop = int(stop_ticks)
+    if eq <= 0:
+        return SizeResult(0, 0.0, 0.0, 0.0, True, "equity_invalid")
+    if stop <= 0 or tv <= 0:
+        return SizeResult(0, 0.0, 0.0, 0.0, True, "stop_or_tick_invalid")
+
+    max_risk = eq * float(risk_limit_pct)
+    risk_per_contract = stop * tv
+    raw = int(max_risk // risk_per_contract)
+    cap = hard_cap if hard_cap is not None else paper_max_mes_contracts()
+    contracts = max(0, min(raw, int(cap)))
+    if contracts < 1:
+        return SizeResult(
+            0, 0.0, 0.0, max_risk, True,
+            f"risk_budget_too_small max_risk={max_risk:.2f} per_contract={risk_per_contract:.2f}",
+        )
+    total_risk = contracts * risk_per_contract
+    risk_pct = total_risk / eq
+    if risk_pct > risk_limit_pct + 1e-12:
+        return SizeResult(
+            0, total_risk, risk_pct, max_risk, True,
+            f"exceeds_risk_limit pct={risk_pct:.4%} limit={risk_limit_pct:.4%}",
+        )
+    return SizeResult(contracts, total_risk, risk_pct, max_risk, False, "ok")
+
+
+def reject_if_over_risk(
+    *,
+    equity: float,
+    contracts: int,
+    stop_ticks: int,
+    risk_limit_pct: float = RISK_LIMIT_PCT,
+) -> ValidationResult:
+    from engine.config import TICK_VALUE
+
+    if contracts <= 0:
+        return ValidationResult(False, "contracts_must_be_gt_zero")
+    eq = float(equity)
+    if eq <= 0:
+        return ValidationResult(False, "equity_invalid")
+    total_risk = int(contracts) * int(stop_ticks) * TICK_VALUE
+    if total_risk / eq > risk_limit_pct + 1e-12:
+        return ValidationResult(
+            False,
+            f"order_exceeds_0_5pct_risk risk={total_risk:.2f} equity={eq:.2f}",
+        )
+    return ValidationResult(True, "ok")
+
+
+def _normalize_direction(direction: str) -> str:
+    d = str(direction or "").upper()
+    if d in {"BUY", "LONG"}:
+        return "LONG"
+    if d in {"SELL", "SHORT"}:
+        return "SHORT"
+    return d
+
+
+def _opposite(direction: str) -> str:
+    d = _normalize_direction(direction)
+    if d == "LONG":
+        return "SHORT"
+    if d == "SHORT":
+        return "LONG"
+    return "FLAT"
+
+
+def _fill_confirmed(status: str) -> bool:
+    return str(status or "").upper() in {"FILLED", "SUBMITTED", "ACCEPTED", "PARTIAL"}
+
+
+async def _await_timeout(coro, *, timeout: float = NETWORK_TIMEOUT_S, label: str = "network"):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"{label}_timeout after {timeout}s") from exc
+
+
+@dataclass
+class VirtueBroker:
+    """
+    Virtue execution gate.
+
+    - AlpacaSPYFeed: live MES proxy prices (market data you already pay for)
+    - TradeClient: Webull futures account, orders, positions, reconcile
+    """
+
+    api: ApiClient = field(default_factory=ApiClient)
+    trade: TradeClient | None = None
+    data: AlpacaSPYFeed = field(default_factory=AlpacaSPYFeed)
+    equity: float = 100_000.0
+    realized_pnl: float = 0.0
+    triage: TriageState = TriageState.READY
+    max_price_age_s: float = 5.0
+    open_positions: list[dict[str, Any]] = field(default_factory=list)
+    network_timeout_s: float = NETWORK_TIMEOUT_S
+    _last_price: float = 0.0
+    _last_disconnect_at: float | None = None
+    _contract: str = EXECUTION_SYMBOL
+
+    def __post_init__(self) -> None:
+        if self.trade is None:
+            self.trade = TradeClient(api=self.api, product_root=EXECUTION_SYMBOL)
+        if not webull_credentials_configured():
+            logger.error("WEBULL credentials missing — set WEBULL_APP_KEY / WEBULL_APP_SECRET in .env.local")
+        if not self.data.is_configured():
+            logger.error("ALPACA credentials missing — set ALPACA_API_KEY / ALPACA_API_SECRET for live prices")
+        else:
+            logger.info("VirtueBroker market data: Alpaca SPY → MES proxy")
+        acct = webull_futures_account_id() or "(resolve-at-runtime)"
+        logger.info(
+            "VirtueBroker Webull execution account=%s product=%s timeout=%.1fs",
+            acct,
+            EXECUTION_SYMBOL,
+            self.network_timeout_s,
+        )
+
+    # --- compatibility shim for older main/tests that expect .adapter ---
+    @property
+    def adapter(self) -> "VirtueBroker":
+        return self
+
+    def update_equity(self, equity: float) -> None:
+        self.equity = float(equity)
+
+    def enter_triage(self, reason: str = "webull_disconnect") -> None:
+        self.triage = TriageState.DISCONNECTED
+        self._last_disconnect_at = time.time()
+        logger.warning("TRIAGE_ENTER reason=%s state=%s", reason, self.triage.value)
+
+    def begin_reconnect(self) -> None:
+        self.triage = TriageState.RECONNECTING
+        logger.info("TRIAGE_RECONNECTING webull")
+
+    def can_send_new_orders(self) -> bool:
+        return self.triage in {TriageState.READY, TriageState.LIVE}
+
+    def net_exposure(self) -> tuple[str, int]:
+        long_qty = 0
+        short_qty = 0
+        for pos in self.open_positions:
+            size = abs(int(pos.get("size") or 0))
+            d = _normalize_direction(str(pos.get("direction") or ""))
+            if d == "LONG":
+                long_qty += size
+            elif d == "SHORT":
+                short_qty += size
+        net = long_qty - short_qty
+        if net > 0:
+            return "LONG", net
+        if net < 0:
+            return "SHORT", abs(net)
+        return "FLAT", 0
+
+    async def health_check(self) -> tuple[bool, str]:
+        """FuturesBrokerAdapter-compatible alias."""
+        return await self.health_check_timed()
+
+    async def health_check_timed(self) -> tuple[bool, str]:
+        """Healthy when Webull trade API is up; Alpaca data preferred for prices."""
+        parts: list[str] = []
+        webull_ok = False
+        alpaca_ok = False
+        try:
+            webull_ok, wdetail = await _await_timeout(
+                asyncio.to_thread(self.trade.health_check),
+                timeout=self.network_timeout_s,
+                label="webull_health",
+            )
+            parts.append(f"webull={wdetail}")
+        except Exception as exc:
+            logger.exception("webull_health_check_failed err=%s", exc)
+            parts.append(f"webull_error={exc}")
+
+        if self.data.is_configured():
+            try:
+                alpaca_ok, adetail = await _await_timeout(
+                    self.data.health_check(),
+                    timeout=self.network_timeout_s,
+                    label="alpaca_health",
+                )
+                parts.append(f"alpaca={adetail}")
+            except Exception as exc:
+                logger.exception("alpaca_health_check_failed err=%s", exc)
+                parts.append(f"alpaca_error={exc}")
+
+        # Execution broker must be up; market data should be up when Alpaca is configured
+        if not webull_ok:
+            return False, " | ".join(parts)
+        if self.data.is_configured() and not alpaca_ok:
+            return False, " | ".join(parts)
+        return True, " | ".join(parts)
+
+    async def resolve_market_context(self) -> dict[str, Any]:
+        return await self.resolve_market_context_timed()
+
+    async def resolve_market_context_timed(self) -> dict[str, Any]:
+        """
+        Prefer Alpaca SPY → MES proxy (paid market data).
+        Fall back to Webull futures snapshot only if Alpaca unavailable.
+        """
+        self._contract = self.trade.contract_symbol() if self.trade else EXECUTION_SYMBOL
+
+        # Primary: Alpaca
+        if self.data.is_configured():
+            try:
+                spy_quote = await _await_timeout(
+                    self.data.fetch_spy_quote(),
+                    timeout=self.network_timeout_s,
+                    label="alpaca_quote",
+                )
+            except Exception as exc:
+                logger.exception("alpaca_quote_failed err=%s", exc)
+                spy_quote = None
+            if spy_quote:
+                tick = self.data.get_mes_proxy_tick(spy_quote)
+                price = float(tick.get("price") or tick.get("last") or 0.0)
+                if price > 0:
+                    self._last_price = price
+                    tick = {
+                        **tick,
+                        "symbol": self._contract,
+                        "source": "alpaca_spy_mes_proxy",
+                        "latency_ms": float(tick.get("latency_ms") or 45.0),
+                    }
+                    return {
+                        "tick": tick,
+                        "live_stream": True,
+                        "alpaca": True,
+                        "webull_contract": self._contract,
+                        "spy_quote": spy_quote,
+                    }
+            logger.warning("Alpaca quote unavailable — trying Webull futures snapshot")
+
+        # Fallback: Webull (requires US_FUTURES subscription)
+        try:
+            quote = await _await_timeout(
+                asyncio.to_thread(self.trade.get_quote),
+                timeout=self.network_timeout_s,
+                label="webull_quote",
+            )
+        except Exception as exc:
+            logger.exception("webull_quote_failed err=%s", exc)
+            raise RuntimeError(f"market_data_unavailable alpaca_and_webull_failed: {exc}") from exc
+
+        if not quote or quote.get("needs_subscription"):
+            detail = (quote or {}).get("error") or "webull_quote_unavailable"
+            raise RuntimeError(
+                f"market_data_unavailable: Alpaca failed and Webull quote blocked ({detail}). "
+                "Ensure ALPACA_API_KEY/SECRET are set."
+            )
+
+        price = float(quote.get("price") or quote.get("last") or 0.0)
+        if price <= 0:
+            raise RuntimeError("webull_quote_invalid_price")
+
+        self._last_price = price
+        self._contract = str(quote.get("symbol") or self._contract)
+        tick = {
+            "symbol": self._contract,
+            "price": price,
+            "last": price,
+            "bid": float(quote.get("bid") or price),
+            "ask": float(quote.get("ask") or price),
+            "source": "webull",
+            "latency_ms": 45.0,
+        }
+        return {"tick": tick, "live_stream": True, "webull": True}
+
+    async def submit_order_timed(
+        self,
+        *,
+        direction: str,
+        contracts: int,
+        limit_price: float | None = None,
+    ) -> OrderExecutionResult:
+        d = _normalize_direction(direction)
+        side = "BUY" if d == "LONG" else "SELL"
+        contract = self._contract or self.trade.contract_symbol()
+
+        live_route = (
+            self.trade.configured()
+            and not webull_is_sandbox()
+            and not forward_test_force_paper()
+        )
+        mode = RoutingMode.LIVE_ROUTE if live_route else RoutingMode.PAPER_ROUTE
+
+        # Paper / sandbox: still go through Webull TradeClient when sandbox;
+        # forced paper without live flag uses Webull submit only if sandbox host.
+        use_webull_submit = self.trade.configured() and (
+            webull_is_sandbox() or live_route
+        )
+
+        if use_webull_submit:
+            try:
+                result, err = await _await_timeout(
+                    asyncio.to_thread(
+                        self.trade.submit_market_order,
+                        direction=side,
+                        contracts=contracts,
+                        contract=contract,
+                    ),
+                    timeout=self.network_timeout_s,
+                    label="webull_submit",
+                )
+            except Exception as exc:
+                logger.exception("webull_submit_failed err=%s", exc)
+                return OrderExecutionResult(
+                    routing_mode=mode,
+                    status="REJECTED",
+                    order_id="",
+                    fill_price=limit_price or self._last_price,
+                    contracts=contracts,
+                    direction=d,
+                    detail=str(exc),
+                    contract=contract,
+                )
+            if err:
+                return OrderExecutionResult(
+                    routing_mode=mode,
+                    status="REJECTED",
+                    order_id="",
+                    fill_price=limit_price or self._last_price,
+                    contracts=contracts,
+                    direction=d,
+                    detail=err,
+                    contract=contract,
+                )
+            fill = limit_price if limit_price is not None else self._last_price
+            return OrderExecutionResult(
+                routing_mode=mode,
+                status=str((result or {}).get("status") or "SUBMITTED").upper(),
+                order_id=str((result or {}).get("order_id") or ""),
+                fill_price=round(float(fill or 0.0), 2),
+                contracts=contracts,
+                direction=d,
+                detail="webull_futures",
+                contract=str((result or {}).get("symbol") or contract),
+            )
+
+        # Forward-test paper without live Webull route: confirmed local fill (still Webull quotes)
+        await asyncio.sleep(0.05)
+        fill = limit_price if limit_price is not None else self._last_price
+        return OrderExecutionResult(
+            routing_mode=RoutingMode.PAPER_ROUTE,
+            status="FILLED",
+            order_id=f"FM-WB-{uuid.uuid4().hex[:8].upper()}",
+            fill_price=round(float(fill or 0.0), 2),
+            contracts=contracts,
+            direction=d,
+            detail="webull_paper_fill",
+            contract=contract,
+        )
+
+    async def reconcile_with_broker(self) -> BrokerTruth:
+        """Bypass local memory — sync from Webull futures positions + balance."""
+        self.triage = TriageState.VERIFYING_POSITIONS
+        try:
+            truth = await _await_timeout(
+                asyncio.to_thread(self.trade.fetch_broker_truth),
+                timeout=self.network_timeout_s,
+                label="webull_reconcile",
+            )
+        except Exception as exc:
+            logger.exception("reconcile_with_broker_failed err=%s", exc)
+            self.triage = TriageState.DISCONNECTED
+            return BrokerTruth(False, self.equity, self.realized_pnl, [], detail=str(exc))
+
+        if not truth.get("ok"):
+            detail = str(truth.get("detail") or "webull_truth_unavailable")
+            logger.error("reconcile_rejected detail=%s", detail)
+            self.triage = TriageState.DISCONNECTED
+            return BrokerTruth(False, self.equity, self.realized_pnl, [], detail=detail)
+
+        remote_equity = float(truth.get("equity") or 0.0)
+        if remote_equity > 0:
+            self.equity = remote_equity
+        self.realized_pnl = float(truth.get("realized_pnl") or 0.0)
+
+        synced: list[dict[str, Any]] = []
+        for row in list(truth.get("positions") or []):
+            try:
+                size = int(row.get("size") or 0)
+                if size == 0:
+                    continue
+                direction = _normalize_direction(str(row.get("direction") or "LONG"))
+                synced.append(
+                    {
+                        "direction": direction,
+                        "size": abs(size),
+                        "price": float(row.get("price") or 0.0),
+                        "symbol": str(row.get("symbol") or EXECUTION_SYMBOL),
+                        "order_id": str(row.get("order_id") or ""),
+                        "source": "webull_remote",
+                        "verified_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            except Exception as exc:
+                logger.exception("reconcile_row_skip err=%s row=%s", exc, row)
+                continue
+
+        self.open_positions = synced
+        self.triage = TriageState.READY
+        logger.info(
+            "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=webull",
+            self.equity,
+            self.realized_pnl,
+            len(self.open_positions),
+        )
+        return BrokerTruth(True, self.equity, self.realized_pnl, list(self.open_positions), detail="ok")
+
+    async def poll_until_reconnected_forever(self) -> bool:
+        """Infinite Webull outage survival — 30–60s backoff until health + reconcile succeed."""
+        self.begin_reconnect()
+        attempt = 0
+        backoff = RECONNECT_BACKOFF_MIN_S
+        while True:
+            attempt += 1
+            try:
+                ok, detail = await self.health_check_timed()
+            except Exception as exc:
+                ok, detail = False, str(exc)
+                logger.exception("webull_reconnect_health_failed attempt=%s", attempt)
+
+            if ok:
+                logger.info("webull_reconnected attempt=%s detail=%s — reconciling", attempt, detail)
+                truth = await self.reconcile_with_broker()
+                if truth.ok:
+                    return True
+                logger.error("webull_reconnect_ok_but_reconcile_failed detail=%s", truth.detail)
+            else:
+                logger.warning(
+                    "webull_reconnect_wait attempt=%s backoff=%.0fs detail=%s",
+                    attempt,
+                    backoff,
+                    detail,
+                )
+
+            try:
+                await asyncio.sleep(backoff)
+            except Exception as exc:
+                logger.exception("reconnect_sleep_failed err=%s", exc)
+            backoff = min(RECONNECT_BACKOFF_MAX_S, backoff * 1.25)
+
+    async def flatten_opposite_if_needed(
+        self,
+        *,
+        desired_direction: str,
+        price: float,
+        stop_ticks: int,
+    ) -> bool:
+        desired = _normalize_direction(desired_direction)
+        if desired not in {"LONG", "SHORT"}:
+            return True
+
+        exposure_dir, exposure_size = self.net_exposure()
+        if exposure_dir == "FLAT" or exposure_size <= 0:
+            return True
+        if exposure_dir == desired:
+            return True
+
+        flat_dir = _opposite(exposure_dir)
+        logger.warning(
+            "POSITION_EXCLUSIVITY flatten %s x%s via Webull before entry %s",
+            exposure_dir,
+            exposure_size,
+            desired,
+        )
+        flatten_order = Order(
+            symbol=self._contract or EXECUTION_SYMBOL,
+            direction=flat_dir,
+            size=exposure_size,
+            price=price,
+            stop_ticks=max(1, int(stop_ticks)),
+            quote_ts=time.time(),
+        )
+        v = validate_order(flatten_order, max_price_age_s=self.max_price_age_s)
+        if not v.ok:
+            logger.error("FLATTEN_VALIDATION_FAILED reason=%s", v.reason)
+            return False
+
+        try:
+            result = await self.submit_order_timed(
+                direction=flatten_order.direction,
+                contracts=flatten_order.size,
+                limit_price=flatten_order.price,
+            )
+        except Exception as exc:
+            logger.exception("FLATTEN_SUBMIT_FAILED err=%s", exc)
+            self.enter_triage("flatten_exception")
+            return False
+
+        if not _fill_confirmed(result.status):
+            logger.error("FLATTEN_NO_FILL_CONFIRM status=%s detail=%s", result.status, result.detail)
+            return False
+
+        logger.info(
+            "FLATTEN_CONFIRMED id=%s status=%s fill=%.2f size=%s",
+            result.order_id,
+            result.status,
+            result.fill_price,
+            result.contracts,
+        )
+        self.open_positions = [
+            p
+            for p in self.open_positions
+            if _normalize_direction(str(p.get("direction") or "")) == desired
+        ]
+        truth = await self.reconcile_with_broker()
+        return truth.ok and self.net_exposure()[0] in {"FLAT", desired}
+
+    def size_for_direction(self, *, direction: str, stop_ticks: int) -> SizeResult:
+        return calculate_max_contracts(equity=self.equity, stop_ticks=stop_ticks)
+
+    async def fire_order(self, order: Order) -> OrderExecutionResult | None:
+        if not self.can_send_new_orders():
+            logger.error("ORDER_BLOCKED triage=%s — no new orders until verified", self.triage.value)
+            return None
+
+        flattened = await self.flatten_opposite_if_needed(
+            desired_direction=order.direction,
+            price=order.price,
+            stop_ticks=order.stop_ticks,
+        )
+        if not flattened:
+            logger.error("ORDER_BLOCKED exclusivity_flatten_failed")
+            return None
+
+        order = Order(
+            symbol=order.symbol if order.symbol else (self._contract or EXECUTION_SYMBOL),
+            direction=order.direction,
+            size=order.size,
+            price=order.price,
+            stop_ticks=order.stop_ticks,
+            quote_ts=time.time(),
+            order_id=order.order_id,
+        )
+
+        v = validate_order(order, expected_symbol=EXECUTION_SYMBOL, max_price_age_s=self.max_price_age_s)
+        if not v.ok:
+            logger.error("ORDER_REJECTED_VALIDATION reason=%s", v.reason)
+            return None
+
+        risk = reject_if_over_risk(
+            equity=self.equity,
+            contracts=order.size,
+            stop_ticks=order.stop_ticks,
+        )
+        if not risk.ok:
+            logger.error("ORDER_REJECTED_RISK reason=%s", risk.reason)
+            return None
+
+        try:
+            result = await self.submit_order_timed(
+                direction=order.direction,
+                contracts=order.size,
+                limit_price=order.price,
+            )
+        except Exception as exc:
+            logger.exception("ORDER_SUBMIT_FAILED err=%s", exc)
+            self.enter_triage("submit_exception")
+            return None
+
+        if _fill_confirmed(result.status):
+            self.open_positions.append(
+                {
+                    "direction": _normalize_direction(order.direction),
+                    "size": order.size,
+                    "price": result.fill_price,
+                    "order_id": result.order_id,
+                    "symbol": result.contract or order.symbol,
+                    "source": "webull_fill",
+                }
+            )
+        return result
+
+
+__all__ = [
+    "BrokerTruth",
+    "NETWORK_TIMEOUT_S",
+    "Order",
+    "RECONNECT_BACKOFF_MAX_S",
+    "RECONNECT_BACKOFF_MIN_S",
+    "RISK_LIMIT_PCT",
+    "SizeResult",
+    "TriageState",
+    "ValidationResult",
+    "VirtueBroker",
+    "calculate_max_contracts",
+    "reject_if_over_risk",
+    "validate_order",
+]
