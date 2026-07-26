@@ -41,6 +41,7 @@ from engine.config import (
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    forward_test_force_paper,
 )
 from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 from manus.heartbeat import BrokerHeartbeatAgent, HeartbeatState
@@ -268,10 +269,13 @@ async def run_cycle(
     session.risk.update_nav(session.broker.equity)
 
     try:
+        # Forward-test paper caps contracts (e.g. 3 MES = $225) below Manus 0.5% floor
+        # (~$425 on $100k) — waive floor in FORWARD_TEST_MODE only.
         verdict, reason = session.risk.evaluate(
             realized_pnl_today=session.realized_pnl_today,
             open_risk_notional=open_risk,
             proposed_trade_risk=proposed_risk,
+            sandbox_fallback=forward_test_force_paper(),
         )
     except Exception as exc:
         logger.exception("manus_evaluate_failed err=%s", exc)
@@ -279,6 +283,15 @@ async def run_cycle(
         return
 
     if verdict == RiskVerdict.HALT:
+        # Hard daily loss / concurrent risk: halt. Floor mismatch in paper: skip cycle only.
+        if forward_test_force_paper() and "fixed_fractional_floor" in reason:
+            logger.warning(
+                "CYCLE %s MANUS_PAPER_SKIP reason=%s — stand aside this cycle (not session halt)",
+                session.cycle,
+                reason,
+            )
+            session.last_action = "FLAT"
+            return
         session.halted = True
         logger.error("CYCLE %s MANUS_HALT reason=%s — session halted", session.cycle, reason)
         session.last_action = "FLAT"
