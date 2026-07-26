@@ -27,6 +27,7 @@ from typing import Any
 from engine.config import (
     EXECUTION_SYMBOL,
     FIXED_FRACTIONAL_RISK_PCT,
+    STARTING_NAV,
     WEBULL_NETWORK_TIMEOUT_S,
     forward_test_force_paper,
     paper_max_mes_contracts,
@@ -509,10 +510,29 @@ class VirtueBroker:
             self.triage = TriageState.DISCONNECTED
             return BrokerTruth(False, self.equity, self.realized_pnl, [], detail=detail)
 
-        # Justice: always overwrite local book with broker equity — including 0.00.
-        # Never keep STARTING_NAV / stale capital when Webull reports an empty futures account.
+        # Justice: broker equity is absolute truth on live/sandbox.
+        # Forward-test paper (FORWARD_TEST_MODE): Webull live futures often reports $0;
+        # historically FM sized against STARTING_NAV and filled locally (webull_paper_fill).
+        # That is FM paper — not the Webull mobile/sandbox $100k account.
         remote_equity = max(0.0, float(truth.get("equity") or 0.0))
-        self.equity = remote_equity
+        equity_source = "webull"
+        if remote_equity > 0:
+            self.equity = remote_equity
+        elif forward_test_force_paper() and not webull_is_sandbox():
+            self.equity = float(STARTING_NAV)
+            equity_source = "forward_test_paper_nav"
+            logger.warning(
+                "reconcile_forward_test_paper_nav equity=%.2f (webull_live_futures=0.00) "
+                "orders=local_paper_fills — not Webull sandbox app paper",
+                self.equity,
+            )
+        else:
+            self.equity = 0.0
+            logger.error(
+                "reconcile_zero_equity account=%s — Temperance: size/fire blocked until "
+                "futures funded (live) or WEBULL_API_HOST=api.sandbox.webull.com with sandbox keys (paper API)",
+                truth.get("account_id") or webull_futures_account_id() or "unknown",
+            )
         self.realized_pnl = float(truth.get("realized_pnl") or 0.0)
 
         synced: list[dict[str, Any]] = []
@@ -539,18 +559,14 @@ class VirtueBroker:
 
         self.open_positions = synced
         self.triage = TriageState.READY
-        if self.equity <= 0:
-            logger.error(
-                "reconcile_zero_equity account=%s — Temperance: size/fire blocked until futures account funded",
-                truth.get("account_id") or webull_futures_account_id() or "unknown",
-            )
         logger.info(
-            "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=webull",
+            "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=%s",
             self.equity,
             self.realized_pnl,
             len(self.open_positions),
+            equity_source,
         )
-        return BrokerTruth(True, self.equity, self.realized_pnl, list(self.open_positions), detail="ok")
+        return BrokerTruth(True, self.equity, self.realized_pnl, list(self.open_positions), detail=equity_source)
 
     async def poll_until_reconnected_forever(self) -> bool:
         """Infinite Webull outage survival — 30–60s backoff until health + reconcile succeed."""

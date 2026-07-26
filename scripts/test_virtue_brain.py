@@ -120,6 +120,15 @@ def test_zero_equity_blocks_sizing() -> None:
     assert sized.contracts == 0
 
 
+def test_forward_test_paper_nav_allows_sizing() -> None:
+    """FORWARD_TEST_MODE paper uses STARTING_NAV when live Webull futures equity is 0."""
+    from engine.config import STARTING_NAV
+
+    sized = calculate_max_contracts(equity=STARTING_NAV, stop_ticks=60)
+    assert not sized.rejected
+    assert sized.contracts >= 1
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -130,4 +139,5 @@ if __name__ == "__main__":
     test_position_exclusivity_helpers()
     test_network_timeout_constant()
     test_zero_equity_blocks_sizing()
+    test_forward_test_paper_nav_allows_sizing()
     print("ALL VIRTUE BRAIN TESTS PASSED")

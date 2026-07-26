@@ -355,7 +355,13 @@ async def run_loop(
             session.realized_pnl_today = float(session.broker.realized_pnl or 0.0)
             if session.broker.equity <= 0:
                 logger.error(
-                    "BOOT zero_futures_equity — Virtue will stand aside on size until account is funded"
+                    "BOOT zero_futures_equity — Virtue will stand aside on size until account is funded "
+                    "(or enable FORWARD_TEST_MODE paper NAV / Webull sandbox keys)"
+                )
+            elif truth.detail == "forward_test_paper_nav":
+                logger.info(
+                    "BOOT forward_test_paper_nav equity=%.2f — local paper fills (not Webull app sandbox)",
+                    session.broker.equity,
                 )
     except Exception as exc:
         logger.exception("boot_reconcile_failed err=%s", exc)
