@@ -137,7 +137,25 @@ class AlpacaSPYFeed:
         except Exception as e:
             logger.error("Failed to fetch SPY quote: %s", e)
             return None
-    
+
+    @staticmethod
+    def quote_age_seconds(spy_quote: dict[str, Any] | None) -> float | None:
+        """Seconds since quote timestamp; None if unparseable."""
+        if not spy_quote:
+            return None
+        raw = spy_quote.get("timestamp")
+        if not raw:
+            return None
+        try:
+            from datetime import timezone
+
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds())
+        except Exception:
+            return None
+
     def scale_spy_to_mes(self, spy_price: float) -> float:
         """Convert SPY price to approximate MES futures price."""
         return round(spy_price * SPY_TO_MES_SCALE, 2)

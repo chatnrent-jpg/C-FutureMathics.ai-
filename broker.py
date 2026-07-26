@@ -45,6 +45,8 @@ RISK_LIMIT_PCT = FIXED_FRACTIONAL_RISK_PCT  # 0.5%
 NETWORK_TIMEOUT_S = WEBULL_NETWORK_TIMEOUT_S  # 5.0 — Justice hard cap
 RECONNECT_BACKOFF_MIN_S = 30.0
 RECONNECT_BACKOFF_MAX_S = 60.0
+# SPY is closed Sun/overnight while MES trades — reject stale equity quotes (Justice)
+MAX_SPY_QUOTE_AGE_S = 15 * 60.0
 
 
 class TriageState(str, Enum):
@@ -351,24 +353,36 @@ class VirtueBroker:
                 logger.exception("alpaca_quote_failed err=%s", exc)
                 spy_quote = None
             if spy_quote:
-                tick = self.data.get_mes_proxy_tick(spy_quote)
-                price = float(tick.get("price") or tick.get("last") or 0.0)
-                if price > 0:
-                    self._last_price = price
-                    tick = {
-                        **tick,
-                        "symbol": self._contract,
-                        "source": "alpaca_spy_mes_proxy",
-                        "latency_ms": float(tick.get("latency_ms") or 45.0),
-                    }
-                    return {
-                        "tick": tick,
-                        "live_stream": True,
-                        "alpaca": True,
-                        "webull_contract": self._contract,
-                        "spy_quote": spy_quote,
-                    }
-            logger.warning("Alpaca quote unavailable — trying Webull futures snapshot")
+                age_s = AlpacaSPYFeed.quote_age_seconds(spy_quote)
+                if age_s is not None and age_s > MAX_SPY_QUOTE_AGE_S:
+                    logger.error(
+                        "alpaca_spy_quote_stale age_s=%.0f max=%.0f ts=%s — Justice: reject "
+                        "(SPY closed; cannot proxy Sunday/overnight MES)",
+                        age_s,
+                        MAX_SPY_QUOTE_AGE_S,
+                        spy_quote.get("timestamp"),
+                    )
+                    # Fall through to Webull MES quote; if that fails, caller stands aside
+                else:
+                    tick = self.data.get_mes_proxy_tick(spy_quote)
+                    price = float(tick.get("price") or tick.get("last") or 0.0)
+                    if price > 0:
+                        self._last_price = price
+                        tick = {
+                            **tick,
+                            "symbol": self._contract,
+                            "source": "alpaca_spy_mes_proxy",
+                            "latency_ms": float(tick.get("latency_ms") or 45.0),
+                            "quote_age_s": age_s,
+                        }
+                        return {
+                            "tick": tick,
+                            "live_stream": True,
+                            "alpaca": True,
+                            "webull_contract": self._contract,
+                            "spy_quote": spy_quote,
+                        }
+            logger.warning("Alpaca quote unavailable/stale — trying Webull futures snapshot")
 
         # Fallback: Webull (requires US_FUTURES subscription)
         try:
@@ -383,10 +397,18 @@ class VirtueBroker:
 
         if not quote or quote.get("needs_subscription"):
             detail = (quote or {}).get("error") or "webull_quote_unavailable"
-            raise RuntimeError(
-                f"market_data_unavailable: Alpaca failed and Webull quote blocked ({detail}). "
-                "Ensure ALPACA_API_KEY/SECRET are set."
+            # Soft fail: Sunday/overnight MES needs live futures quotes; SPY proxy is stale.
+            # Do not raise — caller stands aside (Justice) instead of outage reconnect theater.
+            logger.error(
+                "market_data_stand_aside alpaca_stale_or_down webull=%s — no fresh MES price",
+                detail,
             )
+            return {
+                "tick": {"price": 0.0, "last": 0.0, "source": "unavailable"},
+                "live_stream": False,
+                "stand_aside": True,
+                "detail": detail,
+            }
 
         price = float(quote.get("price") or quote.get("last") or 0.0)
         if price <= 0:

@@ -194,6 +194,15 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
+    if ctx.get("stand_aside"):
+        logger.error(
+            "CYCLE %s market_data_stand_aside detail=%s — Justice flat (need live MES, not stale SPY)",
+            session.cycle,
+            ctx.get("detail"),
+        )
+        session.last_action = "FLAT"
+        return
+
     tick = ctx.get("tick") or {}
     price = float(tick.get("price") or tick.get("last") or 0.0)
     if price <= 0:
@@ -221,6 +230,18 @@ async def run_cycle(
 
     if decision.action == SignalAction.FLAT:
         session.last_action = "FLAT"
+        return
+
+    # Already in desired direction — hold (no pyramid every cycle)
+    net_dir, net_size = session.broker.net_exposure()
+    if net_size > 0 and net_dir == decision.action.value:
+        logger.info(
+            "CYCLE %s already_%s x%s — hold (no add)",
+            session.cycle,
+            net_dir,
+            net_size,
+        )
+        session.last_action = decision.action.value
         return
 
     # Temperance: daily profit lock (no new entries after strong day)
