@@ -121,8 +121,7 @@ async def _survive_outage(session: VirtueSession, reason: str) -> bool:
         logger.exception("outage_survival_failed err=%s", exc)
         return False
     if ok:
-        if session.broker.equity > 0:
-            session.risk.update_nav(session.broker.equity)
+        session.risk.update_nav(session.broker.equity)
         session.realized_pnl_today = float(session.broker.realized_pnl or session.realized_pnl_today)
         logger.info(
             "OUTAGE_RECOVERED equity=%.2f realized_pnl=%.2f positions=%s",
@@ -265,9 +264,8 @@ async def run_cycle(
     proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
     open_risk = _open_risk_notional(session, stop_ticks)
 
-    # Sync Manus NAV from broker truth when available
-    if session.broker.equity > 0:
-        session.risk.update_nav(session.broker.equity)
+    # Sync Manus NAV from broker truth (including equity=0 → no fake STARTING_NAV)
+    session.risk.update_nav(session.broker.equity)
 
     try:
         verdict, reason = session.risk.evaluate(
@@ -349,12 +347,16 @@ async def run_loop(
         NETWORK_TIMEOUT_S,
     )
 
-    # Boot reconcile (Webull absolute truth)
+    # Boot reconcile (Webull absolute truth — including equity=0)
     try:
         truth = await session.broker.reconcile_with_broker()
-        if truth.ok and session.broker.equity > 0:
+        if truth.ok:
             session.risk.update_nav(session.broker.equity)
             session.realized_pnl_today = float(session.broker.realized_pnl or 0.0)
+            if session.broker.equity <= 0:
+                logger.error(
+                    "BOOT zero_futures_equity — Virtue will stand aside on size until account is funded"
+                )
     except Exception as exc:
         logger.exception("boot_reconcile_failed err=%s", exc)
 

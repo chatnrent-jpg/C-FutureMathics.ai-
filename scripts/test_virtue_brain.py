@@ -113,6 +113,13 @@ def test_network_timeout_constant() -> None:
     assert NETWORK_TIMEOUT_S == 5.0
 
 
+def test_zero_equity_blocks_sizing() -> None:
+    """Temperance: never size off fake NAV when futures equity is 0."""
+    sized = calculate_max_contracts(equity=0.0, stop_ticks=60)
+    assert sized.rejected
+    assert sized.contracts == 0
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -122,4 +129,5 @@ if __name__ == "__main__":
     test_risk_math_consistency()
     test_position_exclusivity_helpers()
     test_network_timeout_constant()
+    test_zero_equity_blocks_sizing()
     print("ALL VIRTUE BRAIN TESTS PASSED")

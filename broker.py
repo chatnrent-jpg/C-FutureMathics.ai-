@@ -509,9 +509,10 @@ class VirtueBroker:
             self.triage = TriageState.DISCONNECTED
             return BrokerTruth(False, self.equity, self.realized_pnl, [], detail=detail)
 
-        remote_equity = float(truth.get("equity") or 0.0)
-        if remote_equity > 0:
-            self.equity = remote_equity
+        # Justice: always overwrite local book with broker equity — including 0.00.
+        # Never keep STARTING_NAV / stale capital when Webull reports an empty futures account.
+        remote_equity = max(0.0, float(truth.get("equity") or 0.0))
+        self.equity = remote_equity
         self.realized_pnl = float(truth.get("realized_pnl") or 0.0)
 
         synced: list[dict[str, Any]] = []
@@ -538,6 +539,11 @@ class VirtueBroker:
 
         self.open_positions = synced
         self.triage = TriageState.READY
+        if self.equity <= 0:
+            logger.error(
+                "reconcile_zero_equity account=%s — Temperance: size/fire blocked until futures account funded",
+                truth.get("account_id") or webull_futures_account_id() or "unknown",
+            )
         logger.info(
             "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=webull",
             self.equity,

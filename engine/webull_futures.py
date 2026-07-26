@@ -214,15 +214,27 @@ def get_account_balance() -> dict[str, Any]:
     equity = None
     buying_power = None
     if isinstance(payload, dict):
-        equity = payload.get("total_net_liquidation_value") or payload.get("total_asset")
+        equity = (
+            payload.get("total_net_liquidation_value")
+            or payload.get("total_asset")
+            or payload.get("netLiquidation")
+            or payload.get("net_liquidation")
+            or payload.get("equity")
+        )
         assets = payload.get("account_currency_assets") or payload.get("currency_assets") or []
         if isinstance(assets, list) and assets and isinstance(assets[0], dict):
             buying_power = assets[0].get("buying_power")
+            if equity is None:
+                equity = assets[0].get("net_liquidation_value") or assets[0].get("total_asset")
         buying_power = buying_power or payload.get("buying_power")
+    try:
+        equity_f = float(equity) if equity is not None else 0.0
+    except (TypeError, ValueError):
+        equity_f = 0.0
     return {
         "ok": status == 200,
         "account_id": acct_id,
-        "equity": equity,
+        "equity": equity_f,
         "buying_power": buying_power,
         "paper_host": webull_is_sandbox(),
     }
