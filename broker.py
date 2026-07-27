@@ -690,6 +690,109 @@ class VirtueBroker:
         truth = await self.reconcile_with_broker()
         return truth.ok and self.net_exposure()[0] in {"FLAT", desired}
 
+    async def flatten_all(
+        self,
+        *,
+        price: float,
+        stop_ticks: int,
+        reason: str = "flatten_all",
+    ) -> tuple[bool, float]:
+        """
+        Close entire net exposure. Returns (ok, approx_realized_pnl).
+        Used when Wisdom goes FLAT / stop hit (Temperance + Courage exit).
+        """
+        from engine.config import POINT_VALUE, TICK_SIZE
+
+        exposure_dir, exposure_size = self.net_exposure()
+        if exposure_dir == "FLAT" or exposure_size <= 0:
+            return True, 0.0
+
+        entries = [
+            float(p.get("price") or p.get("entry_price") or 0.0)
+            for p in self.open_positions
+            if _normalize_direction(str(p.get("direction") or "")) == exposure_dir
+        ]
+        entry = sum(entries) / len(entries) if entries else float(price)
+        points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
+        approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
+
+        flat_dir = _opposite(exposure_dir)
+        logger.warning(
+            "FLATTEN_ALL reason=%s close %s x%s @ %.2f entry≈%.2f pnl≈%.2f",
+            reason,
+            exposure_dir,
+            exposure_size,
+            price,
+            entry,
+            approx_pnl,
+        )
+        flatten_order = Order(
+            symbol=self._contract or EXECUTION_SYMBOL,
+            direction=flat_dir,
+            size=exposure_size,
+            price=price,
+            stop_ticks=max(1, int(stop_ticks)),
+            quote_ts=time.time(),
+        )
+        v = validate_order(flatten_order, max_price_age_s=self.max_price_age_s)
+        if not v.ok:
+            logger.error("FLATTEN_ALL_VALIDATION_FAILED reason=%s", v.reason)
+            return False, 0.0
+
+        try:
+            result = await self.submit_order_timed(
+                direction=flatten_order.direction,
+                contracts=flatten_order.size,
+                limit_price=flatten_order.price,
+            )
+        except Exception as exc:
+            logger.exception("FLATTEN_ALL_SUBMIT_FAILED err=%s", exc)
+            self.enter_triage("flatten_all_exception")
+            return False, 0.0
+
+        if not _fill_confirmed(result.status):
+            logger.error("FLATTEN_ALL_NO_FILL status=%s detail=%s", result.status, result.detail)
+            return False, 0.0
+
+        fill = float(result.fill_price or price)
+        points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
+        approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
+        self.open_positions = []
+        logger.info(
+            "FLATTEN_ALL_CONFIRMED id=%s status=%s fill=%.2f pnl≈%.2f reason=%s",
+            result.order_id,
+            result.status,
+            fill,
+            approx_pnl,
+            reason,
+        )
+        # Forward-test paper: local book is source of truth (Webull futures equity is 0)
+        if forward_test_force_paper() and not webull_is_sandbox():
+            return True, approx_pnl
+        truth = await self.reconcile_with_broker()
+        return bool(truth.ok and self.net_exposure()[0] == "FLAT"), approx_pnl
+
+    def stop_hit(self, *, price: float, stop_ticks: int) -> bool:
+        """True if mark price breached stop_ticks from average entry."""
+        from engine.config import TICK_SIZE
+
+        exposure_dir, exposure_size = self.net_exposure()
+        if exposure_dir == "FLAT" or exposure_size <= 0:
+            return False
+        entries = [
+            float(p.get("price") or p.get("entry_price") or 0.0)
+            for p in self.open_positions
+            if _normalize_direction(str(p.get("direction") or "")) == exposure_dir
+            and float(p.get("price") or p.get("entry_price") or 0.0) > 0
+        ]
+        if not entries:
+            return False
+        entry = sum(entries) / len(entries)
+        stop_pts = max(1, int(stop_ticks)) * float(TICK_SIZE)
+        if exposure_dir == "LONG":
+            return float(price) <= entry - stop_pts
+        return float(price) >= entry + stop_pts
+
     def size_for_direction(self, *, direction: str, stop_ticks: int) -> SizeResult:
         return calculate_max_contracts(equity=self.equity, stop_ticks=stop_ticks)
 

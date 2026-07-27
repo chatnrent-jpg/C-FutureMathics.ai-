@@ -129,6 +129,19 @@ def test_forward_test_paper_nav_allows_sizing() -> None:
     assert sized.contracts >= 1
 
 
+def test_stop_hit_and_flat_exit_helpers() -> None:
+    from broker import VirtueBroker
+    from engine.config import TICK_SIZE
+
+    b = VirtueBroker()
+    b.open_positions = [{"direction": "SHORT", "size": 3, "price": 9269.12}]
+    assert b.stop_hit(price=9269.12, stop_ticks=60) is False
+    # SHORT stop is above entry
+    assert b.stop_hit(price=9269.12 + 60 * TICK_SIZE, stop_ticks=60) is True
+    b.open_positions = [{"direction": "LONG", "size": 2, "price": 9200.0}]
+    assert b.stop_hit(price=9200.0 - 60 * TICK_SIZE, stop_ticks=60) is True
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -140,4 +153,5 @@ if __name__ == "__main__":
     test_network_timeout_constant()
     test_zero_equity_blocks_sizing()
     test_forward_test_paper_nav_allows_sizing()
+    test_stop_hit_and_flat_exit_helpers()
     print("ALL VIRTUE BRAIN TESTS PASSED")

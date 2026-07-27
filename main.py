@@ -263,7 +263,54 @@ async def run_cycle(
         session.broker.net_exposure(),
     )
 
+    # Hard stop from entry (Temperance) — exit even if regime still trending
+    if session.broker.stop_hit(price=price, stop_ticks=stop_ticks):
+        try:
+            ok, pnl = await session.broker.flatten_all(
+                price=price,
+                stop_ticks=stop_ticks,
+                reason="stop_hit",
+            )
+        except Exception as exc:
+            logger.exception("stop_flatten_failed err=%s", exc)
+            session.last_action = "FLAT"
+            return
+        if ok:
+            session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
+            session.trades_today += 1
+            logger.info("CYCLE %s STOP_EXIT pnl≈%.2f realized_today=%.2f", session.cycle, pnl, session.realized_pnl_today)
+        else:
+            logger.error("CYCLE %s STOP_EXIT_FAILED — exposure may remain", session.cycle)
+        session.last_action = "FLAT"
+        return
+
+    # Wisdom stand-aside / chop → close open risk (do not orphan positions)
     if decision.action == SignalAction.FLAT:
+        net_dir, net_size = session.broker.net_exposure()
+        if net_size > 0:
+            try:
+                ok, pnl = await session.broker.flatten_all(
+                    price=price,
+                    stop_ticks=stop_ticks,
+                    reason=f"wisdom_flat:{decision.reason}",
+                )
+            except Exception as exc:
+                logger.exception("flat_flatten_failed err=%s", exc)
+                session.last_action = "FLAT"
+                return
+            if ok:
+                session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
+                session.trades_today += 1
+                logger.info(
+                    "CYCLE %s WISDOM_FLAT_EXIT closed %s x%s pnl≈%.2f reason=%s",
+                    session.cycle,
+                    net_dir,
+                    net_size,
+                    pnl,
+                    decision.reason,
+                )
+            else:
+                logger.error("CYCLE %s WISDOM_FLAT_EXIT_FAILED — exposure may remain", session.cycle)
         session.last_action = "FLAT"
         return
 
