@@ -62,16 +62,17 @@ def _unrealized(positions: list, last_price: float | None) -> float:
 
 st.set_page_config(page_title="FutureMathics", layout="wide")
 st.title("FutureMathics.ai")
-st.caption("MES futures — VolumeWatch grade path · Manus risk")
+st.caption("MES futures — Virtue Wisdom brain · Manus risk (Alpaca data + Webull execution)")
 
 if os.environ.get("FM_EXTERNAL_ORCHESTRATOR", "").strip().lower() in {"1", "true", "yes"}:
-    st.caption("Cloud view — fed by background orchestrator (`system_state.json` poll)")
+    st.caption("Cloud view — fed by background virtue loop (`system_state.json` poll)")
 
 data = load_state()
 age_s = _state_age_seconds(data)
 dash = data.get("dashboard") or {}
 session = data.get("session") or {}
 grade = data.get("grade") or {}
+virtue = data.get("virtue") or {}
 positions = data.get("open_positions") or dash.get("open_positions") or []
 last_price = dash.get("last_price") if dash.get("last_price") is not None else data.get("last_price")
 unrealized = dash.get("unrealized_pnl")
@@ -80,10 +81,11 @@ if unrealized is None:
 if unrealized is None:
     unrealized = _unrealized(positions, float(last_price) if last_price else None)
 
+strategy = str(data.get("strategy") or dash.get("strategy") or "—")
 if age_s is not None and age_s > 30:
     st.warning(
         f"Engine looks idle — last update {int(age_s)}s ago. "
-        "Start the orchestrator / check futuremathics_grade on AWS."
+        "Check `futuremathics_virtue` on AWS (legacy grade path is disabled)."
     )
 
 # Big status first — this is what you look at
@@ -110,11 +112,18 @@ c3.metric("Closed today P&L", f"${pnl:,.2f}")
 c4.metric("Open risk", f"${session.get('open_risk_notional', 0):,.0f}")
 
 st.write(
-    f"**Mode:** {dash.get('mode', '—')} · **Strategy:** {data.get('strategy', '—')} · "
+    f"**Mode:** {dash.get('mode', '—')} · **Strategy:** {strategy} · "
     f"**Updated:** {data.get('updated_at', '—')}"
 )
 
-if grade:
+if virtue:
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Regime", str(virtue.get("regime") or "—"))
+    v2.metric("Signal", str(virtue.get("action") or "—"))
+    v3.metric("ADX", f"{float(virtue.get('adx') or 0):.1f}")
+    v4.metric("Exposure", f"{virtue.get('exposure') or 'FLAT'} {virtue.get('contracts') or 0}")
+    st.caption(str(virtue.get("reason") or ""))
+elif grade and strategy == "volumewatch_grade_path":
     g1, g2, g3, g4 = st.columns(4)
     g1.metric("VW grade score", f"{float(grade.get('last_score') or 0):.1f}")
     g2.metric("Path", str(grade.get("path") or "—"))

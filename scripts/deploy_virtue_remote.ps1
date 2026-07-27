@@ -34,11 +34,13 @@ scp @ssh `
     "$Root\engine\config.py" `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `
+    "$Root\engine\ui_state_bridge.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/engine/"
 
 # main.py imports scripts.run_daily_session.in_market_hours + manus risk/heartbeat
 scp @ssh `
     "$Root\scripts\run_daily_session.py" `
+    "$Root\scripts\sandbox_streamlit.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/scripts/"
 
 scp @ssh `
@@ -67,8 +69,10 @@ if ($StopGrade) {
 $remoteCmd += @(
     "sudo systemctl enable futuremathics_virtue",
     "sudo systemctl restart futuremathics_virtue",
+    "sudo systemctl restart futuremathics_dashboard || true",
     "sleep 4",
     "systemctl is-active futuremathics_virtue",
+    "systemctl is-active futuremathics_dashboard",
     "sudo journalctl -u futuremathics_virtue -n 40 --no-pager"
 )
 ssh @ssh $Remote ($remoteCmd -join " && ")

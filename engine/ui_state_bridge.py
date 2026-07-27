@@ -128,3 +128,135 @@ def ensure_boot_system_state(path: Any = None) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"[CELINE] Boot state seeded — handshake equity ${equity:,.2f}", flush=True)
+
+
+def build_virtue_system_state(
+    session: Any,
+    *,
+    last_price: float | None = None,
+    regime: str = "",
+    action: str = "",
+    reason: str = "",
+    adx: float = 0.0,
+    atr_pct: float = 0.0,
+    data_source: str = "alpaca_spy_mes_proxy",
+    last_risk_verdict: str = "",
+    last_risk_reason: str = "",
+) -> dict[str, Any]:
+    """Dashboard payload for native virtue Wisdom loop (not VolumeWatch grade path)."""
+    from engine.config import DEFAULT_STOP_TICKS, EXECUTION_SYMBOL, TICK_VALUE, forward_test_force_paper
+
+    broker = session.broker
+    risk = session.risk
+    nav = float(getattr(broker, "equity", 0.0) or risk.account_nav or STARTING_NAV)
+    net_dir, net_size = broker.net_exposure()
+    positions: list[dict[str, Any]] = []
+    for row in list(getattr(broker, "open_positions", None) or []):
+        try:
+            direction = str(row.get("direction") or "LONG").upper()
+            contracts = int(row.get("size") or row.get("contracts") or 0)
+            entry = float(row.get("price") or row.get("entry_price") or 0.0)
+            if contracts <= 0:
+                continue
+            positions.append(
+                {
+                    "direction": direction,
+                    "contracts": contracts,
+                    "entry_price": entry,
+                    "symbol": str(row.get("symbol") or EXECUTION_SYMBOL),
+                    "order_id": str(row.get("order_id") or ""),
+                }
+            )
+        except Exception:
+            continue
+    if not positions and net_size > 0:
+        positions = [
+            {
+                "direction": net_dir,
+                "contracts": int(net_size),
+                "entry_price": float(last_price or 0.0),
+                "symbol": EXECUTION_SYMBOL,
+            }
+        ]
+
+    unrealized = _unrealized_pnl(positions, last_price)
+    daily_pnl = float(getattr(session, "realized_pnl_today", 0.0) or 0.0)
+    open_risk = float(abs(net_size) * DEFAULT_STOP_TICKS * TICK_VALUE)
+    max_conc = concurrent_risk_cap(nav)
+    hard_stop = max_daily_loss_cap(nav)
+    mode = "PAPER" if forward_test_force_paper() else "LIVE"
+    now = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "version": 1,
+        "updated_at": now,
+        "symbol": EXECUTION_SYMBOL,
+        "strategy": "virtue_wisdom",
+        "data_source": data_source,
+        "last_price": last_price,
+        "unrealized_pnl": unrealized,
+        "account_nav": nav,
+        "session": {
+            "realized_pnl_today": daily_pnl,
+            "open_risk_notional": open_risk,
+            "trades_today": int(getattr(session, "trades_today", 0) or 0),
+            "halted": bool(getattr(session, "halted", False)),
+            "cycle_count": int(getattr(session, "cycle", 0) or 0),
+            "last_risk_verdict": last_risk_verdict,
+            "last_risk_reason": last_risk_reason,
+            "last_action": str(getattr(session, "last_action", "") or action),
+        },
+        "open_positions": positions,
+        "virtue": {
+            "regime": regime,
+            "action": action,
+            "reason": reason,
+            "adx": round(float(adx), 2),
+            "atr_pct": round(float(atr_pct), 4),
+            "exposure": net_dir,
+            "contracts": int(net_size),
+        },
+        "dashboard": {
+            "as_of_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "symbol": EXECUTION_SYMBOL,
+            "mode": mode,
+            "data_source": data_source,
+            "daily_pnl": daily_pnl,
+            "daily_pnl_pct": round((daily_pnl / max(nav, 1.0)) * 100, 2),
+            "unrealized_pnl": unrealized,
+            "last_price": last_price,
+            "account_nav": nav,
+            "starting_nav": float(getattr(risk, "starting_nav", STARTING_NAV) or STARTING_NAV),
+            "hard_stop_limit": hard_stop,
+            "hard_stop_distance": round(hard_stop + daily_pnl, 2),
+            "open_risk_notional": open_risk,
+            "max_concurrent_risk": max_conc,
+            "margin_utilization_pct": round((open_risk / max_conc) * 100, 1) if max_conc else 0.0,
+            "cycle_count": int(getattr(session, "cycle", 0) or 0),
+            "trades_today": int(getattr(session, "trades_today", 0) or 0),
+            "risk_verdict": last_risk_verdict or RiskVerdict.APPROVED.value,
+            "risk_reason": last_risk_reason,
+            "boot_status": "running",
+            "heartbeat_state": "GREEN",
+            "open_positions": positions,
+            "strategy": "virtue_wisdom",
+            "regime": regime,
+            "action": action,
+        },
+    }
+
+
+def persist_virtue_system_state(session: Any, **kwargs: Any) -> None:
+    """Write data/system_state.json for Streamlit / cloud dashboard."""
+    from pathlib import Path
+    import json
+    import logging
+
+    log = logging.getLogger("virtue.ui_state")
+    state_path = Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    try:
+        payload = build_virtue_system_state(session, **kwargs)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log.exception("persist_virtue_system_state_failed err=%s", exc)

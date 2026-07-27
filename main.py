@@ -45,6 +45,7 @@ from engine.config import (
 )
 from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 from manus.heartbeat import BrokerHeartbeatAgent, HeartbeatState
+from engine.ui_state_bridge import persist_virtue_system_state
 from scripts.run_daily_session import in_market_hours
 from strategy import Bar, SignalAction, WisdomStrategy
 
@@ -61,6 +62,14 @@ class VirtueSession:
     halted: bool = False
     last_action: str = "FLAT"
     realized_pnl_today: float = 0.0
+    trades_today: int = 0
+    last_risk_verdict: str = ""
+    last_risk_reason: str = ""
+    last_regime: str = ""
+    last_signal_reason: str = ""
+    last_adx: float = 0.0
+    last_atr_pct: float = 0.0
+    last_data_source: str = "alpaca_spy_mes_proxy"
     strategy: WisdomStrategy = field(default_factory=WisdomStrategy)
     broker: VirtueBroker = field(default_factory=VirtueBroker)
     risk: CapitalProtectionMatrix = field(
@@ -69,6 +78,23 @@ class VirtueSession:
             account_nav=STARTING_NAV,
             peak_nav=STARTING_NAV,
         )
+    )
+
+
+def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> None:
+    """Keep Streamlit/cloud dashboard fresh from virtue loop (not grade path)."""
+    price = last_price if last_price is not None else float(getattr(session.broker, "_last_price", 0.0) or 0.0)
+    persist_virtue_system_state(
+        session,
+        last_price=price if price > 0 else None,
+        regime=session.last_regime,
+        action=session.last_action,
+        reason=session.last_signal_reason,
+        adx=session.last_adx,
+        atr_pct=session.last_atr_pct,
+        data_source=session.last_data_source,
+        last_risk_verdict=session.last_risk_verdict,
+        last_risk_reason=session.last_risk_reason,
     )
 
 
@@ -151,6 +177,8 @@ async def run_cycle(
     if not ignore_hours and not in_market_hours():
         logger.info("CYCLE %s market_closed — stand aside", session.cycle)
         session.last_action = "FLAT"
+        session.last_regime = "MARKET_CLOSED"
+        session.last_signal_reason = "market_closed"
         return
 
     if session.halted:
@@ -201,9 +229,12 @@ async def run_cycle(
             ctx.get("detail"),
         )
         session.last_action = "FLAT"
+        session.last_regime = "NO_FRESH_DATA"
+        session.last_signal_reason = str(ctx.get("detail") or "stand_aside")
         return
 
     tick = ctx.get("tick") or {}
+    session.last_data_source = str(tick.get("source") or session.last_data_source)
     price = float(tick.get("price") or tick.get("last") or 0.0)
     if price <= 0:
         logger.error("CYCLE %s invalid_price — Justice stand aside", session.cycle)
@@ -217,6 +248,10 @@ async def run_cycle(
     session.strategy.update_price(price, high=high + TICK_SIZE, low=low - TICK_SIZE)
 
     decision = session.strategy.evaluate()
+    session.last_regime = decision.regime.value
+    session.last_signal_reason = decision.reason
+    session.last_adx = float(decision.adx)
+    session.last_atr_pct = float(decision.atr_pct)
     logger.info(
         "CYCLE %s regime=%s action=%s adx=%.1f atr_pct=%.2f reason=%s exposure=%s",
         session.cycle,
@@ -303,6 +338,9 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
+    session.last_risk_verdict = verdict.value
+    session.last_risk_reason = reason
+
     if verdict == RiskVerdict.HALT:
         # Hard daily loss / concurrent risk: halt. Floor mismatch in paper: skip cycle only.
         if forward_test_force_paper() and "fixed_fractional_floor" in reason:
@@ -351,6 +389,7 @@ async def run_cycle(
         return
 
     session.last_action = decision.action.value
+    session.trades_today += 1
     logger.info(
         "CYCLE %s FILLED/SUBMITTED %s x%s @ %s id=%s status=%s manus=%s",
         session.cycle,
@@ -407,6 +446,7 @@ async def run_loop(
         logger.exception("boot_seed_failed err=%s", exc)
 
     n = 0
+    _publish_ui(session)
     while True:
         try:
             await run_cycle(session, ignore_hours=ignore_hours)
@@ -416,6 +456,8 @@ async def run_loop(
                 await _survive_outage(session, "cycle_exception")
             except Exception:
                 logger.exception("reconnect_after_cycle_exception_failed — will retry next loop")
+        finally:
+            _publish_ui(session)
 
         n += 1
         if once or (cycles is not None and n >= cycles):
@@ -426,6 +468,7 @@ async def run_loop(
             logger.exception("loop_sleep_failed err=%s", exc)
 
     logger.info("VIRTUE LOOP done cycles=%s last_action=%s", n, session.last_action)
+    _publish_ui(session)
 
 
 def main() -> None:
