@@ -690,6 +690,17 @@ class VirtueBroker:
         truth = await self.reconcile_with_broker()
         return truth.ok and self.net_exposure()[0] in {"FLAT", desired}
 
+    def _avg_entry(self, direction: str) -> float | None:
+        entries = [
+            float(p.get("price") or p.get("entry_price") or 0.0)
+            for p in self.open_positions
+            if _normalize_direction(str(p.get("direction") or "")) == direction
+            and float(p.get("price") or p.get("entry_price") or 0.0) > 0
+        ]
+        if not entries:
+            return None
+        return sum(entries) / len(entries)
+
     async def flatten_all(
         self,
         *,
@@ -701,18 +712,13 @@ class VirtueBroker:
         Close entire net exposure. Returns (ok, approx_realized_pnl).
         Used when Wisdom goes FLAT / stop hit (Temperance + Courage exit).
         """
-        from engine.config import POINT_VALUE, TICK_SIZE
+        from engine.config import POINT_VALUE
 
         exposure_dir, exposure_size = self.net_exposure()
         if exposure_dir == "FLAT" or exposure_size <= 0:
             return True, 0.0
 
-        entries = [
-            float(p.get("price") or p.get("entry_price") or 0.0)
-            for p in self.open_positions
-            if _normalize_direction(str(p.get("direction") or "")) == exposure_dir
-        ]
-        entry = sum(entries) / len(entries) if entries else float(price)
+        entry = self._avg_entry(exposure_dir) or float(price)
         points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
         approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
 
@@ -772,6 +778,113 @@ class VirtueBroker:
         truth = await self.reconcile_with_broker()
         return bool(truth.ok and self.net_exposure()[0] == "FLAT"), approx_pnl
 
+    async def partial_close(
+        self,
+        *,
+        contracts: int,
+        price: float,
+        stop_ticks: int,
+        reason: str = "take_profit_scale_out",
+        leave: int = 1,
+    ) -> tuple[bool, float]:
+        """
+        Close `contracts` of net exposure; leave `leave` contracts as a runner.
+        Returns (ok, approx_realized_pnl on the closed size).
+        """
+        from engine.config import POINT_VALUE
+
+        exposure_dir, exposure_size = self.net_exposure()
+        close_qty = max(0, int(contracts))
+        leave_qty = max(0, int(leave))
+        if exposure_dir == "FLAT" or exposure_size <= 0 or close_qty < 1:
+            return True, 0.0
+        if exposure_size <= leave_qty:
+            logger.info(
+                "PARTIAL_CLOSE_SKIP reason=%s size=%s leave=%s — runner only",
+                reason,
+                exposure_size,
+                leave_qty,
+            )
+            return True, 0.0
+        close_qty = min(close_qty, exposure_size - leave_qty)
+
+        entry = self._avg_entry(exposure_dir) or float(price)
+        points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
+        approx_pnl = round(points * POINT_VALUE * close_qty, 2)
+        flat_dir = _opposite(exposure_dir)
+
+        logger.warning(
+            "PARTIAL_CLOSE reason=%s close %s x%s leave=%s @ %.2f entry≈%.2f pnl≈%.2f",
+            reason,
+            exposure_dir,
+            close_qty,
+            leave_qty,
+            price,
+            entry,
+            approx_pnl,
+        )
+        order = Order(
+            symbol=self._contract or EXECUTION_SYMBOL,
+            direction=flat_dir,
+            size=close_qty,
+            price=price,
+            stop_ticks=max(1, int(stop_ticks)),
+            quote_ts=time.time(),
+        )
+        v = validate_order(order, max_price_age_s=self.max_price_age_s)
+        if not v.ok:
+            logger.error("PARTIAL_CLOSE_VALIDATION_FAILED reason=%s", v.reason)
+            return False, 0.0
+
+        try:
+            result = await self.submit_order_timed(
+                direction=order.direction,
+                contracts=order.size,
+                limit_price=order.price,
+            )
+        except Exception as exc:
+            logger.exception("PARTIAL_CLOSE_SUBMIT_FAILED err=%s", exc)
+            self.enter_triage("partial_close_exception")
+            return False, 0.0
+
+        if not _fill_confirmed(result.status):
+            logger.error("PARTIAL_CLOSE_NO_FILL status=%s detail=%s", result.status, result.detail)
+            return False, 0.0
+
+        fill = float(result.fill_price or price)
+        points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
+        approx_pnl = round(points * POINT_VALUE * close_qty, 2)
+        remaining = exposure_size - close_qty
+        # Consolidate leftover into one runner row (keep original avg entry)
+        self.open_positions = [
+            {
+                "direction": exposure_dir,
+                "size": remaining,
+                "price": entry,
+                "entry_price": entry,
+                "order_id": str(result.order_id or ""),
+                "symbol": self._contract or EXECUTION_SYMBOL,
+                "source": "scale_out_runner",
+                "scaled_out_tp": True,
+            }
+        ] if remaining > 0 else []
+        logger.info(
+            "PARTIAL_CLOSE_CONFIRMED id=%s status=%s fill=%.2f closed=%s remain=%s pnl≈%.2f reason=%s",
+            result.order_id,
+            result.status,
+            fill,
+            close_qty,
+            remaining,
+            approx_pnl,
+            reason,
+        )
+        if forward_test_force_paper() and not webull_is_sandbox():
+            return True, approx_pnl
+        truth = await self.reconcile_with_broker()
+        # After live reconcile, positions may overwrite runner — require remaining exposure
+        ok = bool(truth.ok) and self.net_exposure()[1] >= leave_qty
+        return ok, approx_pnl
+
     def stop_hit(self, *, price: float, stop_ticks: int) -> bool:
         """True if mark price breached stop_ticks from average entry."""
         from engine.config import TICK_SIZE
@@ -779,19 +892,36 @@ class VirtueBroker:
         exposure_dir, exposure_size = self.net_exposure()
         if exposure_dir == "FLAT" or exposure_size <= 0:
             return False
-        entries = [
-            float(p.get("price") or p.get("entry_price") or 0.0)
-            for p in self.open_positions
-            if _normalize_direction(str(p.get("direction") or "")) == exposure_dir
-            and float(p.get("price") or p.get("entry_price") or 0.0) > 0
-        ]
-        if not entries:
+        entry = self._avg_entry(exposure_dir)
+        if entry is None:
             return False
-        entry = sum(entries) / len(entries)
         stop_pts = max(1, int(stop_ticks)) * float(TICK_SIZE)
         if exposure_dir == "LONG":
             return float(price) <= entry - stop_pts
         return float(price) >= entry + stop_pts
+
+    def take_profit_hit(self, *, price: float, target_ticks: int) -> bool:
+        """True if mark price reached target_ticks of favorable move from average entry."""
+        from engine.config import TICK_SIZE
+
+        exposure_dir, exposure_size = self.net_exposure()
+        if exposure_dir == "FLAT" or exposure_size <= 0:
+            return False
+        entry = self._avg_entry(exposure_dir)
+        if entry is None:
+            return False
+        target_pts = max(1, int(target_ticks)) * float(TICK_SIZE)
+        if exposure_dir == "LONG":
+            return float(price) >= entry + target_pts
+        return float(price) <= entry - target_pts
+
+    def scale_out_close_qty(self, *, leave: int = 1) -> int:
+        """Contracts to close so `leave` remain (0 if already at/below leave)."""
+        _, size = self.net_exposure()
+        leave_qty = max(0, int(leave))
+        if size <= leave_qty:
+            return 0
+        return int(size - leave_qty)
 
     def size_for_direction(self, *, direction: str, stop_ticks: int) -> SizeResult:
         return calculate_max_contracts(equity=self.equity, stop_ticks=stop_ticks)

@@ -24,6 +24,11 @@ from engine.config import (
     FORWARD_TEST_MARKET_OPEN_MINUTE,
     FORWARD_TEST_TIMEZONE,
     HANDSHAKE_EQUITY_BASE,
+    VIRTUE_RTH_CLOSE_HOUR,
+    VIRTUE_RTH_CLOSE_MINUTE,
+    VIRTUE_RTH_ONLY,
+    VIRTUE_RTH_OPEN_HOUR,
+    VIRTUE_RTH_OPEN_MINUTE,
     forward_test_force_paper,
 )
 from engine.futures_broker_adapter import FuturesBrokerAdapter
@@ -65,6 +70,25 @@ def in_market_hours(now: datetime | None = None) -> bool:
     # Otherwise open (Mon-Thu outside maintenance window)
     return True
 
+
+def in_rth_hours(now: datetime | None = None) -> bool:
+    """
+    US cash equity Regular Trading Hours (ET): Mon–Fri 9:30 AM – 4:00 PM.
+    Used by virtue loop so Alpaca SPY decisions stay on live tape (no eve/weekend gaps).
+    """
+    dt = (now or datetime.now(TZ)).astimezone(TZ)
+    if dt.weekday() >= 5:  # Sat/Sun
+        return False
+    open_t = time(VIRTUE_RTH_OPEN_HOUR, VIRTUE_RTH_OPEN_MINUTE)
+    close_t = time(VIRTUE_RTH_CLOSE_HOUR, VIRTUE_RTH_CLOSE_MINUTE)
+    return open_t <= dt.time() < close_t
+
+
+def virtue_session_open(now: datetime | None = None) -> bool:
+    """Session gate for virtue main: RTH-only when enabled, else CME hours."""
+    if VIRTUE_RTH_ONLY:
+        return in_rth_hours(now)
+    return in_market_hours(now)
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
     ensure_boot_system_state()

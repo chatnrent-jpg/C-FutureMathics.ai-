@@ -39,6 +39,11 @@ scp @ssh `
 
 # main.py imports scripts.run_daily_session.in_market_hours + manus risk/heartbeat
 scp @ssh `
+    "$Root\celine\live_vwap.py" `
+    "$Root\celine\live_twap.py" `
+    "${Remote}:/home/ubuntu/FutureMathics.ai/celine/"
+
+scp @ssh `
     "$Root\scripts\run_daily_session.py" `
     "$Root\scripts\sandbox_streamlit.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/scripts/"

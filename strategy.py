@@ -2,10 +2,11 @@
 FutureMathics native Wisdom brain — market regime classification.
 
 Pillar 1 (Wisdom / Phronesis):
-  EMA trend filter + ADX/ATR volatility filter.
-  - Bullish trend + stable volatility → LONG
-  - Bearish trend → SHORT
-  - Choppy / chaotic ADX → STAND ASIDE (NO_TRADE)
+  VWAP + TWAP scored 0–100% (50 = at average).
+  - Both scores > 50 → LONG
+  - Both scores < 50 → SHORT
+  - Disagree / neutral → STAND ASIDE
+  ATR% chaos → STAND ASIDE (never force trades in unstable vol)
 
 No VolumeWatch dependency. Objective conditions only.
 """
@@ -16,6 +17,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Sequence
+
+from celine.live_twap import LiveTwapTracker
+from celine.live_vwap import LiveVwapTracker
 
 
 class Regime(str, Enum):
@@ -36,6 +40,7 @@ class Bar:
     high: float
     low: float
     close: float
+    volume: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +53,23 @@ class RegimeDecision:
     atr: float
     atr_pct: float
     reason: str
+    vwap: float = 0.0
+    twap: float = 0.0
+    vwap_score: float = 50.0
+    twap_score: float = 50.0
+    blended_score: float = 50.0
+
+
+def score_vs_anchor(price: float, anchor: float, *, scale: float) -> float:
+    """
+    Map price vs anchor to 0–100.
+    50 = price at anchor; >50 price above; <50 price below.
+    ±scale maps to the full 0–100 range (clamped).
+    """
+    if price <= 0 or anchor <= 0 or scale <= 0:
+        return 50.0
+    raw = 50.0 + 50.0 * ((float(price) - float(anchor)) / float(scale))
+    return round(max(0.0, min(100.0, raw)), 2)
 
 
 @dataclass
@@ -55,32 +77,103 @@ class WisdomStrategy:
     """
     Dynamic regime detection for MES (or any continuous price series).
 
-    Trend: EMA(fast) vs EMA(slow).
-    Volatility structure: ADX for trend strength; ATR% for chaos / unstable vol.
+    Direction: VWAP score + TWAP score (both must agree vs 50%).
+    Volatility structure: ATR% for chaos / unstable vol stand-aside.
+    EMA/ADX retained for telemetry (not hard directional gates).
     """
 
     ema_fast_period: int = 20
     ema_slow_period: int = 50
     adx_period: int = 14
     atr_period: int = 14
-    adx_trend_min: float = 25.0  # below → chop / no trade
+    adx_trend_min: float = 0.0  # unused as hard gate; kept for compat/tests
     atr_pct_chaos_max: float = 2.5  # ATR as % of price; above → stand aside
+    score_atr_mult: float = 2.0  # ATR component of score scale
+    score_price_pct: float = 0.005  # ±0.5% of price spans 0–100 (avoids 0/100 clamp)
+    max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
+    long_enter: float = 55.0  # hysteresis: need clear strength to go LONG
+    short_enter: float = 45.0  # hysteresis: need clear weakness to go SHORT
+    anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)
+    min_anchor_samples: int = 20
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     highs: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     lows: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    vwap_tracker: LiveVwapTracker | None = None
+    twap_tracker: LiveTwapTracker | None = None
+
+    def __post_init__(self) -> None:
+        if self.vwap_tracker is None:
+            self.vwap_tracker = LiveVwapTracker(window=self.anchor_window)
+        if self.twap_tracker is None:
+            self.twap_tracker = LiveTwapTracker(window=self.anchor_window)
 
     def update(self, bar: Bar) -> None:
-        self.highs.append(float(bar.high))
-        self.lows.append(float(bar.low))
-        self.closes.append(float(bar.close))
+        high = float(bar.high)
+        low = float(bar.low)
+        close = float(bar.close)
+        self.highs.append(high)
+        self.lows.append(low)
+        self.closes.append(close)
+        # Equal-weight close for both anchors (SPY proxy has no reliable tape size)
+        assert self.vwap_tracker is not None and self.twap_tracker is not None
+        self.vwap_tracker.update_trade(price=close, size=1.0)
+        self.twap_tracker.update(close)
 
     def update_price(self, price: float, *, high: float | None = None, low: float | None = None) -> None:
         p = float(price)
-        self.update(Bar(high=high if high is not None else p, low=low if low is not None else p, close=p))
+        self.update(
+            Bar(
+                high=high if high is not None else p,
+                low=low if low is not None else p,
+                close=p,
+                volume=1.0,
+            )
+        )
 
     def seed(self, bars: Sequence[Bar]) -> None:
         for bar in bars:
             self.update(bar)
+
+    def rebase_anchors_to_price(self, live_price: float) -> None:
+        """
+        Shift rolling VWAP/TWAP onto the live quote so seeded 5m bars
+        do not disagree with the Alpaca live print (Justice).
+        """
+        assert self.vwap_tracker is not None and self.twap_tracker is not None
+        closes = list(self.closes)
+        px = float(live_price)
+        if not closes or px <= 0:
+            return
+        shift = px - float(closes[-1])
+        self.vwap_tracker.reset()
+        self.twap_tracker.reset()
+        window = closes[-self.anchor_window :]
+        for c in window:
+            p = float(c) + shift
+            self.vwap_tracker.update_trade(price=p, size=1.0)
+            self.twap_tracker.update(p)
+
+    def anchor_gap_too_wide(self, price: float) -> bool:
+        """
+        True on a sudden live disconnect from rolling VWAP (seed/live mismatch).
+        Organic trends widen gap slowly — those must NOT trigger rebase every cycle.
+        """
+        assert self.vwap_tracker is not None
+        px = float(price)
+        vwap = float(self.vwap_tracker.vwap or 0.0)
+        closes = list(self.closes)
+        if px <= 0 or vwap <= 0 or not closes:
+            return False
+        gap_pct = abs(px - vwap) / px
+        atr = self._atr()
+        jump = abs(px - float(closes[-1]))
+        jump_gate = max(2.0 * atr if atr > 0 else 0.0, px * 0.002, 5.0)
+        gap_gate = max(self.max_anchor_gap_pct, (3.0 * atr / px) if atr > 0 else self.max_anchor_gap_pct)
+        return gap_pct > gap_gate and jump > jump_gate
+
+    def score_scale(self, *, price: float, atr: float) -> float:
+        return max(atr * self.score_atr_mult, price * self.score_price_pct, 5.0)
+
 
     @staticmethod
     def _ema(values: Sequence[float], period: int) -> float:
@@ -113,7 +206,7 @@ class WisdomStrategy:
         return sum(window) / len(window) if window else 0.0
 
     def _adx(self) -> float:
-        """Wilder-style ADX approximation on stored OHLC."""
+        """Wilder-style ADX approximation on stored OHLC (telemetry only)."""
         n = self.adx_period
         if len(self.closes) < n + 2:
             return 0.0
@@ -164,21 +257,48 @@ class WisdomStrategy:
             dx_list.append(dx)
         if len(dx_list) < n:
             return sum(dx_list) / len(dx_list) if dx_list else 0.0
-        # ADX = Wilder smooth of DX
         adx_s = wilder_smooth(dx_list, n)
         return float(adx_s[-1] / n)
 
-    def evaluate(self) -> RegimeDecision:
-        need = max(self.ema_slow_period, self.adx_period + 2, self.atr_period + 2)
-        if len(self.closes) < need:
-            return RegimeDecision(
+    def _empty(
+        self,
+        *,
+        regime: Regime,
+        action: SignalAction,
+        reason: str,
+        ema_fast: float = 0.0,
+        ema_slow: float = 0.0,
+        adx: float = 0.0,
+        atr: float = 0.0,
+        atr_pct: float = 0.0,
+        vwap: float = 0.0,
+        twap: float = 0.0,
+        vwap_score: float = 50.0,
+        twap_score: float = 50.0,
+    ) -> RegimeDecision:
+        blended = round((vwap_score + twap_score) / 2.0, 2)
+        return RegimeDecision(
+            regime=regime,
+            action=action,
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            adx=adx,
+            atr=atr,
+            atr_pct=atr_pct,
+            reason=reason,
+            vwap=vwap,
+            twap=twap,
+            vwap_score=vwap_score,
+            twap_score=twap_score,
+            blended_score=blended,
+        )
+
+    def evaluate(self, *, holding: str | None = None) -> RegimeDecision:
+        need = max(self.atr_period + 2, self.min_anchor_samples)
+        if len(self.closes) < need or self.twap_tracker.samples < self.min_anchor_samples:
+            return self._empty(
                 regime=Regime.WARMUP,
                 action=SignalAction.FLAT,
-                ema_fast=0.0,
-                ema_slow=0.0,
-                adx=0.0,
-                atr=0.0,
-                atr_pct=0.0,
                 reason="insufficient_bars_stand_aside",
             )
 
@@ -189,66 +309,166 @@ class WisdomStrategy:
         adx = self._adx()
         atr = self._atr()
         atr_pct = (atr / price * 100.0) if price > 0 else 0.0
+        assert self.vwap_tracker is not None and self.twap_tracker is not None
+        vwap = float(self.vwap_tracker.vwap or price)
+        twap = float(self.twap_tracker.twap or price)
+        # Wide scale so normal MES noise doesn't slam scores to 0/100
+        scale = self.score_scale(price=price, atr=atr)
+        vwap_score = score_vs_anchor(price, vwap, scale=scale)
+        twap_score = score_vs_anchor(price, twap, scale=scale)
+        blended = round((vwap_score + twap_score) / 2.0, 2)
+        hold = (holding or "").upper()
 
         # Chaos / unstable volatility → stand aside (Wisdom)
         if atr_pct >= self.atr_pct_chaos_max:
-            return RegimeDecision(
+            return self._empty(
                 regime=Regime.CHOP_NO_TRADE,
                 action=SignalAction.FLAT,
-                ema_fast=ema_fast,
-                ema_slow=ema_slow,
-                adx=adx,
-                atr=atr,
-                atr_pct=atr_pct,
                 reason=f"atr_chaos atr_pct={atr_pct:.2f}>={self.atr_pct_chaos_max}",
-            )
-
-        # Choppy range (weak ADX) → No Trade zone
-        if adx < self.adx_trend_min:
-            return RegimeDecision(
-                regime=Regime.CHOP_NO_TRADE,
-                action=SignalAction.FLAT,
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,
                 atr=atr,
                 atr_pct=atr_pct,
-                reason=f"adx_chop adx={adx:.1f}<{self.adx_trend_min}",
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
             )
 
-        if ema_fast > ema_slow:
-            return RegimeDecision(
+        clear_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
+        clear_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
+
+        # Hysteresis: while in a trade, stay until the opposite band is clear (no 50% whipsaw)
+        if hold == "LONG":
+            if clear_short:
+                return self._empty(
+                    regime=Regime.TREND_BEAR,
+                    action=SignalAction.SHORT,
+                    reason=(
+                        f"vwap_twap_flip_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                        f"blend={blended:.1f} enter<={self.short_enter}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
+            return self._empty(
                 regime=Regime.TREND_BULL,
                 action=SignalAction.LONG,
+                reason=(
+                    f"vwap_twap_hold_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                    f"blend={blended:.1f} hyst={self.short_enter}-{self.long_enter}"
+                ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,
                 atr=atr,
                 atr_pct=atr_pct,
-                reason="ema_bull_adx_ok_vol_stable",
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
             )
 
-        if ema_fast < ema_slow:
-            return RegimeDecision(
+        if hold == "SHORT":
+            if clear_long:
+                return self._empty(
+                    regime=Regime.TREND_BULL,
+                    action=SignalAction.LONG,
+                    reason=(
+                        f"vwap_twap_flip_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                        f"blend={blended:.1f} enter>={self.long_enter}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
+            return self._empty(
                 regime=Regime.TREND_BEAR,
                 action=SignalAction.SHORT,
+                reason=(
+                    f"vwap_twap_hold_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                    f"blend={blended:.1f} hyst={self.short_enter}-{self.long_enter}"
+                ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,
                 atr=atr,
                 atr_pct=atr_pct,
-                reason="ema_bear_adx_ok_vol_stable",
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
             )
 
-        return RegimeDecision(
+        # Flat: only enter on a clear band (not every tick around 50)
+        if clear_long:
+            return self._empty(
+                regime=Regime.TREND_BULL,
+                action=SignalAction.LONG,
+                reason=(
+                    f"vwap_twap_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                    f"blend={blended:.1f} enter>={self.long_enter}"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        if clear_short:
+            return self._empty(
+                regime=Regime.TREND_BEAR,
+                action=SignalAction.SHORT,
+                reason=(
+                    f"vwap_twap_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                    f"blend={blended:.1f} enter<={self.short_enter}"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        return self._empty(
             regime=Regime.CHOP_NO_TRADE,
             action=SignalAction.FLAT,
+            reason=(
+                f"vwap_twap_neutral_band vwap={vwap_score:.1f} twap={twap_score:.1f} "
+                f"blend={blended:.1f} need>={self.long_enter}or<={self.short_enter}"
+            ),
             ema_fast=ema_fast,
             ema_slow=ema_slow,
             adx=adx,
             atr=atr,
             atr_pct=atr_pct,
-            reason="ema_flat_stand_aside",
+            vwap=vwap,
+            twap=twap,
+            vwap_score=vwap_score,
+            twap_score=twap_score,
         )
 
 
@@ -258,4 +478,5 @@ __all__ = [
     "RegimeDecision",
     "SignalAction",
     "WisdomStrategy",
+    "score_vs_anchor",
 ]

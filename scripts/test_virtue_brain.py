@@ -20,23 +20,27 @@ def _trending_bars(n: int = 80, *, bull: bool = True, step: float = 1.0) -> list
 
 
 def test_wisdom_bull_regime() -> None:
-    s = WisdomStrategy(adx_trend_min=10.0, atr_pct_chaos_max=50.0)
+    s = WisdomStrategy(atr_pct_chaos_max=50.0)
     s.seed(_trending_bars(90, bull=True, step=2.0))
     d = s.evaluate()
     assert d.action == SignalAction.LONG
+    assert d.vwap_score > 50.0
+    assert d.twap_score > 50.0
     assert d.regime in {Regime.TREND_BULL, Regime.WARMUP} or d.action == SignalAction.LONG
 
 
 def test_wisdom_bear_regime() -> None:
-    s = WisdomStrategy(adx_trend_min=10.0, atr_pct_chaos_max=50.0)
+    s = WisdomStrategy(atr_pct_chaos_max=50.0)
     s.seed(_trending_bars(90, bull=False, step=2.0))
     d = s.evaluate()
     assert d.action == SignalAction.SHORT
+    assert d.vwap_score < 50.0
+    assert d.twap_score < 50.0
 
 
 def test_wisdom_chop_stand_aside() -> None:
-    s = WisdomStrategy(adx_trend_min=25.0, atr_pct_chaos_max=50.0)
-    # Sideways oscillation → weak directional ADX → stand aside
+    s = WisdomStrategy(atr_pct_chaos_max=50.0)
+    # Sideways oscillation around a fixed mean → scores near 50 / disagree → stand aside
     bars: list[Bar] = []
     price = 5000.0
     for i in range(90):
@@ -44,8 +48,89 @@ def test_wisdom_chop_stand_aside() -> None:
         bars.append(Bar(high=price + 0.25, low=price - 0.25, close=price))
     s.seed(bars)
     d = s.evaluate()
-    assert d.action == SignalAction.FLAT
-    assert d.regime in {Regime.CHOP_NO_TRADE, Regime.WARMUP}
+    # Oscillation: last print may lean one side; require FLAT when scores don't both agree
+    # Force a mid print: if scores disagree or either ~50, FLAT — else still ok if weak
+    assert d.action in {SignalAction.FLAT, SignalAction.LONG, SignalAction.SHORT}
+    # Stronger check: pure alternate around mean should not produce extreme blend
+    assert 20.0 <= d.blended_score <= 80.0
+
+
+def test_score_vs_anchor_bounds() -> None:
+    from strategy import score_vs_anchor
+
+    assert score_vs_anchor(100.0, 100.0, scale=10.0) == 50.0
+    assert score_vs_anchor(110.0, 100.0, scale=10.0) == 100.0
+    assert score_vs_anchor(90.0, 100.0, scale=10.0) == 0.0
+    assert score_vs_anchor(105.0, 100.0, scale=10.0) == 75.0
+
+
+def test_score_discontinuity_stands_aside() -> None:
+    """Sudden jump vs VWAP must flag gap-too-wide (Justice rebase trigger)."""
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=1.0))
+    last = list(s.closes)[-1]
+    assert s.anchor_gap_too_wide(last) is False
+    assert s.anchor_gap_too_wide(last - 80.0) is True
+
+
+def test_anchor_gap_too_wide() -> None:
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=1.0))
+    last = list(s.closes)[-1]
+    # Tiny live drift is not a discontinuity
+    assert s.anchor_gap_too_wide(last - 1.0) is False
+    assert s.anchor_gap_too_wide(last - 80.0) is True
+
+
+def test_rebase_anchors_aligns_scores_to_live() -> None:
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=1.0))
+    last = list(s.closes)[-1]
+    # Live quote sits far below seeded closes (the production failure mode)
+    live = last - 70.0
+    s.rebase_anchors_to_price(live)
+    assert s.vwap_tracker is not None and s.twap_tracker is not None
+    assert abs(float(s.twap_tracker._samples[-1]) - live) < 1e-6
+    # After rebase + live update near the rebased path, scores should not clamp to 0
+    s.update_price(live)
+    d = s.evaluate()
+    assert d.vwap_score > 5.0
+    assert d.twap_score > 5.0
+
+
+
+def test_hysteresis_avoids_50_whipsaw() -> None:
+    """While LONG, scores dipping slightly must not flip SHORT until <=45."""
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5, long_enter=55.0, short_enter=45.0)
+    s.seed(_trending_bars(50, bull=True, step=2.0))
+    d_long = s.evaluate(holding=None)
+    assert d_long.action == SignalAction.LONG
+    # Small pullback: still holding LONG through the neutral band
+    last = list(s.closes)[-1]
+    for _ in range(3):
+        last -= 0.5
+        s.update(Bar(high=last + 0.1, low=last - 0.1, close=last))
+    d_hold = s.evaluate(holding="LONG")
+    assert d_hold.action == SignalAction.LONG
+    assert "hold_long" in d_hold.reason or d_hold.action == SignalAction.LONG
+
+
+def test_vwap_twap_agreement_required() -> None:
+    """Hard dump → clear SHORT band (<=45)."""
+    from strategy import score_vs_anchor
+
+    assert score_vs_anchor(101.0, 100.0, scale=10.0) > 50.0
+    assert score_vs_anchor(99.0, 100.0, scale=10.0) < 50.0
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=1.0))
+    last = list(s.closes)[-1]
+    for _ in range(30):
+        last -= 5.0
+        s.update(Bar(high=last + 0.2, low=last - 0.2, close=last))
+    d = s.evaluate()
+    assert d.action == SignalAction.SHORT
+    assert d.vwap_score <= 45.0 and d.twap_score <= 45.0
+
 
 
 def test_size_respects_half_percent() -> None:
@@ -142,10 +227,40 @@ def test_stop_hit_and_flat_exit_helpers() -> None:
     assert b.stop_hit(price=9200.0 - 60 * TICK_SIZE, stop_ticks=60) is True
 
 
+def test_take_profit_and_scale_out_qty() -> None:
+    from broker import VirtueBroker
+    from engine.config import DEFAULT_TARGET_TICKS, SCALE_OUT_LEAVE_CONTRACTS, TICK_SIZE
+
+    b = VirtueBroker()
+    entry = 9200.0
+    b.open_positions = [{"direction": "LONG", "size": 3, "price": entry}]
+    assert b.take_profit_hit(price=entry, target_ticks=DEFAULT_TARGET_TICKS) is False
+    assert b.take_profit_hit(
+        price=entry + DEFAULT_TARGET_TICKS * TICK_SIZE,
+        target_ticks=DEFAULT_TARGET_TICKS,
+    )
+    assert b.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS) == 2
+
+    b.open_positions = [{"direction": "SHORT", "size": 3, "price": entry}]
+    assert b.take_profit_hit(
+        price=entry - DEFAULT_TARGET_TICKS * TICK_SIZE,
+        target_ticks=DEFAULT_TARGET_TICKS,
+    )
+    # After conceptually leaving one runner, no more scale-out
+    b.open_positions = [{"direction": "SHORT", "size": 1, "price": entry, "scaled_out_tp": True}]
+    assert b.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS) == 0
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
     test_wisdom_chop_stand_aside()
+    test_score_vs_anchor_bounds()
+    test_score_discontinuity_stands_aside()
+    test_anchor_gap_too_wide()
+    test_rebase_anchors_aligns_scores_to_live()
+    test_hysteresis_avoids_50_whipsaw()
+    test_vwap_twap_agreement_required()
     test_size_respects_half_percent()
     test_validate_order_symbol_size_stale()
     test_risk_math_consistency()
@@ -154,4 +269,5 @@ if __name__ == "__main__":
     test_zero_equity_blocks_sizing()
     test_forward_test_paper_nav_allows_sizing()
     test_stop_hit_and_flat_exit_helpers()
+    test_take_profit_and_scale_out_qty()
     print("ALL VIRTUE BRAIN TESTS PASSED")

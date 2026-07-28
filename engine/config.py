@@ -109,6 +109,8 @@ MAX_ALLOWED_SPREAD_TICKS = 2  # max bid/ask spread in ticks for entry
 # Strategy defaults
 DEFAULT_STOP_TICKS = 60  # 60 ticks = 15 points = $75/contract risk (SWING)
 DEFAULT_TARGET_TICKS = 120  # 120 ticks = 30 points = $150/contract profit (2:1 R:R SWING)
+# Virtue scale-out: at target, bank most size and leave a runner (e.g. 3→close 2, leave 1)
+SCALE_OUT_LEAVE_CONTRACTS = 1
 VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (legacy, not used in swing)
 MIN_CONFIDENCE_THRESHOLD = 0.65  # Only take signals with 65%+ confidence (SWING quality)
 MIN_SECONDS_BETWEEN_TRADES = 14400  # 4 hours between trades (SWING frequency)
@@ -157,6 +159,17 @@ FORWARD_TEST_MARKET_CLOSE_MINUTE = 0
 FORWARD_TEST_MAINTENANCE_START_HOUR = 17  # 5:00 PM ET (daily break start)
 FORWARD_TEST_MAINTENANCE_END_HOUR = 18     # 6:00 PM ET (daily break end)
 FORWARD_TEST_TIMEZONE = "America/New_York"
+
+# Virtue live / paper session: cash Regular Trading Hours only (Alpaca SPY live).
+# Avoids evening / weekend MES gap risk when decisions are SPY-proxied.
+VIRTUE_RTH_ONLY = True
+VIRTUE_RTH_OPEN_HOUR = 9
+VIRTUE_RTH_OPEN_MINUTE = 30
+VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET
+VIRTUE_RTH_CLOSE_MINUTE = 0
+# Hysteresis around 50% so we don't flip LONG↔SHORT on every tiny cross (Temperance)
+VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP must clear this to go/stay LONG from flat/short
+VIRTUE_SCORE_SHORT_ENTER = 45.0  # both must be under this to go/stay SHORT from flat/long
 
 # Simulated MES price anchor (updated from live feed when wired)
 WARMUP_MES_PRICE = 6200.0
