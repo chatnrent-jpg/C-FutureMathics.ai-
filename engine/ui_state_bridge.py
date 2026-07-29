@@ -35,14 +35,16 @@ def build_system_state(orchestrator: Any, last_price: float | None = None) -> di
     session = orchestrator.session
     risk = orchestrator.risk
     pm = orchestrator.position_manager
-    nav = risk.account_nav
+    # Risk math stays on book NAV; dashboard account_nav is mark-to-market balance.
+    risk_nav = risk.account_nav
     daily_pnl = session.realized_pnl_today
-    max_conc = concurrent_risk_cap(nav)
+    max_conc = concurrent_risk_cap(risk_nav)
     open_risk = pm.total_open_risk()
     margin_pct = round((open_risk / max_conc) * 100, 1) if max_conc else 0.0
-    hard_stop = max_daily_loss_cap(nav)
+    hard_stop = max_daily_loss_cap(risk_nav)
     positions = pm.open_positions_list()
     unrealized = _unrealized_pnl(positions, last_price)
+    nav = round(float(risk_nav) + float(unrealized), 2)
 
     # Detect data source
     broker = orchestrator.broker
@@ -151,7 +153,10 @@ def build_virtue_system_state(
 
     broker = session.broker
     risk = session.risk
-    nav = float(getattr(broker, "equity", 0.0) or risk.account_nav or STARTING_NAV)
+    starting = float(getattr(risk, "starting_nav", STARTING_NAV) or STARTING_NAV)
+    broker_equity = float(getattr(broker, "equity", 0.0) or 0.0)
+    # Manus / sizing baseline unchanged — do not feed mark-to-market into risk caps.
+    risk_nav = broker_equity or float(getattr(risk, "account_nav", 0.0) or 0.0) or starting
     net_dir, net_size = broker.net_exposure()
     positions: list[dict[str, Any]] = []
     for row in list(getattr(broker, "open_positions", None) or []):
@@ -184,9 +189,15 @@ def build_virtue_system_state(
 
     unrealized = _unrealized_pnl(positions, last_price)
     daily_pnl = float(getattr(session, "realized_pnl_today", 0.0) or 0.0)
+    # Paper equity is frozen at STARTING_NAV; show current balance = start + realized + open P&L.
+    # Live Webull equity is already broker mark-to-market when remote equity > 0.
+    if forward_test_force_paper() or broker_equity <= 0:
+        nav = round(starting + daily_pnl + unrealized, 2)
+    else:
+        nav = round(broker_equity, 2)
     open_risk = float(abs(net_size) * DEFAULT_STOP_TICKS * TICK_VALUE)
-    max_conc = concurrent_risk_cap(nav)
-    hard_stop = max_daily_loss_cap(nav)
+    max_conc = concurrent_risk_cap(risk_nav)
+    hard_stop = max_daily_loss_cap(risk_nav)
     mode = "PAPER" if forward_test_force_paper() else "LIVE"
     now = datetime.now(timezone.utc).isoformat()
 
@@ -228,11 +239,11 @@ def build_virtue_system_state(
             "mode": mode,
             "data_source": data_source,
             "daily_pnl": daily_pnl,
-            "daily_pnl_pct": round((daily_pnl / max(nav, 1.0)) * 100, 2),
+            "daily_pnl_pct": round((daily_pnl / max(starting, 1.0)) * 100, 2),
             "unrealized_pnl": unrealized,
             "last_price": last_price,
             "account_nav": nav,
-            "starting_nav": float(getattr(risk, "starting_nav", STARTING_NAV) or STARTING_NAV),
+            "starting_nav": starting,
             "hard_stop_limit": hard_stop,
             "hard_stop_distance": round(hard_stop + daily_pnl, 2),
             "open_risk_notional": open_risk,
