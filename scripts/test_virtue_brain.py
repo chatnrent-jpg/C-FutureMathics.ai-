@@ -266,14 +266,19 @@ def test_vwap_twap_agreement_required() -> None:
 
 
 def test_size_respects_fixed_fractional() -> None:
-    from engine.config import STARTING_NAV
+    from engine.config import PAPER_MAX_MES_CONTRACTS, STARTING_NAV
 
     equity = float(STARTING_NAV)
     stop_ticks = 60
     sized = calculate_max_contracts(equity=equity, stop_ticks=stop_ticks, hard_cap=1000)
     assert not sized.rejected
-    assert sized.contracts == 1  # $10k / 0.75% → exactly 1 MES
+    # $10k × 1% = $100 → 1 MES @ $75; $15k → 2 MES
+    assert sized.contracts == 1
     assert sized.risk_pct <= FIXED_FRACTIONAL_RISK_PCT + 1e-12
+    two = calculate_max_contracts(equity=15_000.0, stop_ticks=stop_ticks, hard_cap=1000)
+    assert not two.rejected
+    assert two.contracts == 2
+    assert int(PAPER_MAX_MES_CONTRACTS) >= 2
     # Over-size must reject
     too_many = sized.contracts + 50
     gate = reject_if_over_risk(equity=equity, contracts=too_many, stop_ticks=stop_ticks)
@@ -311,10 +316,13 @@ def test_validate_order_symbol_size_stale() -> None:
 def test_risk_math_consistency() -> None:
     from engine.config import STARTING_NAV
 
-    # 0.75% of $10k = $75; 60 ticks * $1.25 = $75/contract → 1 MES
+    # 1% of $10k = $100; 60 ticks * $1.25 = $75/contract → 1 MES
     sized = calculate_max_contracts(equity=float(STARTING_NAV), stop_ticks=60, hard_cap=100)
     assert sized.contracts == int((float(STARTING_NAV) * FIXED_FRACTIONAL_RISK_PCT) // (60 * TICK_VALUE))
     assert sized.contracts == 1
+    # Scale-out profile: $15k × 1% = $150 → 2 MES
+    two = calculate_max_contracts(equity=15_000.0, stop_ticks=60, hard_cap=100)
+    assert two.contracts == 2
 
 
 def test_position_exclusivity_helpers() -> None:
@@ -423,7 +431,7 @@ def test_weighted_avg_entry() -> None:
 
 
 def test_capital_drag_allows_irreducible_1_mes() -> None:
-    """Under 10% DD, $75 1-MES stop must not session-HALT when undragged budget fits."""
+    """Under 10% DD, 2-MES stop ($150) must not HALT when undragged paper ceiling fits."""
     from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 
     m = CapitalProtectionMatrix(
@@ -432,10 +440,11 @@ def test_capital_drag_allows_irreducible_1_mes() -> None:
         peak_nav=10_000.0,
     )
     assert m.capital_drag_active is True
+    # Dragged ceiling is tight; undragged paper tol still covers $150 (2×$75).
     verdict, reason = m.evaluate(
         realized_pnl_today=0.0,
         open_risk_notional=0.0,
-        proposed_trade_risk=75.0,
+        proposed_trade_risk=150.0,
         sandbox_fallback=True,
     )
     assert verdict == RiskVerdict.APPROVED

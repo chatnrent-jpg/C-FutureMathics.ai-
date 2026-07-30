@@ -814,7 +814,7 @@ async def run_cycle(
         return
 
     # Take-profit (Temperance): ATR-dynamic target (floor = VIRTUE_TP_MIN_TICKS).
-    # Multi-lot: scale out and leave a runner. Single lot ($10k): full exit at target.
+    # 2 MES: scale out 1 at target, leave 1 runner. 1 MES: full exit at target.
     if (
         decision.action in {SignalAction.LONG, SignalAction.SHORT}
         and session.broker.take_profit_hit(price=price, target_ticks=tp_ticks)

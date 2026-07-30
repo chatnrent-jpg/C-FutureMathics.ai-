@@ -73,30 +73,30 @@ def webull_credentials_configured() -> bool:
     return bool(webull_app_key() and webull_app_secret())
 
 
-# Capital baseline — $10k real-market paper test (Temperance: 1 MES)
+# Capital baseline — paper book compounds from here (Temperance)
 STARTING_NAV = 10_000.0
 HANDSHAKE_EQUITY_BASE = 10_000.0
 
 MAX_DAILY_LOSS_PCT = 0.02
-HARD_DAILY_STOP = 200.0  # 2% of $10k
-# 0.8% of $10k = $80 → 1 MES @ 60-tick stop ($75) still fits after small adverse days
-FIXED_FRACTIONAL_RISK_PCT = 0.008
+HARD_DAILY_STOP = 200.0  # floor; Manus also uses 2% of NAV
+# 1.0% FF: @~$10k → 1 MES ($75); @$15k+ → 2 MES ($150) for scale-out runner
+FIXED_FRACTIONAL_RISK_PCT = 0.01
 MAX_CONCURRENT_RISK_PCT = 0.05
 PER_TRADE_RISK_MIN = 60.0
-PER_TRADE_RISK_MAX = 90.0
+PER_TRADE_RISK_MAX = 160.0  # headroom for 2×$75 stop
 
-# Paper forward-test — $10k / 1 MES
+# Paper forward-test — up to 2 MES (enter 2, TP scale-out leave 1 runner)
 FORWARD_TEST_MAX_CONCURRENT_RISK_PCT = 0.05
-FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.008
+FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.01
 FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
-PAPER_MAX_MES_CONTRACTS = 1
+PAPER_MAX_MES_CONTRACTS = 2
 PAPER_MAX_OPEN_MES_POSITIONS = 1
 
-# Live — aligned to $10k test book when FORWARD_TEST_MODE=false
-LIVE_RISK_NAV_CAP = 10_000.0
-LIVE_MAX_DAILY_LOSS = 200.0
+# Live — cap risk NAV; size still FF-driven
+LIVE_RISK_NAV_CAP = 15_000.0
+LIVE_MAX_DAILY_LOSS = 300.0
 LIVE_MAX_CONCURRENT_RISK_PCT = 0.05
-LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.008
+LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.01
 
 DRAWDOWN_BRAKE_PCT = 0.10
 CAPITAL_DRAG_MULTIPLIER = 0.5
@@ -110,8 +110,8 @@ MAX_ALLOWED_SPREAD_TICKS = 2  # max bid/ask spread in ticks for entry
 # Strategy defaults
 DEFAULT_STOP_TICKS = 60  # 60 ticks = 15 points = $75/contract risk (SWING)
 DEFAULT_TARGET_TICKS = 120  # 120 ticks = 30 points = $150/contract profit (2:1 R:R SWING)
-# Virtue scale-out: at target, bank most size and leave a runner (e.g. 3→close 2, leave 1).
-# On $10k / 1 MES, leave=1 means no partial scale-out (full exit via stop/flat/flip/TP path).
+# Virtue scale-out: at TP, close down to a runner (2→close 1, leave 1 still in the game).
+# Single-lot books still full-exit at target (net_size <= leave).
 SCALE_OUT_LEAVE_CONTRACTS = 1
 VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (legacy, not used in swing)
 MIN_CONFIDENCE_THRESHOLD = 0.65  # Only take signals with 65%+ confidence (SWING quality)
@@ -138,13 +138,13 @@ GRADE_PATH_EPSILON = 0.35
 GRADE_SCORE_SOURCE = "overall"  # "overall" | "1m"
 GRADE_STALE_SECONDS = 300.0
 GRADE_ALLOW_STALE = False
-GRADE_CONTRACTS = 1  # $10k test: 1 MES
+GRADE_CONTRACTS = 2  # align with paper max (scale-out runner profile)
 # Protective only — grade owns the real exit (≥85). Wide so MES turbulence does not stop out rising-path longs.
 # 200 ticks = 50 pts = $250/contract.
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
-GRADE_DAILY_PROFIT_LOCK = 250.0  # ~2.5% of $10k — halt new entries after strong day
-GRADE_DAILY_LOSS_HALT = 200.0  # 2% of $10k
+GRADE_DAILY_PROFIT_LOCK = 250.0  # day profit lock (Temperance)
+GRADE_DAILY_LOSS_HALT = 200.0
 
 FORWARD_TEST_MODE = True
 FORWARD_TEST_CYCLE_INTERVAL_S = 900.0  # 15 minutes for swing (was 2.0 for scalping)
