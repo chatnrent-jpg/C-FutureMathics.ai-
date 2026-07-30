@@ -147,6 +147,7 @@ def build_virtue_system_state(
     data_source: str = "alpaca_spy_mes_proxy",
     last_risk_verdict: str = "",
     last_risk_reason: str = "",
+    heartbeat_state: str = "",
 ) -> dict[str, Any]:
     """Dashboard payload for native virtue Wisdom loop (not VolumeWatch grade path)."""
     from engine.config import DEFAULT_STOP_TICKS, EXECUTION_SYMBOL, TICK_VALUE, forward_test_force_paper
@@ -255,7 +256,11 @@ def build_virtue_system_state(
             "risk_verdict": last_risk_verdict or RiskVerdict.APPROVED.value,
             "risk_reason": last_risk_reason,
             "boot_status": "running",
-            "heartbeat_state": "GREEN",
+            "heartbeat_state": str(
+                heartbeat_state
+                or getattr(session, "last_heartbeat_state", None)
+                or "UNKNOWN"
+            ),
             "open_positions": positions,
             "strategy": "virtue_wisdom",
             "regime": regime,

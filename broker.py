@@ -130,21 +130,22 @@ def calculate_max_contracts(
     *,
     equity: float,
     stop_ticks: int,
-    risk_limit_pct: float = RISK_LIMIT_PCT,
+    risk_limit_pct: float | None = None,
     tick_value: float | None = None,
     hard_cap: int | None = None,
 ) -> SizeResult:
-    from engine.config import TICK_VALUE
+    from engine.config import TICK_VALUE, fixed_fractional_risk_pct
 
     tv = float(TICK_VALUE if tick_value is None else tick_value)
     eq = float(equity)
     stop = int(stop_ticks)
+    limit_pct = float(risk_limit_pct if risk_limit_pct is not None else fixed_fractional_risk_pct())
     if eq <= 0:
         return SizeResult(0, 0.0, 0.0, 0.0, True, "equity_invalid")
     if stop <= 0 or tv <= 0:
         return SizeResult(0, 0.0, 0.0, 0.0, True, "stop_or_tick_invalid")
 
-    max_risk = eq * float(risk_limit_pct)
+    max_risk = eq * limit_pct
     risk_per_contract = stop * tv
     raw = int(max_risk // risk_per_contract)
     cap = hard_cap if hard_cap is not None else paper_max_mes_contracts()
@@ -156,10 +157,10 @@ def calculate_max_contracts(
         )
     total_risk = contracts * risk_per_contract
     risk_pct = total_risk / eq
-    if risk_pct > risk_limit_pct + 1e-12:
+    if risk_pct > limit_pct + 1e-12:
         return SizeResult(
             0, total_risk, risk_pct, max_risk, True,
-            f"exceeds_risk_limit pct={risk_pct:.4%} limit={risk_limit_pct:.4%}",
+            f"exceeds_risk_limit pct={risk_pct:.4%} limit={limit_pct:.4%}",
         )
     return SizeResult(contracts, total_risk, risk_pct, max_risk, False, "ok")
 
@@ -169,20 +170,21 @@ def reject_if_over_risk(
     equity: float,
     contracts: int,
     stop_ticks: int,
-    risk_limit_pct: float = RISK_LIMIT_PCT,
+    risk_limit_pct: float | None = None,
 ) -> ValidationResult:
-    from engine.config import TICK_VALUE
+    from engine.config import TICK_VALUE, fixed_fractional_risk_pct
 
     if contracts <= 0:
         return ValidationResult(False, "contracts_must_be_gt_zero")
     eq = float(equity)
     if eq <= 0:
         return ValidationResult(False, "equity_invalid")
+    limit_pct = float(risk_limit_pct if risk_limit_pct is not None else fixed_fractional_risk_pct())
     total_risk = int(contracts) * int(stop_ticks) * TICK_VALUE
-    if total_risk / eq > risk_limit_pct + 1e-12:
+    if total_risk / eq > limit_pct + 1e-12:
         return ValidationResult(
             False,
-            f"order_exceeds_0_5pct_risk risk={total_risk:.2f} equity={eq:.2f}",
+            f"order_exceeds_fixed_fractional_risk risk={total_risk:.2f} equity={eq:.2f} limit={limit_pct:.4%}",
         )
     return ValidationResult(True, "ok")
 
@@ -639,17 +641,24 @@ class VirtueBroker:
         desired_direction: str,
         price: float,
         stop_ticks: int,
-    ) -> bool:
+    ) -> tuple[bool, float]:
+        """
+        Flatten opposite exposure before a new entry.
+        Returns (ok, approx_realized_pnl). PnL is 0 when nothing was closed.
+        """
+        from engine.config import POINT_VALUE
+
         desired = _normalize_direction(desired_direction)
         if desired not in {"LONG", "SHORT"}:
-            return True
+            return True, 0.0
 
         exposure_dir, exposure_size = self.net_exposure()
         if exposure_dir == "FLAT" or exposure_size <= 0:
-            return True
+            return True, 0.0
         if exposure_dir == desired:
-            return True
+            return True, 0.0
 
+        entry = self._avg_entry(exposure_dir) or float(price)
         flat_dir = _opposite(exposure_dir)
         logger.warning(
             "POSITION_EXCLUSIVITY flatten %s x%s via Webull before entry %s",
@@ -668,7 +677,7 @@ class VirtueBroker:
         v = validate_order(flatten_order, max_price_age_s=self.max_price_age_s)
         if not v.ok:
             logger.error("FLATTEN_VALIDATION_FAILED reason=%s", v.reason)
-            return False
+            return False, 0.0
 
         try:
             result = await self.submit_order_timed(
@@ -679,37 +688,50 @@ class VirtueBroker:
         except Exception as exc:
             logger.exception("FLATTEN_SUBMIT_FAILED err=%s", exc)
             self.enter_triage("flatten_exception")
-            return False
+            return False, 0.0
 
         if not _fill_confirmed(result.status):
             logger.error("FLATTEN_NO_FILL_CONFIRM status=%s detail=%s", result.status, result.detail)
-            return False
+            return False, 0.0
 
+        fill = float(result.fill_price or price)
+        points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
+        approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
         logger.info(
-            "FLATTEN_CONFIRMED id=%s status=%s fill=%.2f size=%s",
+            "FLATTEN_CONFIRMED id=%s status=%s fill=%.2f size=%s pnl≈%.2f",
             result.order_id,
             result.status,
-            result.fill_price,
+            fill,
             result.contracts,
+            approx_pnl,
         )
         self.open_positions = [
             p
             for p in self.open_positions
             if _normalize_direction(str(p.get("direction") or "")) == desired
         ]
+        if forward_test_force_paper() and not webull_is_sandbox():
+            return True, approx_pnl
         truth = await self.reconcile_with_broker()
-        return truth.ok and self.net_exposure()[0] in {"FLAT", desired}
+        ok = bool(truth.ok and self.net_exposure()[0] in {"FLAT", desired})
+        return ok, approx_pnl
 
     def _avg_entry(self, direction: str) -> float | None:
-        entries = [
-            float(p.get("price") or p.get("entry_price") or 0.0)
-            for p in self.open_positions
-            if _normalize_direction(str(p.get("direction") or "")) == direction
-            and float(p.get("price") or p.get("entry_price") or 0.0) > 0
-        ]
-        if not entries:
+        """Size-weighted average entry (Justice — stop/TP must match real risk)."""
+        notional = 0.0
+        qty = 0.0
+        for p in self.open_positions:
+            if _normalize_direction(str(p.get("direction") or "")) != direction:
+                continue
+            px = float(p.get("price") or p.get("entry_price") or 0.0)
+            sz = float(p.get("size") or p.get("contracts") or 0.0)
+            if px <= 0 or sz <= 0:
+                continue
+            notional += px * sz
+            qty += sz
+        if qty <= 0:
             return None
-        return sum(entries) / len(entries)
+        return notional / qty
 
     async def flatten_all(
         self,
@@ -933,15 +955,25 @@ class VirtueBroker:
             return 0
         return int(size - leave_qty)
 
-    def size_for_direction(self, *, direction: str, stop_ticks: int) -> SizeResult:
-        return calculate_max_contracts(equity=self.equity, stop_ticks=stop_ticks)
+    def size_for_direction(
+        self,
+        *,
+        direction: str,
+        stop_ticks: int,
+        risk_limit_pct: float | None = None,
+    ) -> SizeResult:
+        return calculate_max_contracts(
+            equity=self.equity,
+            stop_ticks=stop_ticks,
+            risk_limit_pct=risk_limit_pct,
+        )
 
     async def fire_order(self, order: Order) -> OrderExecutionResult | None:
         if not self.can_send_new_orders():
             logger.error("ORDER_BLOCKED triage=%s — no new orders until verified", self.triage.value)
             return None
 
-        flattened = await self.flatten_opposite_if_needed(
+        flattened, _excl_pnl = await self.flatten_opposite_if_needed(
             desired_direction=order.direction,
             price=order.price,
             stop_ticks=order.stop_ticks,

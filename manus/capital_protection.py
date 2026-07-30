@@ -1,7 +1,7 @@
 """
 Manus capital protection matrix — dynamic NAV compounding & drawdown brake (Phase 10).
 
-Fixed-fractional per-trade risk (0.5% NAV) with Capital Drag Brake on 10% drawdown.
+Fixed-fractional per-trade risk (config FF % NAV) with Capital Drag Brake on 10% drawdown.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class CapitalProtectionMatrix:
     """
     Rolling NAV capital constraints for MarketMathics.
 
-    - Per-trade risk: exactly 0.5% of current NAV (fixed-fractional)
+    - Per-trade risk: fixed-fractional % of current NAV (see engine.config)
     - Capital Drag Brake: 10% drawdown → 50% risk until new equity high
     - Hard daily stop: 2% of current NAV
     - Max concurrent exposure: paper 50% NAV; live capped at LIVE_RISK_NAV_CAP
@@ -220,6 +220,19 @@ class CapitalProtectionMatrix:
             return RiskVerdict.HALT, "max_concurrent_risk_exceeded"
 
         if proposed_trade_risk > ceiling:
+            # Temperance: under capital drag, 1 MES stop may exceed the halved ceiling
+            # but still fit the undragged budget — approve irreducible unit, never deadlock.
+            if self.capital_drag_active:
+                undragged = effective_risk_nav(self.account_nav) * fixed_fractional_risk_pct()
+                undragged_ceiling = round(
+                    undragged * (1.0 + risk_budget_tolerance_pct(sandbox_fallback=sandbox_fallback)),
+                    2,
+                )
+                if proposed_trade_risk <= undragged_ceiling + 1e-9:
+                    return (
+                        RiskVerdict.APPROVED,
+                        "capital_drag_irreducible_unit_approved",
+                    )
             return RiskVerdict.HALT, "per_trade_risk_exceeds_fixed_fractional"
 
         if proposed_trade_risk > 0 and proposed_trade_risk < floor:

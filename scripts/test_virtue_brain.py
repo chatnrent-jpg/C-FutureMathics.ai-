@@ -411,6 +411,52 @@ def test_session_uses_tighter_entry_band() -> None:
     assert int(VIRTUE_REQUIRED_STREAK) == 2
 
 
+def test_weighted_avg_entry() -> None:
+    from broker import VirtueBroker
+
+    b = VirtueBroker()
+    b.open_positions = [
+        {"direction": "LONG", "size": 1, "price": 100.0},
+        {"direction": "LONG", "size": 3, "price": 104.0},
+    ]
+    assert abs(float(b._avg_entry("LONG")) - 103.0) < 1e-9
+
+
+def test_capital_drag_allows_irreducible_1_mes() -> None:
+    """Under 10% DD, $75 1-MES stop must not session-HALT when undragged budget fits."""
+    from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
+
+    m = CapitalProtectionMatrix(
+        starting_nav=10_000.0,
+        account_nav=9_000.0,
+        peak_nav=10_000.0,
+    )
+    assert m.capital_drag_active is True
+    verdict, reason = m.evaluate(
+        realized_pnl_today=0.0,
+        open_risk_notional=0.0,
+        proposed_trade_risk=75.0,
+        sandbox_fallback=True,
+    )
+    assert verdict == RiskVerdict.APPROVED
+    assert "irreducible_unit" in reason
+
+
+def test_credit_pnl_updates_paper_book_only() -> None:
+    from engine.config import STARTING_NAV
+    from main import VirtueSession, _credit_realized_pnl, _local_paper_book
+
+    s = VirtueSession()
+    s.broker.update_equity(float(STARTING_NAV))
+    before = float(s.broker.equity)
+    _credit_realized_pnl(s, 50.0)
+    assert s.realized_pnl_today == 50.0
+    if _local_paper_book():
+        assert float(s.broker.equity) == before + 50.0
+    else:
+        assert float(s.broker.equity) == before
+
+
 def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     """Yesterday's realized PnL must not lock today's entries (Justice + Temperance)."""
     from datetime import datetime
@@ -476,5 +522,8 @@ if __name__ == "__main__":
     test_stop_hit_and_flat_exit_helpers()
     test_take_profit_and_scale_out_qty()
     test_session_uses_tighter_entry_band()
+    test_weighted_avg_entry()
+    test_capital_drag_allows_irreducible_1_mes()
+    test_credit_pnl_updates_paper_book_only()
     test_session_day_roll_clears_yesterdays_profit_lock()
     print("ALL VIRTUE BRAIN TESTS PASSED")

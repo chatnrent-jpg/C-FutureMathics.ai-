@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from broker import NETWORK_TIMEOUT_S, Order, VirtueBroker
+from broker import NETWORK_TIMEOUT_S, Order, SizeResult, VirtueBroker
 from engine.config import (
     DEFAULT_STOP_TICKS,
     EXECUTION_SYMBOL,
@@ -62,6 +62,7 @@ from engine.config import (
     VIRTUE_TICK_POLL_S,
     VIRTUE_TP_ATR_MULT,
     VIRTUE_TP_MIN_TICKS,
+    fixed_fractional_risk_pct,
     forward_test_force_paper,
 )
 
@@ -108,6 +109,7 @@ class VirtueSession:
     is_running: bool = True  # False stops background state writer (run.py pattern)
     cycles_since_heartbeat: int = 0
     last_heartbeat_ok: bool = True
+    last_heartbeat_state: str = "GREEN"
     strategy: WisdomStrategy = field(
         default_factory=lambda: WisdomStrategy(
             long_enter=float(VIRTUE_SCORE_LONG_ENTER),
@@ -176,13 +178,24 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     return True
 
 
+def _local_paper_book() -> bool:
+    """True when local paper fills own the book (Webull equity is not truth)."""
+    from engine.webull_openapi import webull_is_sandbox
+
+    return bool(forward_test_force_paper() and not webull_is_sandbox())
+
+
 def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
-    """Bank realized PnL into the day bucket AND compounded book equity."""
+    """
+    Bank realized PnL into the day bucket.
+
+    Justice: update book equity only on local paper. Live/sandbox reconcile already
+    set broker.equity — adding approx_pnl again would double-count NAV.
+    """
     delta = float(pnl or 0.0)
     session.realized_pnl_today = round(session.realized_pnl_today + delta, 2)
-    if abs(delta) < 1e-12:
-        return
-    session.broker.update_equity(round(float(session.broker.equity) + delta, 2))
+    if abs(delta) >= 1e-12 and _local_paper_book():
+        session.broker.update_equity(round(float(session.broker.equity) + delta, 2))
     session.risk.update_nav(session.broker.equity)
 
 
@@ -204,6 +217,7 @@ def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> N
         data_source=session.last_data_source,
         last_risk_verdict=session.last_risk_verdict,
         last_risk_reason=session.last_risk_reason,
+        heartbeat_state=session.last_heartbeat_state,
     )
 
 
@@ -596,9 +610,11 @@ async def run_cycle(
             return
 
         dead = any(e.state == HeartbeatState.DEAD for e in events)
+        degraded = any(e.state == HeartbeatState.DEGRADED for e in events)
         session.cycles_since_heartbeat = 0
         if dead:
             session.last_heartbeat_ok = False
+            session.last_heartbeat_state = "DEAD"
             recovered = await _survive_outage(session, "heartbeat_dead")
             if not recovered:
                 session.last_action = "FLAT"
@@ -608,6 +624,7 @@ async def run_cycle(
                 return
         else:
             session.last_heartbeat_ok = True
+            session.last_heartbeat_state = "DEGRADED" if degraded else "GREEN"
     # else: skipped heartbeat this cycle — cycles_since_heartbeat already advanced
 
     if not session.broker.can_send_new_orders():
@@ -688,7 +705,8 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    session.strategy.update_price(price, high=high + TICK_SIZE, low=low - TICK_SIZE)
+    # Use true bid/ask (or mid) — do not pad ±1 tick (that inflated ATR on proxy quotes).
+    session.strategy.update_price(price, high=high, low=low)
 
     net_dir_pre, net_size_pre = session.broker.net_exposure()
     holding = net_dir_pre if net_size_pre > 0 else None
@@ -972,7 +990,7 @@ async def run_cycle(
 
     # Mandatory exclusivity check before emitting new LONG/SHORT payload
     try:
-        exclusive_ok = await session.broker.flatten_opposite_if_needed(
+        exclusive_ok, excl_pnl = await session.broker.flatten_opposite_if_needed(
             desired_direction=decision.action.value,
             price=price,
             stop_ticks=stop_ticks,
@@ -987,11 +1005,35 @@ async def run_cycle(
         logger.error("CYCLE %s exclusivity_blocked — opposite flatten not confirmed", session.cycle)
         session.last_action = "FLAT"
         return
+    if abs(float(excl_pnl or 0.0)) >= 1e-12:
+        _credit_realized_pnl(session, excl_pnl)
+        session.trades_today += 1
 
+    # Drag-aware sizing (single risk source of truth with Manus).
+    drag_mult = float(session.risk.capital_drag_multiplier)
+    size_pct = float(fixed_fractional_risk_pct()) * drag_mult
     sized = session.broker.size_for_direction(
         direction=decision.action.value,
         stop_ticks=stop_ticks,
+        risk_limit_pct=size_pct,
     )
+    # Under drag, budget may reject 1 MES — retry undragged for irreducible unit.
+    if (sized.rejected or sized.contracts < 1) and drag_mult < 1.0 - 1e-12:
+        sized = session.broker.size_for_direction(
+            direction=decision.action.value,
+            stop_ticks=stop_ticks,
+            risk_limit_pct=float(fixed_fractional_risk_pct()),
+        )
+        if not sized.rejected and sized.contracts >= 1:
+            unit_risk = float(1 * stop_ticks * TICK_VALUE)
+            sized = SizeResult(
+                contracts=1,
+                risk_dollars=unit_risk,
+                risk_pct=unit_risk / max(float(session.broker.equity), 1e-9),
+                max_allowed_risk=sized.max_allowed_risk,
+                rejected=False,
+                reason="irreducible_unit_under_drag",
+            )
     if sized.rejected or sized.contracts < 1:
         logger.warning("CYCLE %s size_rejected reason=%s", session.cycle, sized.reason)
         session.last_action = "FLAT"
@@ -1005,8 +1047,7 @@ async def run_cycle(
     session.risk.update_nav(session.broker.equity)
 
     try:
-        # Forward-test paper caps contracts (e.g. 3 MES = $225) below Manus 0.5% floor
-        # (~$425 on $100k) — waive floor in FORWARD_TEST_MODE only.
+        # Forward-test paper: waive floor when FF floor > irreducible 1 MES stop.
         verdict, reason = session.risk.evaluate(
             realized_pnl_today=session.realized_pnl_today,
             open_risk_notional=open_risk,
@@ -1022,10 +1063,14 @@ async def run_cycle(
     session.last_risk_reason = reason
 
     if verdict == RiskVerdict.HALT:
-        # Hard daily loss / concurrent risk: halt. Floor mismatch in paper: skip cycle only.
-        if forward_test_force_paper() and "fixed_fractional_floor" in reason:
+        # Hard daily / concurrent: session halt. Sizing band mismatch: cycle stand-aside only.
+        soft_halt = (
+            "fixed_fractional_floor" in reason
+            or "exceeds_fixed_fractional" in reason
+        )
+        if soft_halt:
             logger.warning(
-                "CYCLE %s MANUS_PAPER_SKIP reason=%s — stand aside this cycle (not session halt)",
+                "CYCLE %s MANUS_CYCLE_SKIP reason=%s — stand aside this cycle (not session halt)",
                 session.cycle,
                 reason,
             )
@@ -1037,15 +1082,22 @@ async def run_cycle(
         return
 
     if verdict == RiskVerdict.REDUCE_SIZE:
-        contracts = max(1, contracts // 2)
-        proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
-        logger.warning(
-            "CYCLE %s MANUS_REDUCE_SIZE reason=%s contracts=%s risk=%.2f",
-            session.cycle,
-            reason,
-            contracts,
-            proposed_risk,
-        )
+        if contracts <= 1:
+            logger.warning(
+                "CYCLE %s MANUS_REDUCE_MIN_LOT reason=%s — keep 1 MES (cannot shrink further)",
+                session.cycle,
+                reason,
+            )
+        else:
+            contracts = max(1, contracts // 2)
+            proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
+            logger.warning(
+                "CYCLE %s MANUS_REDUCE_SIZE reason=%s contracts=%s risk=%.2f",
+                session.cycle,
+                reason,
+                contracts,
+                proposed_risk,
+            )
 
     order = Order(
         symbol=EXECUTION_SYMBOL,
