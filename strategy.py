@@ -89,10 +89,10 @@ class WisdomStrategy:
     adx_trend_min: float = 0.0  # unused as hard gate; kept for compat/tests
     atr_pct_chaos_max: float = 2.5  # ATR as % of price; above → stand aside
     score_atr_mult: float = 2.0  # ATR component of score scale
-    score_price_pct: float = 0.005  # ±0.5% of price spans 0–100 (avoids 0/100 clamp)
+    score_price_pct: float = 0.004  # ±0.4% of price spans 0–100 (trend extensions register)
     max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
-    long_enter: float = 62.0  # ENTER long from flat (both scores >=)
-    short_enter: float = 38.0  # ENTER short from flat (both scores <=)
+    long_enter: float = 58.0  # ENTER long from flat (both scores >=)
+    short_enter: float = 42.0  # ENTER short from flat (both scores <=)
     long_exit: float = 42.0  # while LONG: flip/exit when both scores <=
     short_exit: float = 58.0  # while SHORT: flip/exit when both scores >=
     anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)

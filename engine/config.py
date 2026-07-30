@@ -175,13 +175,15 @@ VIRTUE_NO_NEW_ENTRY_MINUTE = 45
 # Outside RTH: retry flatten until flat (or attempts exhausted).
 VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
-# Hysteresis bands (Temperance — hard to enter, harder to whipsaw out)
-# Enter only on strong agreement; while holding, exit/flip only at opposite exit band.
-VIRTUE_SCORE_LONG_ENTER = 62.0   # both VWAP+TWAP >= this to ENTER long from flat
-VIRTUE_SCORE_SHORT_ENTER = 38.0  # both VWAP+TWAP <= this to ENTER short from flat
+# Hysteresis bands (Temperance — enter on clear extension; hold through mid-band)
+# Tuned so brief trends that clear ~58 can fire (ADX is telemetry only — not an entry gate).
+VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
 VIRTUE_SCORE_LONG_EXIT = 42.0    # while LONG, flip/exit only when both <= this
 VIRTUE_SCORE_SHORT_EXIT = 58.0   # while SHORT, flip/exit only when both >= this
 VIRTUE_REQUIRED_STREAK = 2       # consecutive clear entry cycles before fire
+# Score scale: ±score_price_pct of price maps to 0–100 (smaller → more sensitive to extensions)
+VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
 VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
 # Dynamic take-profit: max(floor, atr_in_ticks * ATR_TP_MULT)

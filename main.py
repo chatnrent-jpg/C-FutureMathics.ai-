@@ -55,6 +55,7 @@ from engine.config import (
     VIRTUE_RTH_FLATTEN_RETRY_S,
     VIRTUE_SCORE_LONG_ENTER,
     VIRTUE_SCORE_LONG_EXIT,
+    VIRTUE_SCORE_PRICE_PCT,
     VIRTUE_SCORE_SHORT_ENTER,
     VIRTUE_SCORE_SHORT_EXIT,
     VIRTUE_STATE_PERSIST_INTERVAL_S,
@@ -113,6 +114,7 @@ class VirtueSession:
             short_enter=float(VIRTUE_SCORE_SHORT_ENTER),
             long_exit=float(VIRTUE_SCORE_LONG_EXIT),
             short_exit=float(VIRTUE_SCORE_SHORT_EXIT),
+            score_price_pct=float(VIRTUE_SCORE_PRICE_PCT),
         )
     )
     broker: VirtueBroker = field(default_factory=VirtueBroker)

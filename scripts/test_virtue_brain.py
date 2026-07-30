@@ -229,19 +229,19 @@ def test_hysteresis_avoids_50_whipsaw() -> None:
 
 
 def test_separate_entry_exit_bands() -> None:
-    """Enter needs 62; while long, only exit/flip at <=42."""
+    """Enter needs 58; while long, only exit/flip at <=42."""
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
         min_anchor_samples=5,
-        long_enter=62.0,
-        short_enter=38.0,
+        long_enter=58.0,
+        short_enter=42.0,
         long_exit=42.0,
         short_exit=58.0,
     )
     s.seed(_trending_bars(60, bull=True, step=3.0))
     d = s.evaluate(holding=None)
     assert d.action == SignalAction.LONG
-    assert d.vwap_score >= 62.0
+    assert d.vwap_score >= 58.0
     # Holding: mid-band scores must stay LONG (not flip at 55)
     d_hold = s.evaluate(holding="LONG")
     assert d_hold.action == SignalAction.LONG
@@ -404,8 +404,8 @@ def test_session_uses_tighter_entry_band() -> None:
     from main import VirtueSession
 
     s = VirtueSession()
-    assert s.strategy.long_enter == float(VIRTUE_SCORE_LONG_ENTER) == 62.0
-    assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 38.0
+    assert s.strategy.long_enter == float(VIRTUE_SCORE_LONG_ENTER) == 58.0
+    assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 42.0
     assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 42.0
     assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 58.0
     assert int(VIRTUE_REQUIRED_STREAK) == 2
