@@ -183,16 +183,23 @@ VIRTUE_SCORE_LONG_EXIT = 42.0    # while LONG, flip/exit only when both <= this
 VIRTUE_SCORE_SHORT_EXIT = 58.0   # while SHORT, flip/exit only when both >= this
 VIRTUE_REQUIRED_STREAK = 2       # consecutive clear entry cycles before fire
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
-VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 2
+VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
 # Dynamic take-profit: max(floor, atr_in_ticks * ATR_TP_MULT)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS  # floor = 120 ticks
 # Rebase when |VWAP − TWAP| exceeds this many ATRs (anchor disagreement)
 VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT = 3.0
 # Concurrent Justice layer: throttle writes to primary data/system_state.json
-VIRTUE_STATE_PERSIST_INTERVAL_S = 2.0
-# Event-driven market tick poll cadence (replaces old 30s blocking sleep loop)
+# 3s keeps dashboard fresh without thrashing disk every tick
+VIRTUE_STATE_PERSIST_INTERVAL_S = 3.0
+# Listener poll (quote freshness). Engine may skip quiet flat ticks until force timer.
 VIRTUE_TICK_POLL_S = 5.0
+# Full broker heartbeat every N *engine* cycles (≈ old 30s load when events ~10s)
+VIRTUE_HEARTBEAT_EVERY_N_CYCLES = 3
+# Listener: skip enqueue when mid unchanged by less than this many ticks
+VIRTUE_MIN_PRICE_MOVE_TICKS = 1
+# When flat + quiet, still force an engine event this often (Temperance — stay awake)
+VIRTUE_FORCE_EVENT_MAX_S = 10.0
 
 # Friendly aliases (engine-sketch names)
 LONG_ENTER = VIRTUE_SCORE_LONG_ENTER

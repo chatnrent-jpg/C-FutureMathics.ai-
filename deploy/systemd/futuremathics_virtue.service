@@ -9,7 +9,7 @@ WorkingDirectory=/home/ubuntu/FutureMathics.ai
 Environment=PYTHONPATH=/home/ubuntu/FutureMathics.ai
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env.local
-# Event-driven tick poll cadence (seconds) — market listener → engine queue
+# Listener polls every 5s; engine force-event / heartbeat throttles keep load calm
 ExecStart=/usr/bin/python3 /home/ubuntu/FutureMathics.ai/main.py --interval 5
 Restart=always
 RestartSec=15

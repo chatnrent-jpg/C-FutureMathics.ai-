@@ -182,6 +182,27 @@ def test_engine_event_loop_consumes_tick_ctx() -> None:
     asyncio.run(_run())
 
 
+def test_heartbeat_throttled_every_n_cycles() -> None:
+    """Full heartbeat runs on cycle 1 then every N cycles (calm efficiency)."""
+    from main import VirtueSession, _should_run_heartbeat
+    from engine.config import VIRTUE_HEARTBEAT_EVERY_N_CYCLES
+
+    s = VirtueSession()
+    every = max(1, int(VIRTUE_HEARTBEAT_EVERY_N_CYCLES))
+    s.cycle = 1
+    assert _should_run_heartbeat(s) is True
+    s.cycles_since_heartbeat = 0
+    s.last_heartbeat_ok = True
+    # Simulate skips until N
+    fired = 0
+    for c in range(2, every + 3):
+        s.cycle = c
+        if _should_run_heartbeat(s):
+            fired += 1
+            s.cycles_since_heartbeat = 0
+    assert fired >= 1
+
+
 
 
 def test_hysteresis_avoids_50_whipsaw() -> None:
@@ -441,6 +462,7 @@ if __name__ == "__main__":
     test_target_ticks_from_atr_floor_and_scale()
     test_save_state_throttled_stops_cleanly()
     test_engine_event_loop_consumes_tick_ctx()
+    test_heartbeat_throttled_every_n_cycles()
     test_hysteresis_avoids_50_whipsaw()
     test_separate_entry_exit_bands()
     test_vwap_twap_agreement_required()

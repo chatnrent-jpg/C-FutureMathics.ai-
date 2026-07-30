@@ -46,6 +46,9 @@ from engine.config import (
     TICK_SIZE,
     TICK_VALUE,
     VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT,
+    VIRTUE_FORCE_EVENT_MAX_S,
+    VIRTUE_HEARTBEAT_EVERY_N_CYCLES,
+    VIRTUE_MIN_PRICE_MOVE_TICKS,
     VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES,
     VIRTUE_REQUIRED_STREAK,
     VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
@@ -102,6 +105,8 @@ class VirtueSession:
     long_streak: int = 0
     short_streak: int = 0
     is_running: bool = True  # False stops background state writer (run.py pattern)
+    cycles_since_heartbeat: int = 0
+    last_heartbeat_ok: bool = True
     strategy: WisdomStrategy = field(
         default_factory=lambda: WisdomStrategy(
             long_enter=float(VIRTUE_SCORE_LONG_ENTER),
@@ -228,20 +233,39 @@ async def market_tick_listener(
 ) -> None:
     """
     Produce market tick events onto the queue (event-driven source).
-    Polls Alpaca/Webull at poll_s; coalescing happens in the engine consumer.
+    Calm efficiency: poll at poll_s; skip enqueue when price is quiet unless
+    a force-event timer fires (so open risk still gets stop/TP checks).
     """
     cadence = max(0.5, float(poll_s))
-    logger.info("MARKET_LISTENER start poll_s=%.1f → event queue", cadence)
+    min_move = max(1, int(VIRTUE_MIN_PRICE_MOVE_TICKS)) * float(TICK_SIZE)
+    force_every = max(cadence, float(VIRTUE_FORCE_EVENT_MAX_S))
+    last_emitted_px = 0.0
+    last_emit_mono = 0.0
+    logger.info(
+        "MARKET_LISTENER start poll_s=%.1f force_event_max=%.1fs min_move=%.2f → event queue",
+        cadence,
+        force_every,
+        min_move,
+    )
     while session.is_running:
         try:
             ctx = await session.broker.resolve_market_context_timed()
-            # Drop backlog so the engine always sees the freshest quote (Justice).
-            while not tick_queue.empty():
-                try:
-                    tick_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-            await tick_queue.put({"ok": True, "ctx": ctx})
+            tick = (ctx or {}).get("tick") or {}
+            px = float(tick.get("price") or tick.get("last") or 0.0)
+            now_mono = time.monotonic()
+            holding = session.broker.net_exposure()[1] > 0
+            moved = last_emitted_px <= 0 or abs(px - last_emitted_px) >= min_move
+            due = (now_mono - last_emit_mono) >= force_every
+            # Always emit when holding (Temperance stops), on meaningful move, or force timer.
+            if px > 0 and (holding or moved or due or last_emitted_px <= 0):
+                while not tick_queue.empty():
+                    try:
+                        tick_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                await tick_queue.put({"ok": True, "ctx": ctx})
+                last_emitted_px = px
+                last_emit_mono = now_mono
         except Exception as exc:
             logger.exception("market_tick_listener_failed err=%s", exc)
             try:
@@ -249,7 +273,6 @@ async def market_tick_listener(
             except Exception:
                 logger.exception("market_tick_enqueue_failed")
         await asyncio.sleep(cadence)
-    # Wake consumer so gather can unwind cleanly.
     try:
         await tick_queue.put(None)
     except Exception:
@@ -323,6 +346,19 @@ async def engine_event_loop(
             break
 
     return n
+
+
+def _should_run_heartbeat(session: VirtueSession) -> bool:
+    """Calm efficiency: probe every N cycles; always on first / after prior failure / triage."""
+    every = max(1, int(VIRTUE_HEARTBEAT_EVERY_N_CYCLES))
+    session.cycles_since_heartbeat += 1
+    if session.cycle <= 1:
+        return True
+    if not session.last_heartbeat_ok:
+        return True
+    if not session.broker.can_send_new_orders():
+        return True
+    return session.cycles_since_heartbeat >= every
 
 
 
@@ -539,29 +575,38 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    hb = BrokerHeartbeatAgent(
-        brokers={"primary": lambda: _heartbeat_probe(session.broker)},
-        interval_s=5.0,
-        degraded_ms=NETWORK_TIMEOUT_S * 1000.0,
-        green_ms=min(2000.0, NETWORK_TIMEOUT_S * 1000.0),
-    )
-    try:
-        events = await asyncio.wait_for(hb.run_once(), timeout=NETWORK_TIMEOUT_S + 1.0)
-    except Exception as exc:
-        logger.exception("heartbeat_run_failed err=%s", exc)
-        await _survive_outage(session, "heartbeat_exception")
-        session.last_action = "FLAT"
-        return
-
-    dead = any(e.state == HeartbeatState.DEAD for e in events)
-    if dead:
-        recovered = await _survive_outage(session, "heartbeat_dead")
-        if not recovered:
+    # Calm efficiency: full heartbeat every N cycles (old-format load), not every event.
+    if _should_run_heartbeat(session):
+        hb = BrokerHeartbeatAgent(
+            brokers={"primary": lambda: _heartbeat_probe(session.broker)},
+            interval_s=5.0,
+            degraded_ms=NETWORK_TIMEOUT_S * 1000.0,
+            green_ms=min(2000.0, NETWORK_TIMEOUT_S * 1000.0),
+        )
+        try:
+            events = await asyncio.wait_for(hb.run_once(), timeout=NETWORK_TIMEOUT_S + 1.0)
+        except Exception as exc:
+            logger.exception("heartbeat_run_failed err=%s", exc)
+            session.last_heartbeat_ok = False
+            session.cycles_since_heartbeat = 0
+            await _survive_outage(session, "heartbeat_exception")
             session.last_action = "FLAT"
             return
-        # Outage may have spanned the 16:00 boundary — re-gate before continuing.
-        if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
-            return
+
+        dead = any(e.state == HeartbeatState.DEAD for e in events)
+        session.cycles_since_heartbeat = 0
+        if dead:
+            session.last_heartbeat_ok = False
+            recovered = await _survive_outage(session, "heartbeat_dead")
+            if not recovered:
+                session.last_action = "FLAT"
+                return
+            # Outage may have spanned the 16:00 boundary — re-gate before continuing.
+            if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
+                return
+        else:
+            session.last_heartbeat_ok = True
+    # else: skipped heartbeat this cycle — cycles_since_heartbeat already advanced
 
     if not session.broker.can_send_new_orders():
         logger.warning("CYCLE %s triage=%s — forcing reconcile path", session.cycle, session.broker.triage.value)
@@ -1109,8 +1154,10 @@ async def run_loop(
     poll_s = max(0.5, float(interval_s if interval_s is not None else VIRTUE_TICK_POLL_S))
     logger.info(
         "EVENT_ENGINE start listener+processor+state_writer poll_s=%.1fs "
-        "state=data/system_state.json persist_every=%.1fs",
+        "heartbeat_every=%s rebase_cooldown=%s state=data/system_state.json persist_every=%.1fs",
         poll_s,
+        int(VIRTUE_HEARTBEAT_EVERY_N_CYCLES),
+        int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES),
         float(VIRTUE_STATE_PERSIST_INTERVAL_S),
     )
 
