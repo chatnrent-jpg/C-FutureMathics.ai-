@@ -41,7 +41,7 @@ from engine.webull_openapi import webull_is_sandbox
 
 logger = logging.getLogger(__name__)
 
-RISK_LIMIT_PCT = FIXED_FRACTIONAL_RISK_PCT  # 0.75% on $10k book
+RISK_LIMIT_PCT = FIXED_FRACTIONAL_RISK_PCT  # 0.8% on $10k book
 NETWORK_TIMEOUT_S = WEBULL_NETWORK_TIMEOUT_S  # 5.0 — Justice hard cap
 RECONNECT_BACKOFF_MIN_S = 30.0
 RECONNECT_BACKOFF_MAX_S = 60.0
@@ -581,7 +581,15 @@ class VirtueBroker:
                 logger.exception("reconcile_row_skip err=%s row=%s", exc, row)
                 continue
 
-        self.open_positions = synced
+        # Forward-test paper: Webull futures book is empty — keep local paper fills (Justice).
+        if equity_source == "forward_test_paper_nav" and not synced:
+            logger.info(
+                "reconcile_paper_keep_local_positions n=%s equity=%.2f",
+                len(self.open_positions),
+                self.equity,
+            )
+        else:
+            self.open_positions = synced
         self.triage = TriageState.READY
         logger.info(
             "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=%s",

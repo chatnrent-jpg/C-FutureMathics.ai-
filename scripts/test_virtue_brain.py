@@ -98,10 +98,102 @@ def test_rebase_anchors_aligns_scores_to_live() -> None:
     assert d.twap_score > 5.0
 
 
+def test_anchors_diverged_atr_gate() -> None:
+    """|VWAP−TWAP| > atr×3 triggers divergence rebase (engine sketch)."""
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=0.25))
+    assert s.anchors_diverged(atr_mult=3.0) is False
+    # Force TWAP away from VWAP without changing closes ATR path much
+    assert s.twap_tracker is not None and s.vwap_tracker is not None
+    atr = s._atr()
+    assert atr > 0
+    # Inject divergent TWAP samples while VWAP stays near last close
+    last = float(list(s.closes)[-1])
+    s.twap_tracker.reset()
+    for _ in range(30):
+        s.twap_tracker.update(last + atr * 4.0)
+    assert s.anchors_diverged(atr_mult=3.0) is True
+
+
+def test_target_ticks_from_atr_floor_and_scale() -> None:
+    from main import target_ticks_from_atr
+    from engine.config import TICK_SIZE, VIRTUE_TP_ATR_MULT, VIRTUE_TP_MIN_TICKS
+
+    # Tiny ATR → floor
+    assert target_ticks_from_atr(0.5) == int(VIRTUE_TP_MIN_TICKS)
+    # Large ATR → max(floor, atr_ticks * mult)
+    atr_pts = 50.0  # 200 ticks
+    expected = max(int(VIRTUE_TP_MIN_TICKS), int(round((atr_pts / TICK_SIZE) * float(VIRTUE_TP_ATR_MULT))))
+    assert target_ticks_from_atr(atr_pts) == expected
+    assert expected >= int(VIRTUE_TP_MIN_TICKS)
+
+
+def test_save_state_throttled_stops_cleanly() -> None:
+    """Background Justice writer exits when is_running flips (run.py pattern)."""
+    import asyncio
+    from main import VirtueSession, save_state_throttled
+
+    async def _run() -> None:
+        session = VirtueSession()
+        session.is_running = True
+        task = asyncio.create_task(save_state_throttled(session, interval_s=0.05))
+        await asyncio.sleep(0.12)
+        session.is_running = False
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(_run())
+
+
+def test_engine_event_loop_consumes_tick_ctx() -> None:
+    """Event consumer runs one cycle from a queued market_ctx then stops."""
+    import asyncio
+    from main import VirtueSession, engine_event_loop, run_cycle
+    from unittest.mock import AsyncMock, patch
+
+    async def _run() -> None:
+        session = VirtueSession()
+        session.is_running = True
+        q: asyncio.Queue = asyncio.Queue()
+        ctx = {
+            "tick": {
+                "price": 9200.0,
+                "last": 9200.0,
+                "bid": 9199.75,
+                "ask": 9200.25,
+                "source": "test",
+            }
+        }
+        await q.put({"ok": True, "ctx": ctx})
+
+        with patch("main.run_cycle", new_callable=AsyncMock) as mocked:
+            n = await engine_event_loop(
+                session,
+                q,
+                cycles=1,
+                once=False,
+                ignore_hours=True,
+            )
+            assert n == 1
+            assert mocked.await_count == 1
+            kwargs = mocked.await_args.kwargs
+            assert kwargs.get("market_ctx") == ctx
+            assert session.is_running is False
+
+    asyncio.run(_run())
+
+
+
 
 def test_hysteresis_avoids_50_whipsaw() -> None:
-    """While LONG, scores dipping slightly must not flip SHORT until <=45."""
-    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5, long_enter=55.0, short_enter=45.0)
+    """While LONG, scores dipping must not flip until long_exit band."""
+    s = WisdomStrategy(
+        atr_pct_chaos_max=50.0,
+        min_anchor_samples=5,
+        long_enter=62.0,
+        short_enter=38.0,
+        long_exit=42.0,
+        short_exit=58.0,
+    )
     s.seed(_trending_bars(50, bull=True, step=2.0))
     d_long = s.evaluate(holding=None)
     assert d_long.action == SignalAction.LONG
@@ -115,8 +207,27 @@ def test_hysteresis_avoids_50_whipsaw() -> None:
     assert "hold_long" in d_hold.reason or d_hold.action == SignalAction.LONG
 
 
+def test_separate_entry_exit_bands() -> None:
+    """Enter needs 62; while long, only exit/flip at <=42."""
+    s = WisdomStrategy(
+        atr_pct_chaos_max=50.0,
+        min_anchor_samples=5,
+        long_enter=62.0,
+        short_enter=38.0,
+        long_exit=42.0,
+        short_exit=58.0,
+    )
+    s.seed(_trending_bars(60, bull=True, step=3.0))
+    d = s.evaluate(holding=None)
+    assert d.action == SignalAction.LONG
+    assert d.vwap_score >= 62.0
+    # Holding: mid-band scores must stay LONG (not flip at 55)
+    d_hold = s.evaluate(holding="LONG")
+    assert d_hold.action == SignalAction.LONG
+
+
 def test_vwap_twap_agreement_required() -> None:
-    """Hard dump → clear SHORT band (<=45)."""
+    """Hard dump → clear SHORT band (<= short_enter)."""
     from strategy import score_vs_anchor
 
     assert score_vs_anchor(101.0, 100.0, scale=10.0) > 50.0
@@ -129,7 +240,7 @@ def test_vwap_twap_agreement_required() -> None:
         s.update(Bar(high=last + 0.2, low=last - 0.2, close=last))
     d = s.evaluate()
     assert d.action == SignalAction.SHORT
-    assert d.vwap_score <= 45.0 and d.twap_score <= 45.0
+    assert d.vwap_score <= s.short_enter and d.twap_score <= s.short_enter
 
 
 
@@ -252,9 +363,31 @@ def test_take_profit_and_scale_out_qty() -> None:
         price=entry - DEFAULT_TARGET_TICKS * TICK_SIZE,
         target_ticks=DEFAULT_TARGET_TICKS,
     )
-    # After conceptually leaving one runner, no more scale-out
-    b.open_positions = [{"direction": "SHORT", "size": 1, "price": entry, "scaled_out_tp": True}]
+    # Single-lot book: scale-out leave=1 means close qty 0 — full TP path must be used instead
+    b.open_positions = [{"direction": "LONG", "size": 1, "price": entry}]
     assert b.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS) == 0
+    assert b.take_profit_hit(
+        price=entry + DEFAULT_TARGET_TICKS * TICK_SIZE,
+        target_ticks=DEFAULT_TARGET_TICKS,
+    )
+
+
+def test_session_uses_tighter_entry_band() -> None:
+    from engine.config import (
+        VIRTUE_REQUIRED_STREAK,
+        VIRTUE_SCORE_LONG_ENTER,
+        VIRTUE_SCORE_LONG_EXIT,
+        VIRTUE_SCORE_SHORT_ENTER,
+        VIRTUE_SCORE_SHORT_EXIT,
+    )
+    from main import VirtueSession
+
+    s = VirtueSession()
+    assert s.strategy.long_enter == float(VIRTUE_SCORE_LONG_ENTER) == 62.0
+    assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 38.0
+    assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 42.0
+    assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 58.0
+    assert int(VIRTUE_REQUIRED_STREAK) == 2
 
 
 def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
@@ -304,7 +437,12 @@ if __name__ == "__main__":
     test_score_discontinuity_stands_aside()
     test_anchor_gap_too_wide()
     test_rebase_anchors_aligns_scores_to_live()
+    test_anchors_diverged_atr_gate()
+    test_target_ticks_from_atr_floor_and_scale()
+    test_save_state_throttled_stops_cleanly()
+    test_engine_event_loop_consumes_tick_ctx()
     test_hysteresis_avoids_50_whipsaw()
+    test_separate_entry_exit_bands()
     test_vwap_twap_agreement_required()
     test_size_respects_fixed_fractional()
     test_validate_order_symbol_size_stale()
@@ -315,5 +453,6 @@ if __name__ == "__main__":
     test_forward_test_paper_nav_allows_sizing()
     test_stop_hit_and_flat_exit_helpers()
     test_take_profit_and_scale_out_qty()
+    test_session_uses_tighter_entry_band()
     test_session_day_roll_clears_yesterdays_profit_lock()
     print("ALL VIRTUE BRAIN TESTS PASSED")

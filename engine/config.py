@@ -79,15 +79,15 @@ HANDSHAKE_EQUITY_BASE = 10_000.0
 
 MAX_DAILY_LOSS_PCT = 0.02
 HARD_DAILY_STOP = 200.0  # 2% of $10k
-# 0.75% of $10k = $75 → exactly 1 MES @ 60-tick stop ($75)
-FIXED_FRACTIONAL_RISK_PCT = 0.0075
+# 0.8% of $10k = $80 → 1 MES @ 60-tick stop ($75) still fits after small adverse days
+FIXED_FRACTIONAL_RISK_PCT = 0.008
 MAX_CONCURRENT_RISK_PCT = 0.05
 PER_TRADE_RISK_MIN = 60.0
 PER_TRADE_RISK_MAX = 90.0
 
 # Paper forward-test — $10k / 1 MES
 FORWARD_TEST_MAX_CONCURRENT_RISK_PCT = 0.05
-FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.0075
+FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.008
 FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
 PAPER_MAX_MES_CONTRACTS = 1
 PAPER_MAX_OPEN_MES_POSITIONS = 1
@@ -96,7 +96,7 @@ PAPER_MAX_OPEN_MES_POSITIONS = 1
 LIVE_RISK_NAV_CAP = 10_000.0
 LIVE_MAX_DAILY_LOSS = 200.0
 LIVE_MAX_CONCURRENT_RISK_PCT = 0.05
-LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.0075
+LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.008
 
 DRAWDOWN_BRAKE_PCT = 0.10
 CAPITAL_DRAG_MULTIPLIER = 0.5
@@ -175,9 +175,33 @@ VIRTUE_NO_NEW_ENTRY_MINUTE = 45
 # Outside RTH: retry flatten until flat (or attempts exhausted).
 VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
-# Hysteresis around 50% so we don't flip LONG↔SHORT on every tiny cross (Temperance)
-VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP must clear this to go/stay LONG from flat/short
-VIRTUE_SCORE_SHORT_ENTER = 45.0  # both must be under this to go/stay SHORT from flat/long
+# Hysteresis bands (Temperance — hard to enter, harder to whipsaw out)
+# Enter only on strong agreement; while holding, exit/flip only at opposite exit band.
+VIRTUE_SCORE_LONG_ENTER = 62.0   # both VWAP+TWAP >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 38.0  # both VWAP+TWAP <= this to ENTER short from flat
+VIRTUE_SCORE_LONG_EXIT = 42.0    # while LONG, flip/exit only when both <= this
+VIRTUE_SCORE_SHORT_EXIT = 58.0   # while SHORT, flip/exit only when both >= this
+VIRTUE_REQUIRED_STREAK = 2       # consecutive clear entry cycles before fire
+# After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
+VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 2
+# Dynamic take-profit: max(floor, atr_in_ticks * ATR_TP_MULT)
+VIRTUE_TP_ATR_MULT = 1.5
+VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS  # floor = 120 ticks
+# Rebase when |VWAP − TWAP| exceeds this many ATRs (anchor disagreement)
+VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT = 3.0
+# Concurrent Justice layer: throttle writes to primary data/system_state.json
+VIRTUE_STATE_PERSIST_INTERVAL_S = 2.0
+# Event-driven market tick poll cadence (replaces old 30s blocking sleep loop)
+VIRTUE_TICK_POLL_S = 5.0
+
+# Friendly aliases (engine-sketch names)
+LONG_ENTER = VIRTUE_SCORE_LONG_ENTER
+SHORT_ENTER = VIRTUE_SCORE_SHORT_ENTER
+LONG_EXIT = VIRTUE_SCORE_LONG_EXIT
+SHORT_EXIT = VIRTUE_SCORE_SHORT_EXIT
+REQUIRED_STREAK = VIRTUE_REQUIRED_STREAK
+MAX_DAILY_LOSS = HARD_DAILY_STOP
+PROFIT_LOCK = GRADE_DAILY_PROFIT_LOCK
 
 # Simulated MES price anchor (updated from live feed when wired)
 WARMUP_MES_PRICE = 6200.0

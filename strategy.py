@@ -91,8 +91,10 @@ class WisdomStrategy:
     score_atr_mult: float = 2.0  # ATR component of score scale
     score_price_pct: float = 0.005  # ±0.5% of price spans 0–100 (avoids 0/100 clamp)
     max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
-    long_enter: float = 55.0  # hysteresis: need clear strength to go LONG
-    short_enter: float = 45.0  # hysteresis: need clear weakness to go SHORT
+    long_enter: float = 62.0  # ENTER long from flat (both scores >=)
+    short_enter: float = 38.0  # ENTER short from flat (both scores <=)
+    long_exit: float = 42.0  # while LONG: flip/exit when both scores <=
+    short_exit: float = 58.0  # while SHORT: flip/exit when both scores >=
     anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)
     min_anchor_samples: int = 20
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
@@ -170,6 +172,19 @@ class WisdomStrategy:
         jump_gate = max(2.0 * atr if atr > 0 else 0.0, px * 0.002, 5.0)
         gap_gate = max(self.max_anchor_gap_pct, (3.0 * atr / px) if atr > 0 else self.max_anchor_gap_pct)
         return gap_pct > gap_gate and jump > jump_gate
+
+    def anchors_diverged(self, *, atr_mult: float = 3.0) -> bool:
+        """
+        True when |VWAP − TWAP| exceeds atr_mult × ATR (anchor disagreement).
+        Wisdom: rebase + cooldown rather than trade on conflicting averages.
+        """
+        assert self.vwap_tracker is not None and self.twap_tracker is not None
+        vwap = float(self.vwap_tracker.vwap or 0.0)
+        twap = float(self.twap_tracker.twap or 0.0)
+        atr = self._atr()
+        if vwap <= 0 or twap <= 0 or atr <= 0:
+            return False
+        return abs(vwap - twap) > (atr * float(atr_mult))
 
     def score_scale(self, *, price: float, atr: float) -> float:
         return max(atr * self.score_atr_mult, price * self.score_price_pct, 5.0)
@@ -336,18 +351,21 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        clear_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
-        clear_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
+        # Entry bands (from flat) vs exit bands (while holding) — asymmetric hysteresis
+        enter_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
+        enter_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
+        exit_long = vwap_score <= self.long_exit and twap_score <= self.long_exit
+        exit_short = vwap_score >= self.short_exit and twap_score >= self.short_exit
 
-        # Hysteresis: while in a trade, stay until the opposite band is clear (no 50% whipsaw)
+        # Hysteresis: while in a trade, stay until the opposite EXIT band is clear
         if hold == "LONG":
-            if clear_short:
+            if exit_long:
                 return self._empty(
                     regime=Regime.TREND_BEAR,
                     action=SignalAction.SHORT,
                     reason=(
                         f"vwap_twap_flip_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                        f"blend={blended:.1f} enter<={self.short_enter}"
+                        f"blend={blended:.1f} exit<={self.long_exit}"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -364,7 +382,7 @@ class WisdomStrategy:
                 action=SignalAction.LONG,
                 reason=(
                     f"vwap_twap_hold_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                    f"blend={blended:.1f} hyst={self.short_enter}-{self.long_enter}"
+                    f"blend={blended:.1f} hold_until_exit<={self.long_exit}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -378,13 +396,13 @@ class WisdomStrategy:
             )
 
         if hold == "SHORT":
-            if clear_long:
+            if exit_short:
                 return self._empty(
                     regime=Regime.TREND_BULL,
                     action=SignalAction.LONG,
                     reason=(
                         f"vwap_twap_flip_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                        f"blend={blended:.1f} enter>={self.long_enter}"
+                        f"blend={blended:.1f} exit>={self.short_exit}"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -401,7 +419,7 @@ class WisdomStrategy:
                 action=SignalAction.SHORT,
                 reason=(
                     f"vwap_twap_hold_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                    f"blend={blended:.1f} hyst={self.short_enter}-{self.long_enter}"
+                    f"blend={blended:.1f} hold_until_exit>={self.short_exit}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -414,8 +432,8 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Flat: only enter on a clear band (not every tick around 50)
-        if clear_long:
+        # Flat: only enter on a clear ENTRY band (not every tick around 50)
+        if enter_long:
             return self._empty(
                 regime=Regime.TREND_BULL,
                 action=SignalAction.LONG,
@@ -434,7 +452,7 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        if clear_short:
+        if enter_short:
             return self._empty(
                 regime=Regime.TREND_BEAR,
                 action=SignalAction.SHORT,

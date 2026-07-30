@@ -311,10 +311,51 @@ def load_persisted_book_equity(default: float | None = None) -> float:
     return base
 
 
+def load_persisted_open_positions() -> list[dict[str, Any]]:
+    """Restore paper open positions from system_state.json (survive restarts)."""
+    from pathlib import Path
+    import json
+    import logging
+
+    from engine.config import EXECUTION_SYMBOL
+
+    log = logging.getLogger("virtue.ui_state")
+    state_path = Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    out: list[dict[str, Any]] = []
+    try:
+        if not state_path.is_file():
+            return out
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        for row in list(raw.get("open_positions") or []):
+            try:
+                direction = str(row.get("direction") or "").upper()
+                contracts = int(row.get("contracts") or row.get("size") or 0)
+                entry = float(row.get("entry_price") or row.get("price") or 0.0)
+                if direction not in {"LONG", "SHORT"} or contracts < 1 or entry <= 0:
+                    continue
+                out.append(
+                    {
+                        "direction": direction,
+                        "size": contracts,
+                        "price": entry,
+                        "entry_price": entry,
+                        "symbol": str(row.get("symbol") or EXECUTION_SYMBOL),
+                        "order_id": str(row.get("order_id") or ""),
+                        "source": "persisted_paper",
+                    }
+                )
+            except Exception:
+                continue
+    except Exception as exc:
+        log.exception("load_persisted_open_positions_failed err=%s", exc)
+    return out
+
+
 __all__ = [
     "build_system_state",
     "build_virtue_system_state",
     "ensure_boot_system_state",
     "load_persisted_book_equity",
+    "load_persisted_open_positions",
     "persist_virtue_system_state",
 ]

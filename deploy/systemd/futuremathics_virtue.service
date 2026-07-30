@@ -9,8 +9,8 @@ WorkingDirectory=/home/ubuntu/FutureMathics.ai
 Environment=PYTHONPATH=/home/ubuntu/FutureMathics.ai
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/home/ubuntu/FutureMathics.ai/.env.local
-# Interval between virtue cycles (seconds)
-ExecStart=/usr/bin/python3 /home/ubuntu/FutureMathics.ai/main.py --interval 30
+# Event-driven tick poll cadence (seconds) — market listener → engine queue
+ExecStart=/usr/bin/python3 /home/ubuntu/FutureMathics.ai/main.py --interval 5
 Restart=always
 RestartSec=15
 

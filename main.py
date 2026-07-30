@@ -38,7 +38,6 @@ if str(ROOT) not in sys.path:
 from broker import NETWORK_TIMEOUT_S, Order, VirtueBroker
 from engine.config import (
     DEFAULT_STOP_TICKS,
-    DEFAULT_TARGET_TICKS,
     EXECUTION_SYMBOL,
     FORWARD_TEST_TIMEZONE,
     GRADE_DAILY_PROFIT_LOCK,
@@ -46,15 +45,30 @@ from engine.config import (
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT,
+    VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES,
+    VIRTUE_REQUIRED_STREAK,
     VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
     VIRTUE_RTH_FLATTEN_RETRY_S,
+    VIRTUE_SCORE_LONG_ENTER,
+    VIRTUE_SCORE_LONG_EXIT,
+    VIRTUE_SCORE_SHORT_ENTER,
+    VIRTUE_SCORE_SHORT_EXIT,
+    VIRTUE_STATE_PERSIST_INTERVAL_S,
+    VIRTUE_TICK_POLL_S,
+    VIRTUE_TP_ATR_MULT,
+    VIRTUE_TP_MIN_TICKS,
     forward_test_force_paper,
 )
 
 _ET = ZoneInfo(FORWARD_TEST_TIMEZONE)
 from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 from manus.heartbeat import BrokerHeartbeatAgent, HeartbeatState
-from engine.ui_state_bridge import load_persisted_book_equity, persist_virtue_system_state
+from engine.ui_state_bridge import (
+    load_persisted_book_equity,
+    load_persisted_open_positions,
+    persist_virtue_system_state,
+)
 from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
 from strategy import Bar, SignalAction, WisdomStrategy
 
@@ -84,7 +98,18 @@ class VirtueSession:
     last_blended_score: float = 50.0
     last_data_source: str = "alpaca_spy_mes_proxy"
     anchors_aligned: bool = False
-    strategy: WisdomStrategy = field(default_factory=WisdomStrategy)
+    entry_cooldown_cycles: int = 0  # skip new entries after anchor rebase
+    long_streak: int = 0
+    short_streak: int = 0
+    is_running: bool = True  # False stops background state writer (run.py pattern)
+    strategy: WisdomStrategy = field(
+        default_factory=lambda: WisdomStrategy(
+            long_enter=float(VIRTUE_SCORE_LONG_ENTER),
+            short_enter=float(VIRTUE_SCORE_SHORT_ENTER),
+            long_exit=float(VIRTUE_SCORE_LONG_EXIT),
+            short_exit=float(VIRTUE_SCORE_SHORT_EXIT),
+        )
+    )
     broker: VirtueBroker = field(default_factory=VirtueBroker)
     risk: CapitalProtectionMatrix = field(
         default_factory=lambda: CapitalProtectionMatrix(
@@ -93,6 +118,17 @@ class VirtueSession:
             peak_nav=STARTING_NAV,
         )
     )
+
+
+def target_ticks_from_atr(atr: float) -> int:
+    """
+    Dynamic take-profit in ticks: max(floor, atr_ticks * mult).
+    atr is in price points; MES tick = 0.25 → atr_ticks = atr / TICK_SIZE.
+    """
+    atr_pts = max(0.0, float(atr or 0.0))
+    atr_ticks = atr_pts / float(TICK_SIZE) if TICK_SIZE > 0 else 0.0
+    raw = int(round(atr_ticks * float(VIRTUE_TP_ATR_MULT)))
+    return max(int(VIRTUE_TP_MIN_TICKS), raw)
 
 
 def et_session_date(now: datetime | None = None) -> str:
@@ -145,7 +181,7 @@ def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
 
 
 def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> None:
-    """Keep Streamlit/cloud dashboard fresh from virtue loop (not grade path)."""
+    """Persist to primary live data/system_state.json for Streamlit / cloud dashboard."""
     price = last_price if last_price is not None else float(getattr(session.broker, "_last_price", 0.0) or 0.0)
     persist_virtue_system_state(
         session,
@@ -162,6 +198,132 @@ def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> N
         last_risk_verdict=session.last_risk_verdict,
         last_risk_reason=session.last_risk_reason,
     )
+
+
+async def save_state_throttled(
+    session: VirtueSession,
+    *,
+    interval_s: float | None = None,
+) -> None:
+    """
+    Background Justice writer — concurrent with the market event engine.
+    Always writes the primary live path: data/system_state.json (via _publish_ui).
+    Disk I/O stays off the hot path via asyncio.to_thread.
+    """
+    sleep_s = float(interval_s if interval_s is not None else VIRTUE_STATE_PERSIST_INTERVAL_S)
+    sleep_s = max(0.5, sleep_s)
+    while session.is_running:
+        try:
+            await asyncio.to_thread(_publish_ui, session)
+        except Exception as exc:
+            logger.error("Justice Layer write failure (system_state.json): %s", exc)
+        await asyncio.sleep(sleep_s)
+
+
+async def market_tick_listener(
+    session: VirtueSession,
+    tick_queue: asyncio.Queue,
+    *,
+    poll_s: float,
+) -> None:
+    """
+    Produce market tick events onto the queue (event-driven source).
+    Polls Alpaca/Webull at poll_s; coalescing happens in the engine consumer.
+    """
+    cadence = max(0.5, float(poll_s))
+    logger.info("MARKET_LISTENER start poll_s=%.1f → event queue", cadence)
+    while session.is_running:
+        try:
+            ctx = await session.broker.resolve_market_context_timed()
+            # Drop backlog so the engine always sees the freshest quote (Justice).
+            while not tick_queue.empty():
+                try:
+                    tick_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            await tick_queue.put({"ok": True, "ctx": ctx})
+        except Exception as exc:
+            logger.exception("market_tick_listener_failed err=%s", exc)
+            try:
+                await tick_queue.put({"ok": False, "error": str(exc)})
+            except Exception:
+                logger.exception("market_tick_enqueue_failed")
+        await asyncio.sleep(cadence)
+    # Wake consumer so gather can unwind cleanly.
+    try:
+        await tick_queue.put(None)
+    except Exception:
+        pass
+
+
+async def engine_event_loop(
+    session: VirtueSession,
+    tick_queue: asyncio.Queue,
+    *,
+    cycles: int | None,
+    once: bool,
+    ignore_hours: bool,
+    stop_ticks: int = DEFAULT_STOP_TICKS,
+) -> int:
+    """
+    Consume market tick events and run virtue cycles (Courage — act when signal arrives).
+    Replaces the old sleep-then-poll main loop.
+    """
+    n = 0
+    while session.is_running:
+        try:
+            item = await tick_queue.get()
+        except Exception as exc:
+            logger.exception("engine_event_queue_get_failed err=%s", exc)
+            await asyncio.sleep(1.0)
+            continue
+
+        # Coalesce to latest event while running.
+        while True:
+            try:
+                nxt = tick_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            item = nxt
+
+        if item is None:
+            break
+
+        market_ctx = None
+        if isinstance(item, dict) and item.get("ok") and isinstance(item.get("ctx"), dict):
+            market_ctx = item["ctx"]
+        elif isinstance(item, dict) and not item.get("ok"):
+            logger.error(
+                "CYCLE pending market_listener_error err=%s — outage survival",
+                item.get("error"),
+            )
+            try:
+                await _survive_outage(session, "market_listener_error")
+            except Exception:
+                logger.exception("reconnect_after_listener_error_failed")
+            continue
+
+        try:
+            await run_cycle(
+                session,
+                stop_ticks=stop_ticks,
+                ignore_hours=ignore_hours,
+                market_ctx=market_ctx,
+            )
+        except Exception as exc:
+            logger.exception("cycle_unhandled err=%s — infinite outage survival", exc)
+            try:
+                await _survive_outage(session, "cycle_exception")
+            except Exception:
+                logger.exception("reconnect_after_cycle_exception_failed — will retry next event")
+
+        n += 1
+        if once or (cycles is not None and n >= cycles):
+            session.is_running = False
+            break
+
+    return n
+
 
 
 async def _heartbeat_probe(broker: VirtueBroker) -> tuple[bool, str]:
@@ -356,11 +518,16 @@ async def run_cycle(
     *,
     stop_ticks: int = DEFAULT_STOP_TICKS,
     ignore_hours: bool = False,
+    market_ctx: dict | None = None,
 ) -> None:
     """One virtue cycle: hours → heartbeat → market → regime → exclusivity → Manus → fire."""
     session.cycle += 1
     # Temperance: new ET calendar day → clear yesterday's PnL/trade counters (Justice).
     roll_daily_counters_if_needed(session)
+    # Tick post-rebase entry cooldown every cycle (even while holding).
+    cooldown_blocks_entry = session.entry_cooldown_cycles > 0
+    if session.entry_cooldown_cycles > 0:
+        session.entry_cooldown_cycles -= 1
 
     # Cash RTH only (Alpaca SPY live): Mon–Fri 9:30–16:00 ET.
     # Outside RTH → flatten any residual risk (Temperance: no overnight/weekend gaps).
@@ -405,13 +572,17 @@ async def run_cycle(
         if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
             return
 
-    try:
-        ctx = await session.broker.resolve_market_context_timed()
-    except Exception as exc:
-        logger.exception("market_context_failed err=%s", exc)
-        await _survive_outage(session, "market_context_exception")
-        session.last_action = "FLAT"
-        return
+    # Event-driven path supplies market_ctx from the listener; fallback fetch for --once tools.
+    if market_ctx is not None:
+        ctx = market_ctx
+    else:
+        try:
+            ctx = await session.broker.resolve_market_context_timed()
+        except Exception as exc:
+            logger.exception("market_context_failed err=%s", exc)
+            await _survive_outage(session, "market_context_exception")
+            session.last_action = "FLAT"
+            return
 
     if ctx.get("stand_aside"):
         logger.error(
@@ -441,18 +612,29 @@ async def run_cycle(
         high, low = low, high
 
     # Align rolling VWAP/TWAP to live print (seed bars can sit far from quote).
-    # Re-rebase whenever gap is too wide so we never sit SHORT in a bull on false 0% scores.
+    # Also rebase when VWAP↔TWAP diverge beyond ATR×N (sketch: anchor disagreement).
     try:
-        need_rebase = (not session.anchors_aligned) or session.strategy.anchor_gap_too_wide(price)
+        need_rebase = (
+            (not session.anchors_aligned)
+            or session.strategy.anchor_gap_too_wide(price)
+            or session.strategy.anchors_diverged(atr_mult=float(VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT))
+        )
         if need_rebase:
             session.strategy.rebase_anchors_to_price(price)
             session.anchors_aligned = True
+            session.entry_cooldown_cycles = max(
+                int(session.entry_cooldown_cycles),
+                max(0, int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)),
+            )
+            # Same-cycle: do not fire new entries right after rebase (scores near 50).
+            cooldown_blocks_entry = session.entry_cooldown_cycles > 0
             logger.info(
-                "CYCLE %s anchors_rebased_to_live px=%.2f vwap=%.2f twap=%.2f",
+                "CYCLE %s anchors_rebased_to_live px=%.2f vwap=%.2f twap=%.2f entry_cooldown=%s",
                 session.cycle,
                 price,
                 session.strategy.vwap_tracker.vwap if session.strategy.vwap_tracker else 0.0,
                 session.strategy.twap_tracker.twap if session.strategy.twap_tracker else 0.0,
+                session.entry_cooldown_cycles,
             )
     except Exception as exc:
         logger.exception("anchor_rebase_failed err=%s", exc)
@@ -471,9 +653,20 @@ async def run_cycle(
     session.last_vwap_score = float(decision.vwap_score)
     session.last_twap_score = float(decision.twap_score)
     session.last_blended_score = float(decision.blended_score)
+    tp_ticks = target_ticks_from_atr(float(decision.atr))
+
+    # Dual independent streaks from raw entry bands (build while flat OR holding).
+    # Enables same-cycle flip when opposite streak is already ready (Courage).
+    v_score = float(decision.vwap_score)
+    t_score = float(decision.twap_score)
+    is_raw_long = v_score >= float(VIRTUE_SCORE_LONG_ENTER) and t_score >= float(VIRTUE_SCORE_LONG_ENTER)
+    is_raw_short = v_score <= float(VIRTUE_SCORE_SHORT_ENTER) and t_score <= float(VIRTUE_SCORE_SHORT_ENTER)
+    session.long_streak = (session.long_streak + 1) if is_raw_long else 0
+    session.short_streak = (session.short_streak + 1) if is_raw_short else 0
     logger.info(
         "CYCLE %s regime=%s action=%s vwap=%.1f%% twap=%.1f%% blend=%.1f%% "
-        "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr_pct=%.2f reason=%s exposure=%s",
+        "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr=%.2f atr_pct=%.2f "
+        "tp=%st long_streak=%s short_streak=%s reason=%s exposure=%s",
         session.cycle,
         decision.regime.value,
         decision.action.value,
@@ -484,7 +677,11 @@ async def run_cycle(
         decision.vwap,
         decision.twap,
         decision.adx,
+        decision.atr,
         decision.atr_pct,
+        tp_ticks,
+        session.long_streak,
+        session.short_streak,
         decision.reason,
         session.broker.net_exposure(),
     )
@@ -551,51 +748,81 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Scale-out take-profit (Temperance): bank most size, leave a runner
-    # e.g. 3 contracts → close 2 at +120 ticks ($150/ct), leave 1 until stop/flat/flip
-    # Only while Wisdom still wants the trade — FLAT path below closes everything.
-    close_qty = session.broker.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS)
+    # Take-profit (Temperance): ATR-dynamic target (floor = VIRTUE_TP_MIN_TICKS).
+    # Multi-lot: scale out and leave a runner. Single lot ($10k): full exit at target.
     if (
         decision.action in {SignalAction.LONG, SignalAction.SHORT}
-        and close_qty > 0
-        and session.broker.take_profit_hit(price=price, target_ticks=DEFAULT_TARGET_TICKS)
+        and session.broker.take_profit_hit(price=price, target_ticks=tp_ticks)
     ):
         net_dir, net_size = session.broker.net_exposure()
-        try:
-            ok, pnl = await session.broker.partial_close(
-                contracts=close_qty,
-                price=price,
-                stop_ticks=stop_ticks,
-                reason=f"take_profit_{DEFAULT_TARGET_TICKS}t",
-                leave=SCALE_OUT_LEAVE_CONTRACTS,
-            )
-        except Exception as exc:
-            logger.exception("take_profit_partial_failed err=%s", exc)
+        leave = int(SCALE_OUT_LEAVE_CONTRACTS)
+        if net_size > 0 and net_size <= leave:
+            try:
+                ok, pnl = await session.broker.flatten_all(
+                    price=price,
+                    stop_ticks=stop_ticks,
+                    reason=f"take_profit_full_{tp_ticks}t",
+                )
+            except Exception as exc:
+                logger.exception("take_profit_full_failed err=%s", exc)
+                session.last_action = decision.action.value
+                return
+            if ok:
+                _credit_realized_pnl(session, pnl)
+                session.trades_today += 1
+                logger.info(
+                    "CYCLE %s TAKE_PROFIT_FULL closed %s x%s pnl≈%.2f target=%st atr=%.2f realized_today=%.2f",
+                    session.cycle,
+                    net_dir,
+                    net_size,
+                    pnl,
+                    tp_ticks,
+                    float(decision.atr),
+                    session.realized_pnl_today,
+                )
+            else:
+                logger.error("CYCLE %s TAKE_PROFIT_FULL_FAILED — exposure may remain", session.cycle)
+            session.last_action = "FLAT"
+            return
+
+        close_qty = session.broker.scale_out_close_qty(leave=leave)
+        if close_qty > 0:
+            try:
+                ok, pnl = await session.broker.partial_close(
+                    contracts=close_qty,
+                    price=price,
+                    stop_ticks=stop_ticks,
+                    reason=f"take_profit_{tp_ticks}t",
+                    leave=leave,
+                )
+            except Exception as exc:
+                logger.exception("take_profit_partial_failed err=%s", exc)
+                session.last_action = decision.action.value
+                return
+            if ok:
+                _credit_realized_pnl(session, pnl)
+                session.trades_today += 1
+                remain = session.broker.net_exposure()[1]
+                logger.info(
+                    "CYCLE %s TAKE_PROFIT_SCALE_OUT closed %s x%s leave=%s pnl≈%.2f "
+                    "target=%st atr=%.2f realized_today=%.2f",
+                    session.cycle,
+                    net_dir,
+                    close_qty,
+                    remain,
+                    pnl,
+                    tp_ticks,
+                    float(decision.atr),
+                    session.realized_pnl_today,
+                )
+            else:
+                logger.error(
+                    "CYCLE %s TAKE_PROFIT_SCALE_OUT_FAILED — size may still be %s",
+                    session.cycle,
+                    net_size,
+                )
             session.last_action = decision.action.value
             return
-        if ok:
-            _credit_realized_pnl(session, pnl)
-            session.trades_today += 1
-            remain = session.broker.net_exposure()[1]
-            logger.info(
-                "CYCLE %s TAKE_PROFIT_SCALE_OUT closed %s x%s leave=%s pnl≈%.2f "
-                "target=%st realized_today=%.2f",
-                session.cycle,
-                net_dir,
-                close_qty,
-                remain,
-                pnl,
-                DEFAULT_TARGET_TICKS,
-                session.realized_pnl_today,
-            )
-        else:
-            logger.error(
-                "CYCLE %s TAKE_PROFIT_SCALE_OUT_FAILED — size may still be %s",
-                session.cycle,
-                net_size,
-            )
-        session.last_action = decision.action.value
-        return
 
     # Wisdom stand-aside / chop → close open risk (do not orphan positions)
     if decision.action == SignalAction.FLAT:
@@ -657,6 +884,43 @@ async def run_cycle(
             session.cycle,
         )
         session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
+        return
+
+    # After anchor rebase, scores sit near 50 — wait before new entries (Temperance).
+    if cooldown_blocks_entry:
+        logger.info(
+            "CYCLE %s entry_cooldown — stand aside new entries after rebase (remaining=%s)",
+            session.cycle,
+            session.entry_cooldown_cycles,
+        )
+        session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
+        return
+
+    # Require N consecutive raw entry-band cycles before firing (Temperance).
+    need_streak = max(1, int(VIRTUE_REQUIRED_STREAK))
+    side = decision.action.value
+    if side == "LONG":
+        if session.long_streak < need_streak:
+            logger.info(
+                "CYCLE %s entry_streak LONG %s/%s — wait for confirmation",
+                session.cycle,
+                session.long_streak,
+                need_streak,
+            )
+            session.last_action = "FLAT"
+            return
+    elif side == "SHORT":
+        if session.short_streak < need_streak:
+            logger.info(
+                "CYCLE %s entry_streak SHORT %s/%s — wait for confirmation",
+                session.cycle,
+                session.short_streak,
+                need_streak,
+            )
+            session.last_action = "FLAT"
+            return
+    else:
+        session.last_action = "FLAT"
         return
 
     # Mandatory exclusivity check before emitting new LONG/SHORT payload
@@ -779,19 +1043,35 @@ async def run_loop(
     ignore_hours: bool,
 ) -> None:
     session = VirtueSession()
-    # Compounded book equity persists across restarts/days — never snap to handshake every boot.
+    # Compounded book equity + open paper positions persist across restarts.
     book = load_persisted_book_equity(STARTING_NAV)
     session.broker.update_equity(book)
     session.risk.update_nav(book)
     session.risk.peak_nav = max(float(session.risk.peak_nav), book)
+    restored = load_persisted_open_positions()
+    if restored:
+        session.broker.open_positions = list(restored)
+        logger.info(
+            "BOOT restored_paper_positions n=%s exposure=%s",
+            len(restored),
+            session.broker.net_exposure(),
+        )
     logger.info(
-        "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s target_ticks=%s "
-        "scale_out_leave=%s network_timeout=%.1fs",
+        "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s tp_floor=%st "
+        "tp_atr_mult=%.2f scale_out_leave=%s long_enter=%.1f short_enter=%.1f "
+        "long_exit=%.1f short_exit=%.1f streak=%s anchor_div_atr=%.1f network_timeout=%.1fs",
         session.broker.equity,
         EXECUTION_SYMBOL,
         DEFAULT_STOP_TICKS,
-        DEFAULT_TARGET_TICKS,
+        int(VIRTUE_TP_MIN_TICKS),
+        float(VIRTUE_TP_ATR_MULT),
         SCALE_OUT_LEAVE_CONTRACTS,
+        float(VIRTUE_SCORE_LONG_ENTER),
+        float(VIRTUE_SCORE_SHORT_ENTER),
+        float(VIRTUE_SCORE_LONG_EXIT),
+        float(VIRTUE_SCORE_SHORT_EXIT),
+        int(VIRTUE_REQUIRED_STREAK),
+        float(VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT),
         NETWORK_TIMEOUT_S,
     )
 
@@ -823,36 +1103,70 @@ async def run_loop(
     except Exception as exc:
         logger.exception("boot_seed_failed err=%s", exc)
 
-    n = 0
-    _publish_ui(session)
-    while True:
-        try:
-            await run_cycle(session, ignore_hours=ignore_hours)
-        except Exception as exc:
-            logger.exception("cycle_unhandled err=%s — infinite outage survival", exc)
-            try:
-                await _survive_outage(session, "cycle_exception")
-            except Exception:
-                logger.exception("reconnect_after_cycle_exception_failed — will retry next loop")
-        finally:
-            _publish_ui(session)
+    session.is_running = True
+    await asyncio.to_thread(_publish_ui, session)
+    tick_queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+    poll_s = max(0.5, float(interval_s if interval_s is not None else VIRTUE_TICK_POLL_S))
+    logger.info(
+        "EVENT_ENGINE start listener+processor+state_writer poll_s=%.1fs "
+        "state=data/system_state.json persist_every=%.1fs",
+        poll_s,
+        float(VIRTUE_STATE_PERSIST_INTERVAL_S),
+    )
 
-        n += 1
-        if once or (cycles is not None and n >= cycles):
-            break
+    listener = asyncio.create_task(
+        market_tick_listener(session, tick_queue, poll_s=poll_s),
+        name="virtue_market_listener",
+    )
+    processor = asyncio.create_task(
+        engine_event_loop(
+            session,
+            tick_queue,
+            cycles=cycles,
+            once=once,
+            ignore_hours=ignore_hours,
+        ),
+        name="virtue_engine_processor",
+    )
+    saver = asyncio.create_task(
+        save_state_throttled(session),
+        name="virtue_state_writer",
+    )
+
+    n = 0
+    try:
+        # Verified run.py architecture: market events ∥ state writer (Justice off hot path).
+        results = await asyncio.gather(listener, processor, saver, return_exceptions=True)
+        for label, result in zip(("listener", "processor", "saver"), results):
+            if isinstance(result, Exception):
+                logger.error("EVENT_ENGINE %s failed: %s", label, result)
+        if isinstance(results[1], int):
+            n = int(results[1])
+        elif not isinstance(results[1], Exception):
+            n = int(session.cycle)
+    finally:
+        session.is_running = False
+        for task in (listener, processor, saver):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(listener, processor, saver, return_exceptions=True)
         try:
-            await asyncio.sleep(max(1.0, float(interval_s)))
+            await asyncio.to_thread(_publish_ui, session)
         except Exception as exc:
-            logger.exception("loop_sleep_failed err=%s", exc)
+            logger.error("Justice Layer final write failure (system_state.json): %s", exc)
 
     logger.info("VIRTUE LOOP done cycles=%s last_action=%s", n, session.last_action)
-    _publish_ui(session)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FutureMathics virtue main loop (native Wisdom brain)")
     parser.add_argument("--cycles", type=int, default=None, help="Stop after N cycles")
-    parser.add_argument("--interval", type=float, default=30.0, help="Seconds between cycles")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=float(VIRTUE_TICK_POLL_S),
+        help=f"Market tick poll cadence in seconds (default {VIRTUE_TICK_POLL_S}; event-driven engine)",
+    )
     parser.add_argument("--once", action="store_true", help="Single cycle then exit")
     parser.add_argument(
         "--ignore-hours",
