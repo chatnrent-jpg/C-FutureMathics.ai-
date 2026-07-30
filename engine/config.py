@@ -73,29 +73,30 @@ def webull_credentials_configured() -> bool:
     return bool(webull_app_key() and webull_app_secret())
 
 
-# Capital baseline
-STARTING_NAV = 100_000.0
-HANDSHAKE_EQUITY_BASE = 100_000.0
+# Capital baseline — $10k real-market paper test (Temperance: 1 MES)
+STARTING_NAV = 10_000.0
+HANDSHAKE_EQUITY_BASE = 10_000.0
 
 MAX_DAILY_LOSS_PCT = 0.02
-HARD_DAILY_STOP = 2_000.0
-FIXED_FRACTIONAL_RISK_PCT = 0.005
+HARD_DAILY_STOP = 200.0  # 2% of $10k
+# 0.75% of $10k = $75 → exactly 1 MES @ 60-tick stop ($75)
+FIXED_FRACTIONAL_RISK_PCT = 0.0075
 MAX_CONCURRENT_RISK_PCT = 0.05
-PER_TRADE_RISK_MIN = 400.0
-PER_TRADE_RISK_MAX = 600.0
+PER_TRADE_RISK_MIN = 60.0
+PER_TRADE_RISK_MAX = 90.0
 
-# Paper forward-test — cap contract count (1% of $100k / $10 stop = 100 MES is not realistic)
+# Paper forward-test — $10k / 1 MES
 FORWARD_TEST_MAX_CONCURRENT_RISK_PCT = 0.05
-FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.005
+FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.0075
 FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
-PAPER_MAX_MES_CONTRACTS = 3
+PAPER_MAX_MES_CONTRACTS = 1
 PAPER_MAX_OPEN_MES_POSITIONS = 1
 
-# Live — $1k affordable loss cap (when FORWARD_TEST_MODE=false)
-LIVE_RISK_NAV_CAP = 1_000.0
-LIVE_MAX_DAILY_LOSS = 1_000.0
-LIVE_MAX_CONCURRENT_RISK_PCT = 0.50
-LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.05
+# Live — aligned to $10k test book when FORWARD_TEST_MODE=false
+LIVE_RISK_NAV_CAP = 10_000.0
+LIVE_MAX_DAILY_LOSS = 200.0
+LIVE_MAX_CONCURRENT_RISK_PCT = 0.05
+LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.0075
 
 DRAWDOWN_BRAKE_PCT = 0.10
 CAPITAL_DRAG_MULTIPLIER = 0.5
@@ -109,7 +110,8 @@ MAX_ALLOWED_SPREAD_TICKS = 2  # max bid/ask spread in ticks for entry
 # Strategy defaults
 DEFAULT_STOP_TICKS = 60  # 60 ticks = 15 points = $75/contract risk (SWING)
 DEFAULT_TARGET_TICKS = 120  # 120 ticks = 30 points = $150/contract profit (2:1 R:R SWING)
-# Virtue scale-out: at target, bank most size and leave a runner (e.g. 3→close 2, leave 1)
+# Virtue scale-out: at target, bank most size and leave a runner (e.g. 3→close 2, leave 1).
+# On $10k / 1 MES, leave=1 means no partial scale-out (full exit via stop/flat/flip/TP path).
 SCALE_OUT_LEAVE_CONTRACTS = 1
 VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (legacy, not used in swing)
 MIN_CONFIDENCE_THRESHOLD = 0.65  # Only take signals with 65%+ confidence (SWING quality)
@@ -120,7 +122,7 @@ SWING_MODE = True  # Toggle between swing (True) and scalp (False) strategies
 SWING_MIN_TREND_STRENGTH = 0.60  # Minimum trend strength for entry (0-1.0)
 SWING_MAX_TRADES_PER_DAY = 5  # Maximum 5 swing trades per day
 SWING_TRAILING_STOP_TICKS = 30  # Trail by 30 ticks after 50% to target
-SWING_CONTRACTS = 1  # Start with 1 contract (change to 2 after validation)
+SWING_CONTRACTS = 1  # $10k test: 1 contract only
 
 # ---------------------------------------------------------------------------
 # VolumeWatch grade-path MES strategy (PRIMARY for directional futures)
@@ -136,13 +138,13 @@ GRADE_PATH_EPSILON = 0.35
 GRADE_SCORE_SOURCE = "overall"  # "overall" | "1m"
 GRADE_STALE_SECONDS = 300.0
 GRADE_ALLOW_STALE = False
-GRADE_CONTRACTS = 2  # size toward $1k/day target once validated (start 1 if preferred)
+GRADE_CONTRACTS = 1  # $10k test: 1 MES
 # Protective only — grade owns the real exit (≥85). Wide so MES turbulence does not stop out rising-path longs.
-# 200 ticks = 50 pts = $250/contract = $500 for 2 contracts.
+# 200 ticks = 50 pts = $250/contract.
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
-GRADE_DAILY_PROFIT_LOCK = 1_000.0  # halt new entries after +$1000 day
-GRADE_DAILY_LOSS_HALT = 500.0  # matches one full hard-stop on 2 contracts
+GRADE_DAILY_PROFIT_LOCK = 250.0  # ~2.5% of $10k — halt new entries after strong day
+GRADE_DAILY_LOSS_HALT = 200.0  # 2% of $10k
 
 FORWARD_TEST_MODE = True
 FORWARD_TEST_CYCLE_INTERVAL_S = 900.0  # 15 minutes for swing (was 2.0 for scalping)

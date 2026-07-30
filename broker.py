@@ -41,7 +41,7 @@ from engine.webull_openapi import webull_is_sandbox
 
 logger = logging.getLogger(__name__)
 
-RISK_LIMIT_PCT = FIXED_FRACTIONAL_RISK_PCT  # 0.5%
+RISK_LIMIT_PCT = FIXED_FRACTIONAL_RISK_PCT  # 0.75% on $10k book
 NETWORK_TIMEOUT_S = WEBULL_NETWORK_TIMEOUT_S  # 5.0 — Justice hard cap
 RECONNECT_BACKOFF_MIN_S = 30.0
 RECONNECT_BACKOFF_MAX_S = 60.0
@@ -228,7 +228,7 @@ class VirtueBroker:
     api: ApiClient = field(default_factory=ApiClient)
     trade: TradeClient | None = None
     data: AlpacaSPYFeed = field(default_factory=AlpacaSPYFeed)
-    equity: float = 100_000.0
+    equity: float = 10_000.0
     realized_pnl: float = 0.0
     triage: TriageState = TriageState.READY
     max_price_age_s: float = 5.0

@@ -133,11 +133,14 @@ def test_vwap_twap_agreement_required() -> None:
 
 
 
-def test_size_respects_half_percent() -> None:
-    equity = 100_000.0
+def test_size_respects_fixed_fractional() -> None:
+    from engine.config import STARTING_NAV
+
+    equity = float(STARTING_NAV)
     stop_ticks = 60
     sized = calculate_max_contracts(equity=equity, stop_ticks=stop_ticks, hard_cap=1000)
     assert not sized.rejected
+    assert sized.contracts == 1  # $10k / 0.75% → exactly 1 MES
     assert sized.risk_pct <= FIXED_FRACTIONAL_RISK_PCT + 1e-12
     # Over-size must reject
     too_many = sized.contracts + 50
@@ -174,9 +177,12 @@ def test_validate_order_symbol_size_stale() -> None:
 
 
 def test_risk_math_consistency() -> None:
-    # 0.5% of 100k = $500; 60 ticks * $1.25 = $75/contract → floor(500/75)=6
-    sized = calculate_max_contracts(equity=100_000.0, stop_ticks=60, hard_cap=100)
-    assert sized.contracts == int((100_000.0 * 0.005) // (60 * TICK_VALUE))
+    from engine.config import STARTING_NAV
+
+    # 0.75% of $10k = $75; 60 ticks * $1.25 = $75/contract → 1 MES
+    sized = calculate_max_contracts(equity=float(STARTING_NAV), stop_ticks=60, hard_cap=100)
+    assert sized.contracts == int((float(STARTING_NAV) * FIXED_FRACTIONAL_RISK_PCT) // (60 * TICK_VALUE))
+    assert sized.contracts == 1
 
 
 def test_position_exclusivity_helpers() -> None:
@@ -211,7 +217,7 @@ def test_forward_test_paper_nav_allows_sizing() -> None:
 
     sized = calculate_max_contracts(equity=STARTING_NAV, stop_ticks=60)
     assert not sized.rejected
-    assert sized.contracts >= 1
+    assert sized.contracts == 1
 
 
 def test_stop_hit_and_flat_exit_helpers() -> None:
@@ -256,16 +262,17 @@ def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
+    from engine.config import STARTING_NAV
     from main import VirtueSession, _credit_realized_pnl, et_session_date, roll_daily_counters_if_needed
 
     et = ZoneInfo("America/New_York")
     session = VirtueSession()
-    session.broker.update_equity(100_000.0)
-    session.risk.update_nav(100_000.0)
-    _credit_realized_pnl(session, 1572.10)
-    assert session.realized_pnl_today == 1572.10
-    assert session.broker.equity == 101_572.10
-    session.trades_today = 11
+    session.broker.update_equity(float(STARTING_NAV))
+    session.risk.update_nav(float(STARTING_NAV))
+    _credit_realized_pnl(session, 250.0)
+    assert session.realized_pnl_today == 250.0
+    assert session.broker.equity == float(STARTING_NAV) + 250.0
+    session.trades_today = 3
     session.session_date_et = "2026-07-29"
 
     rolled = roll_daily_counters_if_needed(
@@ -276,7 +283,7 @@ def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     assert session.realized_pnl_today == 0.0
     assert session.trades_today == 0
     # Book NAV compounds — day roll must not wipe account equity
-    assert session.broker.equity == 101_572.10
+    assert session.broker.equity == float(STARTING_NAV) + 250.0
     assert et_session_date(datetime(2026, 7, 30, 10, 0, tzinfo=et)) == "2026-07-30"
     # Same day: no second reset
     _credit_realized_pnl(session, 50.0)
@@ -286,7 +293,7 @@ def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     ) is False
     assert session.realized_pnl_today == 50.0
     assert session.trades_today == 1
-    assert session.broker.equity == 101_622.10
+    assert session.broker.equity == float(STARTING_NAV) + 300.0
 
 
 if __name__ == "__main__":
@@ -299,7 +306,7 @@ if __name__ == "__main__":
     test_rebase_anchors_aligns_scores_to_live()
     test_hysteresis_avoids_50_whipsaw()
     test_vwap_twap_agreement_required()
-    test_size_respects_half_percent()
+    test_size_respects_fixed_fractional()
     test_validate_order_symbol_size_stale()
     test_risk_math_consistency()
     test_position_exclusivity_helpers()
