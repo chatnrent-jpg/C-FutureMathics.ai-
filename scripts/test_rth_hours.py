@@ -36,5 +36,24 @@ def test_rth_hours() -> None:
     print("ALL RTH HOURS TESTS PASSED")
 
 
+def test_entry_cutoff() -> None:
+    from scripts.run_daily_session import virtue_entries_allowed
+
+    tz = ZoneInfo("America/New_York")
+    cases = [
+        ("Monday open", datetime(2026, 7, 27, 9, 30, tzinfo=tz), True),
+        ("Monday 15:44", datetime(2026, 7, 27, 15, 44, tzinfo=tz), True),
+        ("Monday 15:45 cutoff", datetime(2026, 7, 27, 15, 45, tzinfo=tz), False),
+        ("Monday 15:59", datetime(2026, 7, 27, 15, 59, tzinfo=tz), False),
+        ("Monday 16:00 closed", datetime(2026, 7, 27, 16, 0, tzinfo=tz), False),
+        ("Saturday", datetime(2026, 7, 25, 12, 0, tzinfo=tz), False),
+    ]
+    for desc, dt, expected in cases:
+        got = virtue_entries_allowed(dt)
+        assert got == expected, f"{desc}: expected {expected} got {got} @ {dt}"
+    print("ALL ENTRY CUTOFF TESTS PASSED")
+
+
 if __name__ == "__main__":
     test_rth_hours()
+    test_entry_cutoff()

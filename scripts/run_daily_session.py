@@ -24,6 +24,8 @@ from engine.config import (
     FORWARD_TEST_MARKET_OPEN_MINUTE,
     FORWARD_TEST_TIMEZONE,
     HANDSHAKE_EQUITY_BASE,
+    VIRTUE_NO_NEW_ENTRY_HOUR,
+    VIRTUE_NO_NEW_ENTRY_MINUTE,
     VIRTUE_RTH_CLOSE_HOUR,
     VIRTUE_RTH_CLOSE_MINUTE,
     VIRTUE_RTH_ONLY,
@@ -89,6 +91,18 @@ def virtue_session_open(now: datetime | None = None) -> bool:
     if VIRTUE_RTH_ONLY:
         return in_rth_hours(now)
     return in_market_hours(now)
+
+
+def virtue_entries_allowed(now: datetime | None = None) -> bool:
+    """
+    True when new LONG/SHORT entries are allowed.
+    Last 15 minutes of RTH are manage/exit only (no overnight gap from late entries).
+    """
+    if not virtue_session_open(now):
+        return False
+    dt = (now or datetime.now(TZ)).astimezone(TZ)
+    cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
+    return dt.time() < cutoff
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
     ensure_boot_system_state()

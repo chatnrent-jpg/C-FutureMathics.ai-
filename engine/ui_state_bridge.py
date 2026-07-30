@@ -189,12 +189,12 @@ def build_virtue_system_state(
 
     unrealized = _unrealized_pnl(positions, last_price)
     daily_pnl = float(getattr(session, "realized_pnl_today", 0.0) or 0.0)
-    # Paper equity is frozen at STARTING_NAV; show current balance = start + realized + open P&L.
-    # Live Webull equity is already broker mark-to-market when remote equity > 0.
-    if forward_test_force_paper() or broker_equity <= 0:
-        nav = round(starting + daily_pnl + unrealized, 2)
+    # Paper + live: book equity compounds across days; day PnL is a separate Temperance bucket.
+    # Do NOT recompute NAV as starting + daily_pnl (that resets account_nav every day roll).
+    if broker_equity > 0:
+        nav = round(broker_equity + unrealized, 2)
     else:
-        nav = round(broker_equity, 2)
+        nav = round(starting + daily_pnl + unrealized, 2)
     open_risk = float(abs(net_size) * DEFAULT_STOP_TICKS * TICK_VALUE)
     max_conc = concurrent_risk_cap(risk_nav)
     hard_stop = max_daily_loss_cap(risk_nav)
@@ -210,6 +210,7 @@ def build_virtue_system_state(
         "last_price": last_price,
         "unrealized_pnl": unrealized,
         "account_nav": nav,
+        "book_equity": round(broker_equity, 2) if broker_equity > 0 else round(starting, 2),
         "session": {
             "realized_pnl_today": daily_pnl,
             "open_risk_notional": open_risk,
@@ -280,3 +281,40 @@ def persist_virtue_system_state(session: Any, **kwargs: Any) -> None:
         state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as exc:
         log.exception("persist_virtue_system_state_failed err=%s", exc)
+
+
+def load_persisted_book_equity(default: float | None = None) -> float:
+    """
+    Load compounded paper/live book equity from system_state.json.
+    Falls back to account_nav − unrealized, then STARTING_NAV.
+    """
+    from pathlib import Path
+    import json
+    import logging
+
+    log = logging.getLogger("virtue.ui_state")
+    base = float(default if default is not None else STARTING_NAV)
+    state_path = Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    try:
+        if not state_path.is_file():
+            return base
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        book = float(raw.get("book_equity") or 0.0)
+        if book > 0:
+            return round(book, 2)
+        nav = float(raw.get("account_nav") or 0.0)
+        unreal = float(raw.get("unrealized_pnl") or 0.0)
+        if nav > 0:
+            return round(max(base, nav - unreal), 2)
+    except Exception as exc:
+        log.exception("load_persisted_book_equity_failed err=%s", exc)
+    return base
+
+
+__all__ = [
+    "build_system_state",
+    "build_virtue_system_state",
+    "ensure_boot_system_state",
+    "load_persisted_book_equity",
+    "persist_virtue_system_state",
+]

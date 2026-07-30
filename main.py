@@ -27,7 +27,9 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -38,17 +40,22 @@ from engine.config import (
     DEFAULT_STOP_TICKS,
     DEFAULT_TARGET_TICKS,
     EXECUTION_SYMBOL,
+    FORWARD_TEST_TIMEZONE,
     GRADE_DAILY_PROFIT_LOCK,
     SCALE_OUT_LEAVE_CONTRACTS,
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
+    VIRTUE_RTH_FLATTEN_RETRY_S,
     forward_test_force_paper,
 )
+
+_ET = ZoneInfo(FORWARD_TEST_TIMEZONE)
 from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 from manus.heartbeat import BrokerHeartbeatAgent, HeartbeatState
-from engine.ui_state_bridge import persist_virtue_system_state
-from scripts.run_daily_session import virtue_session_open
+from engine.ui_state_bridge import load_persisted_book_equity, persist_virtue_system_state
+from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
 from strategy import Bar, SignalAction, WisdomStrategy
 
 logging.basicConfig(
@@ -65,6 +72,7 @@ class VirtueSession:
     last_action: str = "FLAT"
     realized_pnl_today: float = 0.0
     trades_today: int = 0
+    session_date_et: str = ""  # YYYY-MM-DD America/New_York — Temperance day bucket
     last_risk_verdict: str = ""
     last_risk_reason: str = ""
     last_regime: str = ""
@@ -85,6 +93,55 @@ class VirtueSession:
             peak_nav=STARTING_NAV,
         )
     )
+
+
+def et_session_date(now: datetime | None = None) -> str:
+    """Calendar trading day in ET for daily profit-lock / trade counters."""
+    dt = now or datetime.now(_ET)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_ET)
+    else:
+        dt = dt.astimezone(_ET)
+    return dt.strftime("%Y-%m-%d")
+
+
+def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | None = None) -> bool:
+    """
+    Reset Temperance day counters when the ET calendar date changes.
+
+    Justice: yesterday's realized PnL must never lock today's entries.
+    Temperance: book equity / account NAV must NOT reset — only the day bucket clears.
+    """
+    today = et_session_date(now)
+    if session.session_date_et == today:
+        return False
+    prior_date = session.session_date_et or "(boot)"
+    prior_pnl = float(session.realized_pnl_today)
+    prior_trades = int(session.trades_today)
+    session.session_date_et = today
+    session.realized_pnl_today = 0.0
+    session.trades_today = 0
+    logger.info(
+        "SESSION_DAY_ROLL et_date=%s prior_date=%s prior_realized=%.2f prior_trades=%s "
+        "book_equity=%.2f — day counters reset; NAV compounds (not reset)",
+        today,
+        prior_date,
+        prior_pnl,
+        prior_trades,
+        float(session.broker.equity),
+    )
+    return True
+
+
+def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
+    """Bank realized PnL into the day bucket AND compounded book equity."""
+    delta = float(pnl or 0.0)
+    session.realized_pnl_today = round(session.realized_pnl_today + delta, 2)
+    if abs(delta) < 1e-12:
+        return
+    session.broker.update_equity(round(float(session.broker.equity) + delta, 2))
+    session.risk.update_nav(session.broker.equity)
+
 
 
 def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> None:
@@ -160,11 +217,13 @@ async def _survive_outage(session: VirtueSession, reason: str) -> bool:
         return False
     if ok:
         session.risk.update_nav(session.broker.equity)
-        session.realized_pnl_today = float(session.broker.realized_pnl or session.realized_pnl_today)
+        # Do NOT copy broker.realized_pnl into realized_pnl_today — it can be
+        # process-lifetime paper PnL and would falsely trip daily_profit_lock.
+        roll_daily_counters_if_needed(session)
         logger.info(
-            "OUTAGE_RECOVERED equity=%.2f realized_pnl=%.2f positions=%s",
+            "OUTAGE_RECOVERED equity=%.2f realized_pnl_today=%.2f positions=%s",
             session.broker.equity,
-            session.broker.realized_pnl,
+            session.realized_pnl_today,
             len(session.broker.open_positions),
         )
     return ok
@@ -175,6 +234,123 @@ def _open_risk_notional(session: VirtueSession, stop_ticks: int) -> float:
     return float(abs(size) * stop_ticks * TICK_VALUE)
 
 
+async def _resolve_flatten_price(session: VirtueSession) -> float:
+    price = float(getattr(session.broker, "_last_price", 0.0) or 0.0)
+    if price > 0:
+        return price
+    try:
+        ctx = await session.broker.resolve_market_context_timed()
+        tick = (ctx or {}).get("tick") or {}
+        return float(tick.get("price") or tick.get("last") or 0.0)
+    except Exception as exc:
+        logger.exception("rth_flatten_price_failed err=%s", exc)
+        return 0.0
+
+
+async def _flatten_until_flat(
+    session: VirtueSession,
+    *,
+    stop_ticks: int,
+    reason: str = "rth_close_flatten",
+) -> bool:
+    """
+    Temperance: retry flatten until flat so residual size cannot ride overnight/weekend gaps.
+    Returns True when exposure is flat.
+    """
+    attempts = max(1, int(VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS))
+    retry_s = max(0.5, float(VIRTUE_RTH_FLATTEN_RETRY_S))
+    for attempt in range(1, attempts + 1):
+        net_dir, net_size = session.broker.net_exposure()
+        if net_size <= 0:
+            return True
+        price = await _resolve_flatten_price(session)
+        if price <= 0:
+            logger.error(
+                "CYCLE %s %s attempt=%s/%s no mark price — cannot flatten %s x%s",
+                session.cycle,
+                reason,
+                attempt,
+                attempts,
+                net_dir,
+                net_size,
+            )
+            await asyncio.sleep(retry_s)
+            continue
+        try:
+            ok, pnl = await session.broker.flatten_all(
+                price=price,
+                stop_ticks=stop_ticks,
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.exception(
+                "CYCLE %s %s attempt=%s/%s exception err=%s",
+                session.cycle,
+                reason,
+                attempt,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(retry_s)
+            continue
+        if ok:
+            _credit_realized_pnl(session, pnl)
+            session.trades_today += 1
+            logger.info(
+                "CYCLE %s %s attempt=%s closed %s x%s pnl≈%.2f",
+                session.cycle,
+                reason,
+                attempt,
+                net_dir,
+                net_size,
+                pnl,
+            )
+        else:
+            logger.error(
+                "CYCLE %s %s attempt=%s/%s FAILED — retrying",
+                session.cycle,
+                reason,
+                attempt,
+                attempts,
+            )
+        if session.broker.net_exposure()[1] <= 0:
+            return True
+        await asyncio.sleep(retry_s)
+    _, left = session.broker.net_exposure()
+    if left > 0:
+        logger.error(
+            "CYCLE %s %s EXHAUSTED — exposure may remain overnight size=%s",
+            session.cycle,
+            reason,
+            left,
+        )
+        return False
+    return True
+
+
+async def _rth_gate_or_flatten(
+    session: VirtueSession,
+    *,
+    stop_ticks: int,
+    ignore_hours: bool,
+) -> bool:
+    """
+    Return True if trading cycle may continue.
+    Outside RTH: flatten residual risk and return False (Temperance — no gap).
+    """
+    if ignore_hours or virtue_session_open():
+        return True
+    session.last_regime = "OUTSIDE_RTH"
+    session.last_signal_reason = "rth_only_stand_aside"
+    _, net_size = session.broker.net_exposure()
+    if net_size > 0:
+        await _flatten_until_flat(session, stop_ticks=stop_ticks, reason="rth_close_flatten")
+    else:
+        logger.info("CYCLE %s outside_RTH — stand aside (Alpaca SPY / gap avoidance)", session.cycle)
+    session.last_action = "FLAT"
+    return False
+
+
 async def run_cycle(
     session: VirtueSession,
     *,
@@ -183,58 +359,12 @@ async def run_cycle(
 ) -> None:
     """One virtue cycle: hours → heartbeat → market → regime → exclusivity → Manus → fire."""
     session.cycle += 1
+    # Temperance: new ET calendar day → clear yesterday's PnL/trade counters (Justice).
+    roll_daily_counters_if_needed(session)
 
     # Cash RTH only (Alpaca SPY live): Mon–Fri 9:30–16:00 ET.
     # Outside RTH → flatten any residual risk (Temperance: no overnight/weekend gaps).
-    if not ignore_hours and not virtue_session_open():
-        session.last_regime = "OUTSIDE_RTH"
-        session.last_signal_reason = "rth_only_stand_aside"
-        net_dir, net_size = session.broker.net_exposure()
-        if net_size > 0:
-            price = float(getattr(session.broker, "_last_price", 0.0) or 0.0)
-            if price <= 0:
-                try:
-                    ctx = await session.broker.resolve_market_context_timed()
-                    tick = (ctx or {}).get("tick") or {}
-                    price = float(tick.get("price") or tick.get("last") or 0.0)
-                except Exception as exc:
-                    logger.exception("rth_flatten_price_failed err=%s", exc)
-            if price > 0:
-                try:
-                    ok, pnl = await session.broker.flatten_all(
-                        price=price,
-                        stop_ticks=stop_ticks,
-                        reason="rth_close_flatten",
-                    )
-                except Exception as exc:
-                    logger.exception("rth_flatten_failed err=%s", exc)
-                    session.last_action = "FLAT"
-                    return
-                if ok:
-                    session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
-                    session.trades_today += 1
-                    logger.info(
-                        "CYCLE %s RTH_CLOSE_FLATTEN closed %s x%s pnl≈%.2f — no overnight gap",
-                        session.cycle,
-                        net_dir,
-                        net_size,
-                        pnl,
-                    )
-                else:
-                    logger.error(
-                        "CYCLE %s RTH_CLOSE_FLATTEN_FAILED — exposure may remain overnight",
-                        session.cycle,
-                    )
-            else:
-                logger.error(
-                    "CYCLE %s outside_RTH with %s x%s but no mark price — cannot flatten",
-                    session.cycle,
-                    net_dir,
-                    net_size,
-                )
-        else:
-            logger.info("CYCLE %s outside_RTH — stand aside (Alpaca SPY / gap avoidance)", session.cycle)
-        session.last_action = "FLAT"
+    if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
         return
 
     if session.halted:
@@ -262,12 +392,17 @@ async def run_cycle(
         if not recovered:
             session.last_action = "FLAT"
             return
+        # Outage may have spanned the 16:00 boundary — re-gate before continuing.
+        if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
+            return
 
     if not session.broker.can_send_new_orders():
         logger.warning("CYCLE %s triage=%s — forcing reconcile path", session.cycle, session.broker.triage.value)
         recovered = await _survive_outage(session, "triage_not_ready")
         if not recovered or not session.broker.can_send_new_orders():
             session.last_action = "FLAT"
+            return
+        if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
             return
 
     try:
@@ -297,6 +432,9 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
+    # Re-check RTH after market context (cycle may have started in RTH then crossed close).
+    if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
+        return
     high = float(tick.get("ask") or price)
     low = float(tick.get("bid") or price)
     if high < low:
@@ -378,7 +516,7 @@ async def run_cycle(
             session.last_action = "FLAT"
             return
         if ok:
-            session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
+            _credit_realized_pnl(session, pnl)
             session.trades_today += 1
             logger.info(
                 "CYCLE %s WRONG_SIDE_EXIT pnl≈%.2f — will follow %s same cycle",
@@ -405,7 +543,7 @@ async def run_cycle(
             session.last_action = "FLAT"
             return
         if ok:
-            session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
+            _credit_realized_pnl(session, pnl)
             session.trades_today += 1
             logger.info("CYCLE %s STOP_EXIT pnl≈%.2f realized_today=%.2f", session.cycle, pnl, session.realized_pnl_today)
         else:
@@ -436,7 +574,7 @@ async def run_cycle(
             session.last_action = decision.action.value
             return
         if ok:
-            session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
+            _credit_realized_pnl(session, pnl)
             session.trades_today += 1
             remain = session.broker.net_exposure()[1]
             logger.info(
@@ -474,7 +612,7 @@ async def run_cycle(
                 session.last_action = "FLAT"
                 return
             if ok:
-                session.realized_pnl_today = round(session.realized_pnl_today + pnl, 2)
+                _credit_realized_pnl(session, pnl)
                 session.trades_today += 1
                 logger.info(
                     "CYCLE %s WISDOM_FLAT_EXIT closed %s x%s pnl≈%.2f reason=%s",
@@ -510,6 +648,15 @@ async def run_cycle(
             GRADE_DAILY_PROFIT_LOCK,
         )
         session.last_action = "FLAT"
+        return
+
+    # Temperance: last 15 min of RTH — manage/exit only, no new overnight risk.
+    if not ignore_hours and not virtue_entries_allowed():
+        logger.info(
+            "CYCLE %s no_new_entry_cutoff — manage/exit only (gap avoidance before 16:00 flatten)",
+            session.cycle,
+        )
+        session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
         return
 
     # Mandatory exclusivity check before emitting new LONG/SHORT payload
@@ -632,8 +779,11 @@ async def run_loop(
     ignore_hours: bool,
 ) -> None:
     session = VirtueSession()
-    session.broker.update_equity(STARTING_NAV)
-    session.risk.update_nav(STARTING_NAV)
+    # Compounded book equity persists across restarts/days — never snap to handshake every boot.
+    book = load_persisted_book_equity(STARTING_NAV)
+    session.broker.update_equity(book)
+    session.risk.update_nav(book)
+    session.risk.peak_nav = max(float(session.risk.peak_nav), book)
     logger.info(
         "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s target_ticks=%s "
         "scale_out_leave=%s network_timeout=%.1fs",
@@ -649,8 +799,11 @@ async def run_loop(
     try:
         truth = await session.broker.reconcile_with_broker()
         if truth.ok:
+            # Paper reconcile preserves book equity; live uses Webull mark.
             session.risk.update_nav(session.broker.equity)
-            session.realized_pnl_today = float(session.broker.realized_pnl or 0.0)
+            session.risk.peak_nav = max(float(session.risk.peak_nav), float(session.broker.equity))
+            # Day bucket starts at 0 for this ET date — never import cumulative broker PnL.
+            roll_daily_counters_if_needed(session)
             if session.broker.equity <= 0:
                 logger.error(
                     "BOOT zero_futures_equity — Virtue will stand aside on size until account is funded "

@@ -251,6 +251,44 @@ def test_take_profit_and_scale_out_qty() -> None:
     assert b.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS) == 0
 
 
+def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
+    """Yesterday's realized PnL must not lock today's entries (Justice + Temperance)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from main import VirtueSession, _credit_realized_pnl, et_session_date, roll_daily_counters_if_needed
+
+    et = ZoneInfo("America/New_York")
+    session = VirtueSession()
+    session.broker.update_equity(100_000.0)
+    session.risk.update_nav(100_000.0)
+    _credit_realized_pnl(session, 1572.10)
+    assert session.realized_pnl_today == 1572.10
+    assert session.broker.equity == 101_572.10
+    session.trades_today = 11
+    session.session_date_et = "2026-07-29"
+
+    rolled = roll_daily_counters_if_needed(
+        session, now=datetime(2026, 7, 30, 9, 35, tzinfo=et)
+    )
+    assert rolled is True
+    assert session.session_date_et == "2026-07-30"
+    assert session.realized_pnl_today == 0.0
+    assert session.trades_today == 0
+    # Book NAV compounds — day roll must not wipe account equity
+    assert session.broker.equity == 101_572.10
+    assert et_session_date(datetime(2026, 7, 30, 10, 0, tzinfo=et)) == "2026-07-30"
+    # Same day: no second reset
+    _credit_realized_pnl(session, 50.0)
+    session.trades_today = 1
+    assert roll_daily_counters_if_needed(
+        session, now=datetime(2026, 7, 30, 15, 0, tzinfo=et)
+    ) is False
+    assert session.realized_pnl_today == 50.0
+    assert session.trades_today == 1
+    assert session.broker.equity == 101_622.10
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -270,4 +308,5 @@ if __name__ == "__main__":
     test_forward_test_paper_nav_allows_sizing()
     test_stop_hit_and_flat_exit_helpers()
     test_take_profit_and_scale_out_qty()
+    test_session_day_roll_clears_yesterdays_profit_lock()
     print("ALL VIRTUE BRAIN TESTS PASSED")

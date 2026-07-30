@@ -167,6 +167,12 @@ VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
 VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET
 VIRTUE_RTH_CLOSE_MINUTE = 0
+# No new entries in the last 15 minutes of RTH (manage/exit only — gap avoidance).
+VIRTUE_NO_NEW_ENTRY_HOUR = 15
+VIRTUE_NO_NEW_ENTRY_MINUTE = 45
+# Outside RTH: retry flatten until flat (or attempts exhausted).
+VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
+VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
 # Hysteresis around 50% so we don't flip LONG↔SHORT on every tiny cross (Temperance)
 VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP must clear this to go/stay LONG from flat/short
 VIRTUE_SCORE_SHORT_ENTER = 45.0  # both must be under this to go/stay SHORT from flat/long

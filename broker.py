@@ -541,7 +541,9 @@ class VirtueBroker:
         if remote_equity > 0:
             self.equity = remote_equity
         elif forward_test_force_paper() and not webull_is_sandbox():
-            self.equity = float(STARTING_NAV)
+            # Preserve compounded paper book equity across reconcile — never snap back to STARTING_NAV.
+            if self.equity <= 0:
+                self.equity = float(STARTING_NAV)
             equity_source = "forward_test_paper_nav"
             logger.warning(
                 "reconcile_forward_test_paper_nav equity=%.2f (webull_live_futures=0.00) "
