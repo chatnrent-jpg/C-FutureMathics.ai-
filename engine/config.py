@@ -190,9 +190,9 @@ VIRTUE_SCORE_SHORT_ENTER = 45.0  # both VWAP+TWAP <= this to ENTER short from fl
 VIRTUE_SCORE_LONG_EXIT = 40.0    # while LONG, exit only when both <= this
 VIRTUE_SCORE_SHORT_EXIT = 60.0   # while SHORT, exit only when both >= this
 VIRTUE_REQUIRED_STREAK = 2       # need 2 clear cycles — blocks random short↔long whip-saws
-# If scores are already this extended, the move is late — stand aside for NEW entries only.
-VIRTUE_SCORE_LONG_CHASE_MAX = 72.0
-VIRTUE_SCORE_SHORT_CHASE_MIN = 28.0
+# Chase: block only extreme late entries. 72 was freezing re-entry after $100 TP in bulls.
+VIRTUE_SCORE_LONG_CHASE_MAX = 90.0
+VIRTUE_SCORE_SHORT_CHASE_MIN = 10.0
 # Score scale: ±score_price_pct of price maps to 0–100 (smaller → more sensitive to extensions)
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
@@ -202,9 +202,10 @@ VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
 VIRTUE_POSITION_TP_DOLLARS = 100.0
 # Cut losers at ~$75 on the whole position (full flatten) — ~1.33:1 vs $100 TP.
 VIRTUE_POSITION_STOP_DOLLARS = 75.0
-# After TP or stop flatten: sit out ~8 engine cycles, then wait for strong signal (streak/bands).
-VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = 8
-VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES = VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES
+# After $100 TP: short pause then rejoin if signal still valid (Courage — don't miss the next leg).
+VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = 3
+# After a stop: longer cool-down before the next attempt (Temperance).
+VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES = 8
 # Legacy ATR TP helpers (Virtue exits use VIRTUE_POSITION_TP_DOLLARS; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS

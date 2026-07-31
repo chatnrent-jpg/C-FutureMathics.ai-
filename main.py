@@ -885,8 +885,16 @@ async def run_cycle(
                 int(session.entry_cooldown_cycles),
                 int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES),
             )
-            session.long_streak = 0
-            session.short_streak = 0
+            # Seed one streak in the banked direction so re-entry only needs one more confirm.
+            if net_dir == "LONG":
+                session.long_streak = 1
+                session.short_streak = 0
+            elif net_dir == "SHORT":
+                session.short_streak = 1
+                session.long_streak = 0
+            else:
+                session.long_streak = 0
+                session.short_streak = 0
             logger.info(
                 "CYCLE %s TAKE_PROFIT_FULL closed %s x%s pnl≈%.2f target=$%.0f "
                 "cooldown=%s realized_today=%.2f",

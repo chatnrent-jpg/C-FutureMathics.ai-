@@ -479,8 +479,8 @@ def test_session_uses_timely_entry_band() -> None:
     assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 40.0
     assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 60.0
     assert int(VIRTUE_REQUIRED_STREAK) == 2
-    assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 72.0
-    assert float(VIRTUE_SCORE_SHORT_CHASE_MIN) == 28.0
+    assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 90.0
+    assert float(VIRTUE_SCORE_SHORT_CHASE_MIN) == 10.0
     assert int(VIRTUE_NO_NEW_ENTRY_HOUR) == 15
     assert int(VIRTUE_NO_NEW_ENTRY_MINUTE) == 0
 
@@ -595,8 +595,8 @@ def test_profit_lock_stands_aside_at_500() -> None:
     assert int(PROFIT_LOCK_MAX_CONTRACTS) == 0
     assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
     assert float(VIRTUE_POSITION_STOP_DOLLARS) == 75.0
-    assert int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES) >= 6
-    assert int(VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES) == int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES)
+    assert int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES) == 3
+    assert int(VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES) == 8
     assert (500.0 >= float(GRADE_DAILY_PROFIT_LOCK)) is True
     assert (499.0 >= float(GRADE_DAILY_PROFIT_LOCK)) is False
     assert STARTING_NAV >= 15_000.0
