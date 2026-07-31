@@ -200,8 +200,11 @@ VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
 # Bank ~$100 per open position (full flatten), then cool down for the next clean signal.
 # Fixes “up $300 → back to $19 with nothing taken” (Temperance).
 VIRTUE_POSITION_TP_DOLLARS = 100.0
-# After a take-profit flatten: sit out ~8 engine cycles (~1–2 min) before next entry.
+# Cut losers at ~$75 on the whole position (full flatten) — ~1.33:1 vs $100 TP.
+VIRTUE_POSITION_STOP_DOLLARS = 75.0
+# After TP or stop flatten: sit out ~8 engine cycles, then wait for strong signal (streak/bands).
 VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = 8
+VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES = VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES
 # Legacy ATR TP helpers (Virtue exits use VIRTUE_POSITION_TP_DOLLARS; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS

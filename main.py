@@ -49,8 +49,10 @@ from engine.config import (
     VIRTUE_FORCE_EVENT_MAX_S,
     VIRTUE_HEARTBEAT_EVERY_N_CYCLES,
     VIRTUE_MIN_PRICE_MOVE_TICKS,
+    VIRTUE_POSITION_STOP_DOLLARS,
     VIRTUE_POSITION_TP_DOLLARS,
     VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES,
+    VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES,
     VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES,
     VIRTUE_REQUIRED_STREAK,
     VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
@@ -152,6 +154,15 @@ def position_tp_ticks(contracts: int) -> int:
     if tv <= 0:
         return 1
     return max(1, int(math.ceil(float(VIRTUE_POSITION_TP_DOLLARS) / (tv * n))))
+
+
+def position_stop_ticks(contracts: int) -> int:
+    """Ticks of adverse move so position PnL ≈ -VIRTUE_POSITION_STOP_DOLLARS."""
+    n = max(1, int(contracts))
+    tv = float(TICK_VALUE)
+    if tv <= 0:
+        return 1
+    return max(1, int(math.ceil(float(VIRTUE_POSITION_STOP_DOLLARS) / (tv * n))))
 
 
 def et_session_date(now: datetime | None = None) -> str:
@@ -485,8 +496,12 @@ async def _survive_outage(session: VirtueSession, reason: str) -> bool:
 
 
 def _open_risk_notional(session: VirtueSession, stop_ticks: int) -> float:
+    """Open risk at the dollar stop (Temperance — matches live exit, not legacy tick stop)."""
+    del stop_ticks  # legacy signature; dollar stop owns live risk
     _, size = session.broker.net_exposure()
-    return float(abs(size) * stop_ticks * TICK_VALUE)
+    if size <= 0:
+        return 0.0
+    return float(VIRTUE_POSITION_STOP_DOLLARS)
 
 
 async def _resolve_flatten_price(session: VirtueSession) -> float:
@@ -763,7 +778,9 @@ async def run_cycle(
     session.last_twap_score = float(decision.twap_score)
     session.last_blended_score = float(decision.blended_score)
     _, size_for_tp = session.broker.net_exposure()
-    tp_ticks = position_tp_ticks(size_for_tp if size_for_tp > 0 else 2)
+    size_ref = size_for_tp if size_for_tp > 0 else 2
+    tp_ticks = position_tp_ticks(size_ref)
+    sl_ticks = position_stop_ticks(size_ref)
     open_pnl = session.broker.unrealized_position_pnl(price=price)
 
     # Dual independent streaks from raw entry bands (build while flat OR holding).
@@ -777,7 +794,8 @@ async def run_cycle(
     logger.info(
         "CYCLE %s regime=%s action=%s vwap=%.1f%% twap=%.1f%% blend=%.1f%% "
         "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr=%.2f atr_pct=%.2f "
-        "tp=$%.0f (~%st) open_pnl=%.2f long_streak=%s short_streak=%s reason=%s exposure=%s",
+        "tp=$%.0f (~%st) sl=$%.0f (~%st) open_pnl=%.2f long_streak=%s short_streak=%s "
+        "reason=%s exposure=%s",
         session.cycle,
         decision.regime.value,
         decision.action.value,
@@ -792,6 +810,8 @@ async def run_cycle(
         decision.atr_pct,
         float(VIRTUE_POSITION_TP_DOLLARS),
         tp_ticks,
+        float(VIRTUE_POSITION_STOP_DOLLARS),
+        sl_ticks,
         open_pnl,
         session.long_streak,
         session.short_streak,
@@ -800,16 +820,18 @@ async def run_cycle(
     )
 
     # Exit priority (Temperance + Wisdom structure):
-    # 1) hard stop  2) take-profit  3) opposite-band flatten-to-flat (no same-cycle reverse)
-    # Same-cycle short↔long flips caused unstructured whip-saws and skipped TP.
+    # 1) dollar stop  2) take-profit  3) opposite-band flatten-to-flat (no same-cycle reverse)
 
-    # Hard stop from entry (Temperance) — exit even if regime still trending
-    if session.broker.stop_hit(price=price, stop_ticks=stop_ticks):
+    # Dollar stop (Temperance) — cut ~$75 on the whole position, then cool down.
+    if session.broker.stop_dollars_hit(
+        price=price, stop_dollars=float(VIRTUE_POSITION_STOP_DOLLARS)
+    ):
+        net_dir, net_size = session.broker.net_exposure()
         try:
             ok, pnl = await session.broker.flatten_all(
                 price=price,
                 stop_ticks=stop_ticks,
-                reason="stop_hit",
+                reason=f"stop_${float(VIRTUE_POSITION_STOP_DOLLARS):.0f}",
             )
         except Exception as exc:
             logger.exception("stop_flatten_failed err=%s", exc)
@@ -818,7 +840,23 @@ async def run_cycle(
         if ok:
             _credit_realized_pnl(session, pnl)
             session.trades_today += 1
-            logger.info("CYCLE %s STOP_EXIT pnl≈%.2f realized_today=%.2f", session.cycle, pnl, session.realized_pnl_today)
+            session.entry_cooldown_cycles = max(
+                int(session.entry_cooldown_cycles),
+                int(VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES),
+            )
+            session.long_streak = 0
+            session.short_streak = 0
+            logger.info(
+                "CYCLE %s STOP_EXIT closed %s x%s pnl≈%.2f stop=$%.0f "
+                "cooldown=%s realized_today=%.2f",
+                session.cycle,
+                net_dir,
+                net_size,
+                pnl,
+                float(VIRTUE_POSITION_STOP_DOLLARS),
+                session.entry_cooldown_cycles,
+                session.realized_pnl_today,
+            )
         else:
             logger.error("CYCLE %s STOP_EXIT_FAILED — exposure may remain", session.cycle)
         session.last_action = "FLAT"
@@ -1086,7 +1124,8 @@ async def run_cycle(
         return
 
     contracts = int(sized.contracts)
-    proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
+    # Live exit is dollar stop on the whole book — Manus risk matches that (Temperance).
+    proposed_risk = float(VIRTUE_POSITION_STOP_DOLLARS)
     open_risk = _open_risk_notional(session, stop_ticks)
 
     # Sync Manus NAV from broker truth (including equity=0 → no fake STARTING_NAV)
@@ -1136,7 +1175,7 @@ async def run_cycle(
             )
         else:
             contracts = max(1, contracts // 2)
-            proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
+            proposed_risk = float(VIRTUE_POSITION_STOP_DOLLARS)
             logger.warning(
                 "CYCLE %s MANUS_REDUCE_SIZE reason=%s contracts=%s risk=%.2f",
                 session.cycle,
@@ -1214,13 +1253,13 @@ async def run_loop(
             session.trades_today,
         )
     logger.info(
-        "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s position_tp=$%.0f "
-        "day_lock=$%.0f tp_cooldown=%s long_enter=%.1f short_enter=%.1f "
+        "VIRTUE LOOP start equity=%.2f symbol=%s position_tp=$%.0f position_sl=$%.0f "
+        "day_lock=$%.0f exit_cooldown=%s long_enter=%.1f short_enter=%.1f "
         "long_exit=%.1f short_exit=%.1f streak=%s anchor_div_atr=%.1f network_timeout=%.1fs",
         session.broker.equity,
         EXECUTION_SYMBOL,
-        DEFAULT_STOP_TICKS,
         float(VIRTUE_POSITION_TP_DOLLARS),
+        float(VIRTUE_POSITION_STOP_DOLLARS),
         float(GRADE_DAILY_PROFIT_LOCK),
         int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES),
         float(VIRTUE_SCORE_LONG_ENTER),

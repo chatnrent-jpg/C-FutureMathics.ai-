@@ -154,7 +154,11 @@ def build_virtue_system_state(
     heartbeat_state: str = "",
 ) -> dict[str, Any]:
     """Dashboard payload for native virtue Wisdom loop (not VolumeWatch grade path)."""
-    from engine.config import DEFAULT_STOP_TICKS, EXECUTION_SYMBOL, TICK_VALUE, forward_test_force_paper
+    from engine.config import (
+        EXECUTION_SYMBOL,
+        VIRTUE_POSITION_STOP_DOLLARS,
+        forward_test_force_paper,
+    )
 
     broker = session.broker
     risk = session.risk
@@ -200,7 +204,7 @@ def build_virtue_system_state(
         nav = round(broker_equity + unrealized, 2)
     else:
         nav = round(starting + daily_pnl + unrealized, 2)
-    open_risk = float(abs(net_size) * DEFAULT_STOP_TICKS * TICK_VALUE)
+    open_risk = float(VIRTUE_POSITION_STOP_DOLLARS) if abs(net_size) > 0 else 0.0
     max_conc = concurrent_risk_cap(risk_nav)
     hard_stop = max_daily_loss_cap(risk_nav)
     mode = "PAPER" if forward_test_force_paper() else "LIVE"

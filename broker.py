@@ -1031,6 +1031,13 @@ class VirtueBroker:
             return False
         return self.unrealized_position_pnl(price=price) >= target
 
+    def stop_dollars_hit(self, *, price: float, stop_dollars: float) -> bool:
+        """True when open position unrealized PnL is at/below -stop_dollars."""
+        limit = float(stop_dollars)
+        if limit <= 0:
+            return False
+        return self.unrealized_position_pnl(price=price) <= -limit
+
     def scale_out_close_qty(self, *, leave: int = 1) -> int:
         """Contracts to close so `leave` remain (0 if already at/below leave)."""
         _, size = self.net_exposure()

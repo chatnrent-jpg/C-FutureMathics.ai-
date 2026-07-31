@@ -130,13 +130,18 @@ def test_target_ticks_from_atr_floor_and_scale() -> None:
 
 def test_position_tp_ticks_for_dollar_target() -> None:
     """$100 position TP → 40 ticks on 2 MES, 80 ticks on 1 MES."""
-    from main import position_tp_ticks
-    from engine.config import TICK_VALUE, VIRTUE_POSITION_TP_DOLLARS
+    from main import position_stop_ticks, position_tp_ticks
+    from engine.config import TICK_VALUE, VIRTUE_POSITION_STOP_DOLLARS, VIRTUE_POSITION_TP_DOLLARS
 
     assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
+    assert float(VIRTUE_POSITION_STOP_DOLLARS) == 75.0
     assert position_tp_ticks(2) == 40
     assert position_tp_ticks(1) == 80
     assert abs(position_tp_ticks(2) * float(TICK_VALUE) * 2 - 100.0) < 1e-9
+    # $75 stop → 30 ticks on 2 MES, 60 ticks on 1 MES
+    assert position_stop_ticks(2) == 30
+    assert position_stop_ticks(1) == 60
+    assert abs(position_stop_ticks(2) * float(TICK_VALUE) * 2 - 75.0) < 1e-9
 
 
 def test_save_state_throttled_stops_cleanly() -> None:
@@ -370,7 +375,7 @@ def test_forward_test_paper_nav_allows_sizing() -> None:
 
 def test_stop_hit_and_flat_exit_helpers() -> None:
     from broker import VirtueBroker
-    from engine.config import TICK_SIZE
+    from engine.config import POINT_VALUE, TICK_SIZE, VIRTUE_POSITION_STOP_DOLLARS
 
     b = VirtueBroker()
     b.open_positions = [{"direction": "SHORT", "size": 3, "price": 9269.12}]
@@ -379,6 +384,13 @@ def test_stop_hit_and_flat_exit_helpers() -> None:
     assert b.stop_hit(price=9269.12 + 60 * TICK_SIZE, stop_ticks=60) is True
     b.open_positions = [{"direction": "LONG", "size": 2, "price": 9200.0}]
     assert b.stop_hit(price=9200.0 - 60 * TICK_SIZE, stop_ticks=60) is True
+    # Dollar stop: -$75 on whole 2 MES book (~7.5 points)
+    entry = 9200.0
+    b.open_positions = [{"direction": "LONG", "size": 2, "price": entry}]
+    assert b.stop_dollars_hit(price=entry, stop_dollars=VIRTUE_POSITION_STOP_DOLLARS) is False
+    stop_px = entry - (float(VIRTUE_POSITION_STOP_DOLLARS) / (POINT_VALUE * 2))
+    assert b.unrealized_position_pnl(price=stop_px) <= -float(VIRTUE_POSITION_STOP_DOLLARS) + 1e-9
+    assert b.stop_dollars_hit(price=stop_px, stop_dollars=VIRTUE_POSITION_STOP_DOLLARS) is True
 
 
 def test_take_profit_dollars_full_position() -> None:
@@ -536,10 +548,14 @@ def test_profit_lock_stands_aside_at_500() -> None:
         VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES,
     )
 
+    from engine.config import VIRTUE_POSITION_STOP_DOLLARS, VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES
+
     assert float(GRADE_DAILY_PROFIT_LOCK) == 500.0
     assert int(PROFIT_LOCK_MAX_CONTRACTS) == 0
     assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
+    assert float(VIRTUE_POSITION_STOP_DOLLARS) == 75.0
     assert int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES) >= 6
+    assert int(VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES) == int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES)
     assert (500.0 >= float(GRADE_DAILY_PROFIT_LOCK)) is True
     assert (499.0 >= float(GRADE_DAILY_PROFIT_LOCK)) is False
     assert STARTING_NAV >= 15_000.0
