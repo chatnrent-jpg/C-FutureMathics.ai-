@@ -245,7 +245,7 @@ def test_hysteresis_avoids_50_whipsaw() -> None:
 
 
 def test_separate_entry_exit_bands() -> None:
-    """Enter needs 60; while long, only exit/flip at <=40."""
+    """Enter needs 55; while long, only exit/flip at <=40."""
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
         min_anchor_samples=5,
