@@ -417,7 +417,7 @@ def test_session_uses_timely_entry_band() -> None:
     assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 45.0
     assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 42.0
     assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 58.0
-    assert int(VIRTUE_REQUIRED_STREAK) == 1
+    assert int(VIRTUE_REQUIRED_STREAK) == 2
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 70.0
     assert float(VIRTUE_SCORE_SHORT_CHASE_MIN) == 30.0
     assert int(VIRTUE_NO_NEW_ENTRY_HOUR) == 15
@@ -469,6 +469,27 @@ def test_credit_pnl_updates_paper_book_only() -> None:
         assert float(s.broker.equity) == before + 50.0
     else:
         assert float(s.broker.equity) == before
+
+
+def test_take_profit_independent_of_signal_side() -> None:
+    """TP must fire from position geometry even if signal has flipped opposite."""
+    from broker import VirtueBroker
+    from engine.config import DEFAULT_TARGET_TICKS, TICK_SIZE
+
+    b = VirtueBroker()
+    entry = 9200.0
+    b.open_positions = [{"direction": "SHORT", "size": 1, "price": entry}]
+    # Favorable SHORT move of target ticks
+    hit_px = entry - DEFAULT_TARGET_TICKS * TICK_SIZE
+    assert b.take_profit_hit(price=hit_px, target_ticks=DEFAULT_TARGET_TICKS) is True
+    # Not yet at target
+    assert b.take_profit_hit(price=entry - 10 * TICK_SIZE, target_ticks=DEFAULT_TARGET_TICKS) is False
+
+
+def test_required_streak_is_two_for_structure() -> None:
+    from engine.config import VIRTUE_REQUIRED_STREAK
+
+    assert int(VIRTUE_REQUIRED_STREAK) == 2
 
 
 def test_profit_lock_caps_to_one_mes_not_stand_aside() -> None:

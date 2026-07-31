@@ -784,46 +784,9 @@ async def run_cycle(
         session.broker.net_exposure(),
     )
 
-    # Courage: flip only when hysteresis says the opposite side is clear
-    net_dir, net_size = session.broker.net_exposure()
-    wrong_side = (
-        net_size > 0
-        and decision.action in {SignalAction.LONG, SignalAction.SHORT}
-        and net_dir != decision.action.value
-    )
-    if wrong_side:
-        logger.warning(
-            "CYCLE %s WRONG_SIDE_FLIP holding=%s scores vwap=%.1f twap=%.1f → %s",
-            session.cycle,
-            net_dir,
-            decision.vwap_score,
-            decision.twap_score,
-            decision.action.value,
-        )
-        try:
-            ok, pnl = await session.broker.flatten_all(
-                price=price,
-                stop_ticks=stop_ticks,
-                reason=f"wrong_side_flip:{net_dir}_to_{decision.action.value}",
-            )
-        except Exception as exc:
-            logger.exception("wrong_side_flatten_failed err=%s", exc)
-            session.last_action = "FLAT"
-            return
-        if ok:
-            _credit_realized_pnl(session, pnl)
-            session.trades_today += 1
-            logger.info(
-                "CYCLE %s WRONG_SIDE_EXIT pnl≈%.2f — will follow %s same cycle",
-                session.cycle,
-                pnl,
-                decision.action.value,
-            )
-        else:
-            logger.error("CYCLE %s WRONG_SIDE_EXIT_FAILED — standing aside", session.cycle)
-            session.last_action = "FLAT"
-            return
-        # Fall through to entry path for the correct side (Courage)
+    # Exit priority (Temperance + Wisdom structure):
+    # 1) hard stop  2) take-profit  3) opposite-band flatten-to-flat (no same-cycle reverse)
+    # Same-cycle short↔long flips caused unstructured whip-saws and skipped TP.
 
     # Hard stop from entry (Temperance) — exit even if regime still trending
     if session.broker.stop_hit(price=price, stop_ticks=stop_ticks):
@@ -846,12 +809,9 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Take-profit (Temperance): ATR-dynamic target (floor = VIRTUE_TP_MIN_TICKS).
-    # 2 MES: scale out 1 at target, leave 1 runner. 1 MES: full exit at target.
-    if (
-        decision.action in {SignalAction.LONG, SignalAction.SHORT}
-        and session.broker.take_profit_hit(price=price, target_ticks=tp_ticks)
-    ):
+    # Take-profit (Temperance): based on position + price only — not gated on signal side.
+    # Floor = VIRTUE_TP_MIN_TICKS. 2 MES: scale out leave 1; 1 MES: full exit.
+    if session.broker.take_profit_hit(price=price, target_ticks=tp_ticks):
         net_dir, net_size = session.broker.net_exposure()
         leave = int(SCALE_OUT_LEAVE_CONTRACTS)
         if net_size > 0 and net_size <= leave:
@@ -863,7 +823,7 @@ async def run_cycle(
                 )
             except Exception as exc:
                 logger.exception("take_profit_full_failed err=%s", exc)
-                session.last_action = decision.action.value
+                session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
                 return
             if ok:
                 _credit_realized_pnl(session, pnl)
@@ -895,7 +855,7 @@ async def run_cycle(
                 )
             except Exception as exc:
                 logger.exception("take_profit_partial_failed err=%s", exc)
-                session.last_action = decision.action.value
+                session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
                 return
             if ok:
                 _credit_realized_pnl(session, pnl)
@@ -919,8 +879,57 @@ async def run_cycle(
                     session.cycle,
                     net_size,
                 )
-            session.last_action = decision.action.value
+            session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
             return
+
+    # Opposite-band exit: flatten to FLAT only. Do NOT reverse same cycle (structure).
+    # Reverse needs a fresh streak from flat on a later cycle (Courage with confirmation).
+    net_dir, net_size = session.broker.net_exposure()
+    wrong_side = (
+        net_size > 0
+        and decision.action in {SignalAction.LONG, SignalAction.SHORT}
+        and net_dir != decision.action.value
+    )
+    if wrong_side:
+        logger.warning(
+            "CYCLE %s STRUCTURED_EXIT holding=%s scores vwap=%.1f twap=%.1f → signal=%s "
+            "(flatten to flat; no same-cycle reverse)",
+            session.cycle,
+            net_dir,
+            decision.vwap_score,
+            decision.twap_score,
+            decision.action.value,
+        )
+        try:
+            ok, pnl = await session.broker.flatten_all(
+                price=price,
+                stop_ticks=stop_ticks,
+                reason=f"structured_exit:{net_dir}_vs_{decision.action.value}",
+            )
+        except Exception as exc:
+            logger.exception("structured_exit_failed err=%s", exc)
+            session.last_action = "FLAT"
+            return
+        if ok:
+            _credit_realized_pnl(session, pnl)
+            session.trades_today += 1
+            # Cool off briefly so scores must re-confirm before opposite entry.
+            session.entry_cooldown_cycles = max(
+                int(session.entry_cooldown_cycles),
+                int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES),
+            )
+            session.long_streak = 0
+            session.short_streak = 0
+            logger.info(
+                "CYCLE %s STRUCTURED_EXIT_FLAT pnl≈%.2f cooldown=%s — wait for re-confirm",
+                session.cycle,
+                pnl,
+                session.entry_cooldown_cycles,
+            )
+        else:
+            logger.error("CYCLE %s STRUCTURED_EXIT_FAILED — standing aside", session.cycle)
+        session.last_action = "FLAT"
+        return
 
     # Wisdom stand-aside / chop → close open risk (do not orphan positions)
     if decision.action == SignalAction.FLAT:

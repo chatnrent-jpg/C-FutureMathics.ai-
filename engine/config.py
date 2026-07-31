@@ -189,7 +189,7 @@ VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP >= this to ENTER long from fla
 VIRTUE_SCORE_SHORT_ENTER = 45.0  # both VWAP+TWAP <= this to ENTER short from flat
 VIRTUE_SCORE_LONG_EXIT = 42.0    # while LONG, flip/exit only when both <= this
 VIRTUE_SCORE_SHORT_EXIT = 58.0   # while SHORT, flip/exit only when both >= this
-VIRTUE_REQUIRED_STREAK = 1       # fire on first clear entry-band cycle (Courage)
+VIRTUE_REQUIRED_STREAK = 2       # need 2 clear cycles — blocks random short↔long whip-saws
 # If scores are already this extended, the move is late — stand aside for NEW entries only.
 VIRTUE_SCORE_LONG_CHASE_MAX = 70.0
 VIRTUE_SCORE_SHORT_CHASE_MIN = 30.0
