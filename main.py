@@ -41,6 +41,7 @@ from engine.config import (
     EXECUTION_SYMBOL,
     FORWARD_TEST_TIMEZONE,
     GRADE_DAILY_PROFIT_LOCK,
+    PROFIT_LOCK_MAX_CONTRACTS,
     SCALE_OUT_LEAVE_CONTRACTS,
     STARTING_NAV,
     TICK_SIZE,
@@ -963,16 +964,16 @@ async def run_cycle(
         session.last_action = decision.action.value
         return
 
-    # Temperance: daily profit lock (no new entries after strong day)
-    if session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK):
+    # Temperance: daily profit lock — still allow entries, but only 1 MES (protect the bank).
+    profit_lock_active = session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK)
+    if profit_lock_active:
         logger.info(
-            "CYCLE %s daily_profit_lock pnl=%.2f >= %.2f — stand aside",
+            "CYCLE %s daily_profit_lock pnl=%.2f >= %.2f — allow entry capped at %s MES",
             session.cycle,
             session.realized_pnl_today,
             GRADE_DAILY_PROFIT_LOCK,
+            int(PROFIT_LOCK_MAX_CONTRACTS),
         )
-        session.last_action = "FLAT"
-        return
 
     # Temperance: last 15 min of RTH — manage/exit only, no new overnight risk.
     if not ignore_hours and not virtue_entries_allowed():
@@ -1093,6 +1094,17 @@ async def run_cycle(
         return
 
     contracts = int(sized.contracts)
+    if profit_lock_active:
+        cap = max(1, int(PROFIT_LOCK_MAX_CONTRACTS))
+        if contracts > cap:
+            logger.info(
+                "CYCLE %s profit_lock_size_cap from=%s to=%s pnl_today=%.2f",
+                session.cycle,
+                contracts,
+                cap,
+                session.realized_pnl_today,
+            )
+            contracts = cap
     proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
     open_risk = _open_risk_notional(session, stop_ticks)
 

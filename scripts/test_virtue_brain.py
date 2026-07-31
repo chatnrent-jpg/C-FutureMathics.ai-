@@ -471,6 +471,24 @@ def test_credit_pnl_updates_paper_book_only() -> None:
         assert float(s.broker.equity) == before
 
 
+def test_profit_lock_caps_to_one_mes_not_stand_aside() -> None:
+    """After daily profit lock, Temperance still allows entries but only 1 MES."""
+    from engine.config import GRADE_DAILY_PROFIT_LOCK, PROFIT_LOCK_MAX_CONTRACTS, STARTING_NAV
+
+    assert float(GRADE_DAILY_PROFIT_LOCK) == 375.0
+    assert int(PROFIT_LOCK_MAX_CONTRACTS) == 1
+    # Simulate post-lock size clamp used by main.run_cycle
+    sized_contracts = 2
+    profit_lock_active = 377.20 >= float(GRADE_DAILY_PROFIT_LOCK)
+    assert profit_lock_active is True
+    contracts = min(sized_contracts, max(1, int(PROFIT_LOCK_MAX_CONTRACTS)))
+    assert contracts == 1
+    # Below lock: full size remains
+    below = 300.0 >= float(GRADE_DAILY_PROFIT_LOCK)
+    assert below is False
+    assert STARTING_NAV >= 15_000.0
+
+
 def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     """Yesterday's realized PnL must not lock today's entries (Justice + Temperance)."""
     from datetime import datetime

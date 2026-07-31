@@ -143,7 +143,9 @@ GRADE_CONTRACTS = 2  # align with paper max (scale-out runner profile)
 # 200 ticks = 50 pts = $250/contract.
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
-GRADE_DAILY_PROFIT_LOCK = 375.0  # ~2.5% of $15k — halt new entries after strong day
+GRADE_DAILY_PROFIT_LOCK = 375.0  # ~2.5% of $15k — after lock, Temperance caps size (not full stand-aside)
+# Post profit-lock: still allow LONG/SHORT, but only 1 MES (protect the day's bank)
+PROFIT_LOCK_MAX_CONTRACTS = 1
 GRADE_DAILY_LOSS_HALT = 300.0  # 2% of $15k
 
 FORWARD_TEST_MODE = True
