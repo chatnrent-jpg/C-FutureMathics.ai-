@@ -41,7 +41,8 @@ def main() -> int:
     print("\n[1/2] Historical OHLCV probe (MES.FUT)...")
     try:
         hist = db.Historical(key=key)
-        end = datetime.now(timezone.utc)
+        # Historical batch lags the live clock — pad end back so we stay inside available range.
+        end = datetime.now(timezone.utc) - timedelta(minutes=20)
         start = end - timedelta(hours=6)
         data = hist.timeseries.get_range(
             dataset="GLBX.MDP3",
