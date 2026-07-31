@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass, field
@@ -41,8 +42,6 @@ from engine.config import (
     EXECUTION_SYMBOL,
     FORWARD_TEST_TIMEZONE,
     GRADE_DAILY_PROFIT_LOCK,
-    PROFIT_LOCK_MAX_CONTRACTS,
-    SCALE_OUT_LEAVE_CONTRACTS,
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
@@ -50,7 +49,9 @@ from engine.config import (
     VIRTUE_FORCE_EVENT_MAX_S,
     VIRTUE_HEARTBEAT_EVERY_N_CYCLES,
     VIRTUE_MIN_PRICE_MOVE_TICKS,
+    VIRTUE_POSITION_TP_DOLLARS,
     VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES,
+    VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES,
     VIRTUE_REQUIRED_STREAK,
     VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
     VIRTUE_RTH_FLATTEN_RETRY_S,
@@ -63,8 +64,6 @@ from engine.config import (
     VIRTUE_SCORE_SHORT_EXIT,
     VIRTUE_STATE_PERSIST_INTERVAL_S,
     VIRTUE_TICK_POLL_S,
-    VIRTUE_TP_ATR_MULT,
-    VIRTUE_TP_MIN_TICKS,
     fixed_fractional_risk_pct,
     forward_test_force_paper,
 )
@@ -135,13 +134,24 @@ class VirtueSession:
 
 def target_ticks_from_atr(atr: float) -> int:
     """
-    Dynamic take-profit in ticks: max(floor, atr_ticks * mult).
-    atr is in price points; MES tick = 0.25 → atr_ticks = atr / TICK_SIZE.
+    Legacy ATR take-profit helper (compat/tests).
+    Virtue live exits use VIRTUE_POSITION_TP_DOLLARS via take_profit_dollars_hit.
     """
+    from engine.config import VIRTUE_TP_ATR_MULT, VIRTUE_TP_MIN_TICKS
+
     atr_pts = max(0.0, float(atr or 0.0))
     atr_ticks = atr_pts / float(TICK_SIZE) if TICK_SIZE > 0 else 0.0
     raw = int(round(atr_ticks * float(VIRTUE_TP_ATR_MULT)))
     return max(int(VIRTUE_TP_MIN_TICKS), raw)
+
+
+def position_tp_ticks(contracts: int) -> int:
+    """Ticks of favorable move so position PnL ≈ VIRTUE_POSITION_TP_DOLLARS."""
+    n = max(1, int(contracts))
+    tv = float(TICK_VALUE)
+    if tv <= 0:
+        return 1
+    return max(1, int(math.ceil(float(VIRTUE_POSITION_TP_DOLLARS) / (tv * n))))
 
 
 def et_session_date(now: datetime | None = None) -> str:
@@ -752,7 +762,9 @@ async def run_cycle(
     session.last_vwap_score = float(decision.vwap_score)
     session.last_twap_score = float(decision.twap_score)
     session.last_blended_score = float(decision.blended_score)
-    tp_ticks = target_ticks_from_atr(float(decision.atr))
+    _, size_for_tp = session.broker.net_exposure()
+    tp_ticks = position_tp_ticks(size_for_tp if size_for_tp > 0 else 2)
+    open_pnl = session.broker.unrealized_position_pnl(price=price)
 
     # Dual independent streaks from raw entry bands (build while flat OR holding).
     # Enables same-cycle flip when opposite streak is already ready (Courage).
@@ -765,7 +777,7 @@ async def run_cycle(
     logger.info(
         "CYCLE %s regime=%s action=%s vwap=%.1f%% twap=%.1f%% blend=%.1f%% "
         "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr=%.2f atr_pct=%.2f "
-        "tp=%st long_streak=%s short_streak=%s reason=%s exposure=%s",
+        "tp=$%.0f (~%st) open_pnl=%.2f long_streak=%s short_streak=%s reason=%s exposure=%s",
         session.cycle,
         decision.regime.value,
         decision.action.value,
@@ -778,7 +790,9 @@ async def run_cycle(
         decision.adx,
         decision.atr,
         decision.atr_pct,
+        float(VIRTUE_POSITION_TP_DOLLARS),
         tp_ticks,
+        open_pnl,
         session.long_streak,
         session.short_streak,
         decision.reason,
@@ -810,78 +824,46 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Take-profit (Temperance): based on position + price only — not gated on signal side.
-    # Floor = VIRTUE_TP_MIN_TICKS. 2 MES: scale out leave 1; 1 MES: full exit.
-    if session.broker.take_profit_hit(price=price, target_ticks=tp_ticks):
+    # Take-profit (Temperance): bank ~$100 on the whole position, full flatten, then cooldown.
+    # Not gated on signal side — position geometry / open PnL only.
+    if session.broker.take_profit_dollars_hit(
+        price=price, target_dollars=float(VIRTUE_POSITION_TP_DOLLARS)
+    ):
         net_dir, net_size = session.broker.net_exposure()
-        leave = int(SCALE_OUT_LEAVE_CONTRACTS)
-        if net_size > 0 and net_size <= leave:
-            try:
-                ok, pnl = await session.broker.flatten_all(
-                    price=price,
-                    stop_ticks=stop_ticks,
-                    reason=f"take_profit_full_{tp_ticks}t",
-                )
-            except Exception as exc:
-                logger.exception("take_profit_full_failed err=%s", exc)
-                session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
-                return
-            if ok:
-                _credit_realized_pnl(session, pnl)
-                session.trades_today += 1
-                logger.info(
-                    "CYCLE %s TAKE_PROFIT_FULL closed %s x%s pnl≈%.2f target=%st atr=%.2f realized_today=%.2f",
-                    session.cycle,
-                    net_dir,
-                    net_size,
-                    pnl,
-                    tp_ticks,
-                    float(decision.atr),
-                    session.realized_pnl_today,
-                )
-            else:
-                logger.error("CYCLE %s TAKE_PROFIT_FULL_FAILED — exposure may remain", session.cycle)
-            session.last_action = "FLAT"
-            return
-
-        close_qty = session.broker.scale_out_close_qty(leave=leave)
-        if close_qty > 0:
-            try:
-                ok, pnl = await session.broker.partial_close(
-                    contracts=close_qty,
-                    price=price,
-                    stop_ticks=stop_ticks,
-                    reason=f"take_profit_{tp_ticks}t",
-                    leave=leave,
-                )
-            except Exception as exc:
-                logger.exception("take_profit_partial_failed err=%s", exc)
-                session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
-                return
-            if ok:
-                _credit_realized_pnl(session, pnl)
-                session.trades_today += 1
-                remain = session.broker.net_exposure()[1]
-                logger.info(
-                    "CYCLE %s TAKE_PROFIT_SCALE_OUT closed %s x%s leave=%s pnl≈%.2f "
-                    "target=%st atr=%.2f realized_today=%.2f",
-                    session.cycle,
-                    net_dir,
-                    close_qty,
-                    remain,
-                    pnl,
-                    tp_ticks,
-                    float(decision.atr),
-                    session.realized_pnl_today,
-                )
-            else:
-                logger.error(
-                    "CYCLE %s TAKE_PROFIT_SCALE_OUT_FAILED — size may still be %s",
-                    session.cycle,
-                    net_size,
-                )
+        try:
+            ok, pnl = await session.broker.flatten_all(
+                price=price,
+                stop_ticks=stop_ticks,
+                reason=f"take_profit_${float(VIRTUE_POSITION_TP_DOLLARS):.0f}",
+            )
+        except Exception as exc:
+            logger.exception("take_profit_full_failed err=%s", exc)
             session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
             return
+        if ok:
+            _credit_realized_pnl(session, pnl)
+            session.trades_today += 1
+            session.entry_cooldown_cycles = max(
+                int(session.entry_cooldown_cycles),
+                int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES),
+            )
+            session.long_streak = 0
+            session.short_streak = 0
+            logger.info(
+                "CYCLE %s TAKE_PROFIT_FULL closed %s x%s pnl≈%.2f target=$%.0f "
+                "cooldown=%s realized_today=%.2f",
+                session.cycle,
+                net_dir,
+                net_size,
+                pnl,
+                float(VIRTUE_POSITION_TP_DOLLARS),
+                session.entry_cooldown_cycles,
+                session.realized_pnl_today,
+            )
+        else:
+            logger.error("CYCLE %s TAKE_PROFIT_FULL_FAILED — exposure may remain", session.cycle)
+        session.last_action = "FLAT"
+        return
 
     # Opposite-band exit: flatten to FLAT only. Do NOT reverse same cycle (structure).
     # Reverse needs a fresh streak from flat on a later cycle (Courage with confirmation).
@@ -974,16 +956,16 @@ async def run_cycle(
         session.last_action = decision.action.value
         return
 
-    # Temperance: daily profit lock — still allow entries, but only 1 MES (protect the bank).
-    profit_lock_active = session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK)
-    if profit_lock_active:
+    # Temperance: daily profit lock — day is done; bank the win, no new entries.
+    if session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK):
         logger.info(
-            "CYCLE %s daily_profit_lock pnl=%.2f >= %.2f — allow entry capped at %s MES",
+            "CYCLE %s daily_profit_lock pnl=%.2f >= %.2f — work done for the day (stand aside)",
             session.cycle,
             session.realized_pnl_today,
             GRADE_DAILY_PROFIT_LOCK,
-            int(PROFIT_LOCK_MAX_CONTRACTS),
         )
+        session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
+        return
 
     # Temperance: last 15 min of RTH — manage/exit only, no new overnight risk.
     if not ignore_hours and not virtue_entries_allowed():
@@ -997,7 +979,7 @@ async def run_cycle(
     # After anchor rebase, scores sit near 50 — wait before new entries (Temperance).
     if cooldown_blocks_entry:
         logger.info(
-            "CYCLE %s entry_cooldown — stand aside new entries after rebase (remaining=%s)",
+            "CYCLE %s entry_cooldown — stand aside new entries (remaining=%s)",
             session.cycle,
             session.entry_cooldown_cycles,
         )
@@ -1104,17 +1086,6 @@ async def run_cycle(
         return
 
     contracts = int(sized.contracts)
-    if profit_lock_active:
-        cap = max(1, int(PROFIT_LOCK_MAX_CONTRACTS))
-        if contracts > cap:
-            logger.info(
-                "CYCLE %s profit_lock_size_cap from=%s to=%s pnl_today=%.2f",
-                session.cycle,
-                contracts,
-                cap,
-                session.realized_pnl_today,
-            )
-            contracts = cap
     proposed_risk = float(contracts * stop_ticks * TICK_VALUE)
     open_risk = _open_risk_notional(session, stop_ticks)
 
@@ -1243,15 +1214,15 @@ async def run_loop(
             session.trades_today,
         )
     logger.info(
-        "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s tp_floor=%st "
-        "tp_atr_mult=%.2f scale_out_leave=%s long_enter=%.1f short_enter=%.1f "
+        "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s position_tp=$%.0f "
+        "day_lock=$%.0f tp_cooldown=%s long_enter=%.1f short_enter=%.1f "
         "long_exit=%.1f short_exit=%.1f streak=%s anchor_div_atr=%.1f network_timeout=%.1fs",
         session.broker.equity,
         EXECUTION_SYMBOL,
         DEFAULT_STOP_TICKS,
-        int(VIRTUE_TP_MIN_TICKS),
-        float(VIRTUE_TP_ATR_MULT),
-        SCALE_OUT_LEAVE_CONTRACTS,
+        float(VIRTUE_POSITION_TP_DOLLARS),
+        float(GRADE_DAILY_PROFIT_LOCK),
+        int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES),
         float(VIRTUE_SCORE_LONG_ENTER),
         float(VIRTUE_SCORE_SHORT_ENTER),
         float(VIRTUE_SCORE_LONG_EXIT),

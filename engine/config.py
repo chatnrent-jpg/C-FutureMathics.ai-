@@ -109,10 +109,10 @@ MAX_ALLOWED_SPREAD_TICKS = 2  # max bid/ask spread in ticks for entry
 
 # Strategy defaults
 DEFAULT_STOP_TICKS = 60  # 60 ticks = 15 points = $75/contract risk (SWING)
-DEFAULT_TARGET_TICKS = 120  # 120 ticks = 30 points = $150/contract profit (2:1 R:R SWING)
-# Virtue scale-out: at TP, close down to a runner (2→close 1, leave 1 still in the game).
-# Single-lot books still full-exit at target (net_size <= leave).
-SCALE_OUT_LEAVE_CONTRACTS = 1
+# Legacy swing default (Virtue uses VIRTUE_POSITION_TP_DOLLARS instead).
+DEFAULT_TARGET_TICKS = 40  # ~$100 on 2 MES (40t × $1.25 × 2) — kept for non-Virtue helpers
+# Virtue profit-taking: full flatten at dollar TP (no runner). Scale-out leave unused on Virtue path.
+SCALE_OUT_LEAVE_CONTRACTS = 0
 VWAP_ENTRY_THRESHOLD_TICKS = 8  # min distance from VWAP to enter (legacy, not used in swing)
 MIN_CONFIDENCE_THRESHOLD = 0.65  # Only take signals with 65%+ confidence (SWING quality)
 MIN_SECONDS_BETWEEN_TRADES = 14400  # 4 hours between trades (SWING frequency)
@@ -143,9 +143,9 @@ GRADE_CONTRACTS = 2  # align with paper max (scale-out runner profile)
 # 200 ticks = 50 pts = $250/contract.
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
-GRADE_DAILY_PROFIT_LOCK = 375.0  # ~2.5% of $15k — after lock, Temperance caps size (not full stand-aside)
-# Post profit-lock: still allow LONG/SHORT, but only 1 MES (protect the day's bank)
-PROFIT_LOCK_MAX_CONTRACTS = 1
+GRADE_DAILY_PROFIT_LOCK = 500.0  # ~3.3% of $15k — day done; no new entries (Temperance)
+# 0 = stand aside after lock (do not keep trading smaller)
+PROFIT_LOCK_MAX_CONTRACTS = 0
 GRADE_DAILY_LOSS_HALT = 300.0  # 2% of $15k
 
 FORWARD_TEST_MODE = True
@@ -197,9 +197,14 @@ VIRTUE_SCORE_SHORT_CHASE_MIN = 28.0
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
 VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
-# Dynamic take-profit: max(floor, atr_in_ticks * ATR_TP_MULT)
+# Bank ~$100 per open position (full flatten), then cool down for the next clean signal.
+# Fixes “up $300 → back to $19 with nothing taken” (Temperance).
+VIRTUE_POSITION_TP_DOLLARS = 100.0
+# After a take-profit flatten: sit out ~8 engine cycles (~1–2 min) before next entry.
+VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = 8
+# Legacy ATR TP helpers (Virtue exits use VIRTUE_POSITION_TP_DOLLARS; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
-VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS  # floor = 120 ticks
+VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS
 # Rebase when |VWAP − TWAP| exceeds this many ATRs (anchor disagreement)
 VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT = 3.0
 # Concurrent Justice layer: throttle writes to primary data/system_state.json

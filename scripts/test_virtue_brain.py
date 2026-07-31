@@ -128,6 +128,17 @@ def test_target_ticks_from_atr_floor_and_scale() -> None:
     assert expected >= int(VIRTUE_TP_MIN_TICKS)
 
 
+def test_position_tp_ticks_for_dollar_target() -> None:
+    """$100 position TP → 40 ticks on 2 MES, 80 ticks on 1 MES."""
+    from main import position_tp_ticks
+    from engine.config import TICK_VALUE, VIRTUE_POSITION_TP_DOLLARS
+
+    assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
+    assert position_tp_ticks(2) == 40
+    assert position_tp_ticks(1) == 80
+    assert abs(position_tp_ticks(2) * float(TICK_VALUE) * 2 - 100.0) < 1e-9
+
+
 def test_save_state_throttled_stops_cleanly() -> None:
     """Background Justice writer exits when is_running flips (run.py pattern)."""
     import asyncio
@@ -370,32 +381,29 @@ def test_stop_hit_and_flat_exit_helpers() -> None:
     assert b.stop_hit(price=9200.0 - 60 * TICK_SIZE, stop_ticks=60) is True
 
 
-def test_take_profit_and_scale_out_qty() -> None:
+def test_take_profit_dollars_full_position() -> None:
+    """Bank $100 on the whole position (2 MES ≈ 40 ticks), not a distant per-contract target."""
     from broker import VirtueBroker
-    from engine.config import DEFAULT_TARGET_TICKS, SCALE_OUT_LEAVE_CONTRACTS, TICK_SIZE
+    from engine.config import POINT_VALUE, TICK_SIZE, VIRTUE_POSITION_TP_DOLLARS
 
     b = VirtueBroker()
     entry = 9200.0
-    b.open_positions = [{"direction": "LONG", "size": 3, "price": entry}]
-    assert b.take_profit_hit(price=entry, target_ticks=DEFAULT_TARGET_TICKS) is False
-    assert b.take_profit_hit(
-        price=entry + DEFAULT_TARGET_TICKS * TICK_SIZE,
-        target_ticks=DEFAULT_TARGET_TICKS,
+    b.open_positions = [{"direction": "LONG", "size": 2, "price": entry}]
+    assert b.take_profit_dollars_hit(price=entry, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is False
+    # 10 points × $5 × 2 = $100
+    hit_px = entry + (100.0 / (POINT_VALUE * 2))
+    assert abs(b.unrealized_position_pnl(price=hit_px) - 100.0) < 1e-9
+    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is True
+    # Short book
+    b.open_positions = [{"direction": "SHORT", "size": 2, "price": entry}]
+    assert b.take_profit_dollars_hit(
+        price=entry - (100.0 / (POINT_VALUE * 2)),
+        target_dollars=VIRTUE_POSITION_TP_DOLLARS,
     )
-    assert b.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS) == 2
-
-    b.open_positions = [{"direction": "SHORT", "size": 3, "price": entry}]
-    assert b.take_profit_hit(
-        price=entry - DEFAULT_TARGET_TICKS * TICK_SIZE,
-        target_ticks=DEFAULT_TARGET_TICKS,
-    )
-    # Single-lot book: scale-out leave=1 means close qty 0 — full TP path must be used instead
+    # Still supports tick helper for geometry checks
     b.open_positions = [{"direction": "LONG", "size": 1, "price": entry}]
-    assert b.scale_out_close_qty(leave=SCALE_OUT_LEAVE_CONTRACTS) == 0
-    assert b.take_profit_hit(
-        price=entry + DEFAULT_TARGET_TICKS * TICK_SIZE,
-        target_ticks=DEFAULT_TARGET_TICKS,
-    )
+    assert b.take_profit_hit(price=entry + 80 * TICK_SIZE, target_ticks=80) is True
+    assert b.scale_out_close_qty(leave=0) == 1
 
 
 def test_session_uses_timely_entry_band() -> None:
@@ -500,18 +508,16 @@ def test_load_persisted_day_bucket_same_day_only(tmp_path) -> None:
 
 
 def test_take_profit_independent_of_signal_side() -> None:
-    """TP must fire from position geometry even if signal has flipped opposite."""
+    """TP must fire from open PnL even if signal has flipped opposite."""
     from broker import VirtueBroker
-    from engine.config import DEFAULT_TARGET_TICKS, TICK_SIZE
+    from engine.config import POINT_VALUE, VIRTUE_POSITION_TP_DOLLARS
 
     b = VirtueBroker()
     entry = 9200.0
     b.open_positions = [{"direction": "SHORT", "size": 1, "price": entry}]
-    # Favorable SHORT move of target ticks
-    hit_px = entry - DEFAULT_TARGET_TICKS * TICK_SIZE
-    assert b.take_profit_hit(price=hit_px, target_ticks=DEFAULT_TARGET_TICKS) is True
-    # Not yet at target
-    assert b.take_profit_hit(price=entry - 10 * TICK_SIZE, target_ticks=DEFAULT_TARGET_TICKS) is False
+    hit_px = entry - (float(VIRTUE_POSITION_TP_DOLLARS) / POINT_VALUE)
+    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is True
+    assert b.take_profit_dollars_hit(price=entry - 2.0, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is False
 
 
 def test_required_streak_is_two_for_structure() -> None:
@@ -520,21 +526,22 @@ def test_required_streak_is_two_for_structure() -> None:
     assert int(VIRTUE_REQUIRED_STREAK) == 2
 
 
-def test_profit_lock_caps_to_one_mes_not_stand_aside() -> None:
-    """After daily profit lock, Temperance still allows entries but only 1 MES."""
-    from engine.config import GRADE_DAILY_PROFIT_LOCK, PROFIT_LOCK_MAX_CONTRACTS, STARTING_NAV
+def test_profit_lock_stands_aside_at_500() -> None:
+    """At $500 realized, day is done — no new entries (not a 1-MES continue)."""
+    from engine.config import (
+        GRADE_DAILY_PROFIT_LOCK,
+        PROFIT_LOCK_MAX_CONTRACTS,
+        STARTING_NAV,
+        VIRTUE_POSITION_TP_DOLLARS,
+        VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES,
+    )
 
-    assert float(GRADE_DAILY_PROFIT_LOCK) == 375.0
-    assert int(PROFIT_LOCK_MAX_CONTRACTS) == 1
-    # Simulate post-lock size clamp used by main.run_cycle
-    sized_contracts = 2
-    profit_lock_active = 377.20 >= float(GRADE_DAILY_PROFIT_LOCK)
-    assert profit_lock_active is True
-    contracts = min(sized_contracts, max(1, int(PROFIT_LOCK_MAX_CONTRACTS)))
-    assert contracts == 1
-    # Below lock: full size remains
-    below = 300.0 >= float(GRADE_DAILY_PROFIT_LOCK)
-    assert below is False
+    assert float(GRADE_DAILY_PROFIT_LOCK) == 500.0
+    assert int(PROFIT_LOCK_MAX_CONTRACTS) == 0
+    assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
+    assert int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES) >= 6
+    assert (500.0 >= float(GRADE_DAILY_PROFIT_LOCK)) is True
+    assert (499.0 >= float(GRADE_DAILY_PROFIT_LOCK)) is False
     assert STARTING_NAV >= 15_000.0
 
 
@@ -587,6 +594,7 @@ if __name__ == "__main__":
     test_rebase_anchors_aligns_scores_to_live()
     test_anchors_diverged_atr_gate()
     test_target_ticks_from_atr_floor_and_scale()
+    test_position_tp_ticks_for_dollar_target()
     test_save_state_throttled_stops_cleanly()
     test_engine_event_loop_consumes_tick_ctx()
     test_heartbeat_throttled_every_n_cycles()
@@ -601,9 +609,11 @@ if __name__ == "__main__":
     test_zero_equity_blocks_sizing()
     test_forward_test_paper_nav_allows_sizing()
     test_stop_hit_and_flat_exit_helpers()
-    test_take_profit_and_scale_out_qty()
+    test_take_profit_dollars_full_position()
     test_session_uses_timely_entry_band()
-    test_profit_lock_caps_to_one_mes_not_stand_aside()
+    test_profit_lock_stands_aside_at_500()
+    test_take_profit_independent_of_signal_side()
+    test_required_streak_is_two_for_structure()
     test_weighted_avg_entry()
     test_capital_drag_allows_irreducible_1_mes()
     test_credit_pnl_updates_paper_book_only()

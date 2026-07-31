@@ -1011,6 +1011,26 @@ class VirtueBroker:
             return float(price) >= entry + target_pts
         return float(price) <= entry - target_pts
 
+    def unrealized_position_pnl(self, *, price: float) -> float:
+        """Open position mark-to-market PnL in dollars (0 when flat)."""
+        from engine.config import POINT_VALUE
+
+        exposure_dir, exposure_size = self.net_exposure()
+        if exposure_dir == "FLAT" or exposure_size <= 0:
+            return 0.0
+        entry = self._avg_entry(exposure_dir)
+        if entry is None:
+            return 0.0
+        points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
+        return round(points * float(POINT_VALUE) * int(exposure_size), 2)
+
+    def take_profit_dollars_hit(self, *, price: float, target_dollars: float) -> bool:
+        """True when open position unrealized PnL reaches the dollar take-profit."""
+        target = float(target_dollars)
+        if target <= 0:
+            return False
+        return self.unrealized_position_pnl(price=price) >= target
+
     def scale_out_close_qty(self, *, leave: int = 1) -> int:
         """Contracts to close so `leave` remain (0 if already at/below leave)."""
         _, size = self.net_exposure()
