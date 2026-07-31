@@ -91,10 +91,10 @@ class WisdomStrategy:
     score_atr_mult: float = 2.0  # ATR component of score scale
     score_price_pct: float = 0.004  # ±0.4% of price spans 0–100 (trend extensions register)
     max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
-    long_enter: float = 55.0  # ENTER long from flat (both scores >=)
-    short_enter: float = 45.0  # ENTER short from flat (both scores <=)
-    long_exit: float = 42.0  # while LONG: flip/exit when both scores <=
-    short_exit: float = 58.0  # while SHORT: flip/exit when both scores >=
+    long_enter: float = 60.0  # ENTER long from flat (both scores >=)
+    short_enter: float = 40.0  # ENTER short from flat (both scores <=)
+    long_exit: float = 40.0  # while LONG: flip/exit when both scores <=
+    short_exit: float = 60.0  # while SHORT: flip/exit when both scores >=
     anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)
     min_anchor_samples: int = 20
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))

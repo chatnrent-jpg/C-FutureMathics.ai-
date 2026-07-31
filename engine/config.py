@@ -183,16 +183,16 @@ VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
 # Databento quote staleness ceiling (seconds)
 DATABENTO_MAX_QUOTE_AGE_S = 5.0
-# Hysteresis bands — enter early on clear turn; hold through mid-band; never chase the end.
-# Wisdom: right action @ right time (55/45), not late confirmation (58+) after the move is done.
-VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP >= this to ENTER long from flat
-VIRTUE_SCORE_SHORT_ENTER = 45.0  # both VWAP+TWAP <= this to ENTER short from flat
-VIRTUE_SCORE_LONG_EXIT = 42.0    # while LONG, flip/exit only when both <= this
-VIRTUE_SCORE_SHORT_EXIT = 58.0   # while SHORT, flip/exit only when both >= this
+# Hysteresis bands — stability first: wider no-trade mid-band, clear trend only.
+# Enter 60/40 (not 55/45). Exit 40/60 so holds survive mid-band noise (Temperance + Wisdom).
+VIRTUE_SCORE_LONG_ENTER = 60.0   # both VWAP+TWAP >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 40.0  # both VWAP+TWAP <= this to ENTER short from flat
+VIRTUE_SCORE_LONG_EXIT = 40.0    # while LONG, exit only when both <= this
+VIRTUE_SCORE_SHORT_EXIT = 60.0   # while SHORT, exit only when both >= this
 VIRTUE_REQUIRED_STREAK = 2       # need 2 clear cycles — blocks random short↔long whip-saws
 # If scores are already this extended, the move is late — stand aside for NEW entries only.
-VIRTUE_SCORE_LONG_CHASE_MAX = 70.0
-VIRTUE_SCORE_SHORT_CHASE_MIN = 30.0
+VIRTUE_SCORE_LONG_CHASE_MAX = 72.0
+VIRTUE_SCORE_SHORT_CHASE_MIN = 28.0
 # Score scale: ±score_price_pct of price maps to 0–100 (smaller → more sensitive to extensions)
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
