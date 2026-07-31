@@ -73,26 +73,26 @@ def webull_credentials_configured() -> bool:
     return bool(webull_app_key() and webull_app_secret())
 
 
-# Capital baseline — paper book compounds from here (Temperance)
-STARTING_NAV = 10_000.0
-HANDSHAKE_EQUITY_BASE = 10_000.0
+# Capital baseline — $15k paper book for 2 MES scale-out runner (Temperance)
+STARTING_NAV = 15_000.0
+HANDSHAKE_EQUITY_BASE = 15_000.0
 
 MAX_DAILY_LOSS_PCT = 0.02
-HARD_DAILY_STOP = 200.0  # floor; Manus also uses 2% of NAV
-# 1.0% FF: @~$10k → 1 MES ($75); @$15k+ → 2 MES ($150) for scale-out runner
+HARD_DAILY_STOP = 300.0  # 2% of $15k
+# 1.0% of $15k = $150 → exactly 2 MES @ 60-tick stop ($75 each)
 FIXED_FRACTIONAL_RISK_PCT = 0.01
 MAX_CONCURRENT_RISK_PCT = 0.05
 PER_TRADE_RISK_MIN = 60.0
 PER_TRADE_RISK_MAX = 160.0  # headroom for 2×$75 stop
 
-# Paper forward-test — up to 2 MES (enter 2, TP scale-out leave 1 runner)
+# Paper forward-test — 2 MES (enter 2, TP scale-out leave 1 runner)
 FORWARD_TEST_MAX_CONCURRENT_RISK_PCT = 0.05
 FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.01
 FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
 PAPER_MAX_MES_CONTRACTS = 2
 PAPER_MAX_OPEN_MES_POSITIONS = 1
 
-# Live — cap risk NAV; size still FF-driven
+# Live — aligned to $15k / 2 MES profile
 LIVE_RISK_NAV_CAP = 15_000.0
 LIVE_MAX_DAILY_LOSS = 300.0
 LIVE_MAX_CONCURRENT_RISK_PCT = 0.05
@@ -122,7 +122,7 @@ SWING_MODE = True  # Toggle between swing (True) and scalp (False) strategies
 SWING_MIN_TREND_STRENGTH = 0.60  # Minimum trend strength for entry (0-1.0)
 SWING_MAX_TRADES_PER_DAY = 5  # Maximum 5 swing trades per day
 SWING_TRAILING_STOP_TICKS = 30  # Trail by 30 ticks after 50% to target
-SWING_CONTRACTS = 1  # $10k test: 1 contract only
+SWING_CONTRACTS = 2  # $15k / 2 MES scale-out profile
 
 # ---------------------------------------------------------------------------
 # VolumeWatch grade-path MES strategy (PRIMARY for directional futures)
@@ -143,8 +143,8 @@ GRADE_CONTRACTS = 2  # align with paper max (scale-out runner profile)
 # 200 ticks = 50 pts = $250/contract.
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
-GRADE_DAILY_PROFIT_LOCK = 250.0  # day profit lock (Temperance)
-GRADE_DAILY_LOSS_HALT = 200.0
+GRADE_DAILY_PROFIT_LOCK = 375.0  # ~2.5% of $15k — halt new entries after strong day
+GRADE_DAILY_LOSS_HALT = 300.0  # 2% of $15k
 
 FORWARD_TEST_MODE = True
 FORWARD_TEST_CYCLE_INTERVAL_S = 900.0  # 15 minutes for swing (was 2.0 for scalping)
@@ -169,19 +169,22 @@ VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
 VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET
 VIRTUE_RTH_CLOSE_MINUTE = 0
-# No new entries in the last 15 minutes of RTH (manage/exit only — gap avoidance).
+# No new entries after 3:00 PM ET (manage/exit only — avoid late-day chase + RTH flatten losers).
 VIRTUE_NO_NEW_ENTRY_HOUR = 15
-VIRTUE_NO_NEW_ENTRY_MINUTE = 45
+VIRTUE_NO_NEW_ENTRY_MINUTE = 0
 # Outside RTH: retry flatten until flat (or attempts exhausted).
 VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
-# Hysteresis bands (Temperance — enter on clear extension; hold through mid-band)
-# Tuned so brief trends that clear ~58 can fire (ADX is telemetry only — not an entry gate).
-VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
-VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
+# Hysteresis bands — enter early on clear turn; hold through mid-band; never chase the end.
+# Wisdom: right action @ right time (55/45), not late confirmation (58+) after the move is done.
+VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 45.0  # both VWAP+TWAP <= this to ENTER short from flat
 VIRTUE_SCORE_LONG_EXIT = 42.0    # while LONG, flip/exit only when both <= this
 VIRTUE_SCORE_SHORT_EXIT = 58.0   # while SHORT, flip/exit only when both >= this
-VIRTUE_REQUIRED_STREAK = 2       # consecutive clear entry cycles before fire
+VIRTUE_REQUIRED_STREAK = 1       # fire on first clear entry-band cycle (Courage)
+# If scores are already this extended, the move is late — stand aside for NEW entries only.
+VIRTUE_SCORE_LONG_CHASE_MAX = 70.0
+VIRTUE_SCORE_SHORT_CHASE_MIN = 30.0
 # Score scale: ±score_price_pct of price maps to 0–100 (smaller → more sensitive to extensions)
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)

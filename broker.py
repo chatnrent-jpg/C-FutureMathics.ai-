@@ -230,7 +230,7 @@ class VirtueBroker:
     api: ApiClient = field(default_factory=ApiClient)
     trade: TradeClient | None = None
     data: AlpacaSPYFeed = field(default_factory=AlpacaSPYFeed)
-    equity: float = 10_000.0
+    equity: float = STARTING_NAV
     realized_pnl: float = 0.0
     triage: TriageState = TriageState.READY
     max_price_age_s: float = 5.0

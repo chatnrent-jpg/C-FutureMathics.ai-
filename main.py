@@ -53,9 +53,11 @@ from engine.config import (
     VIRTUE_REQUIRED_STREAK,
     VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
     VIRTUE_RTH_FLATTEN_RETRY_S,
+    VIRTUE_SCORE_LONG_CHASE_MAX,
     VIRTUE_SCORE_LONG_ENTER,
     VIRTUE_SCORE_LONG_EXIT,
     VIRTUE_SCORE_PRICE_PCT,
+    VIRTUE_SCORE_SHORT_CHASE_MIN,
     VIRTUE_SCORE_SHORT_ENTER,
     VIRTUE_SCORE_SHORT_EXIT,
     VIRTUE_STATE_PERSIST_INTERVAL_S,
@@ -985,6 +987,27 @@ async def run_cycle(
             session.last_action = "FLAT"
             return
     else:
+        session.last_action = "FLAT"
+        return
+
+    # Wisdom: do not chase a move that already extended (late entry → stop / RTH flatten).
+    blend = float(decision.blended_score)
+    if side == "LONG" and blend >= float(VIRTUE_SCORE_LONG_CHASE_MAX):
+        logger.info(
+            "CYCLE %s chase_filter LONG blend=%.1f >= %.1f — stand aside (move already extended)",
+            session.cycle,
+            blend,
+            VIRTUE_SCORE_LONG_CHASE_MAX,
+        )
+        session.last_action = "FLAT"
+        return
+    if side == "SHORT" and blend <= float(VIRTUE_SCORE_SHORT_CHASE_MIN):
+        logger.info(
+            "CYCLE %s chase_filter SHORT blend=%.1f <= %.1f — stand aside (move already extended)",
+            session.cycle,
+            blend,
+            VIRTUE_SCORE_SHORT_CHASE_MIN,
+        )
         session.last_action = "FLAT"
         return
 

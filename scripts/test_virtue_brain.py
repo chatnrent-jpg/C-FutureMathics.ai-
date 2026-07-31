@@ -229,20 +229,20 @@ def test_hysteresis_avoids_50_whipsaw() -> None:
 
 
 def test_separate_entry_exit_bands() -> None:
-    """Enter needs 58; while long, only exit/flip at <=42."""
+    """Enter needs 55; while long, only exit/flip at <=42."""
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
         min_anchor_samples=5,
-        long_enter=58.0,
-        short_enter=42.0,
+        long_enter=55.0,
+        short_enter=45.0,
         long_exit=42.0,
         short_exit=58.0,
     )
     s.seed(_trending_bars(60, bull=True, step=3.0))
     d = s.evaluate(holding=None)
     assert d.action == SignalAction.LONG
-    assert d.vwap_score >= 58.0
-    # Holding: mid-band scores must stay LONG (not flip at 55)
+    assert d.vwap_score >= 55.0
+    # Holding: mid-band scores must stay LONG (not flip at 50)
     d_hold = s.evaluate(holding="LONG")
     assert d_hold.action == SignalAction.LONG
 
@@ -272,13 +272,13 @@ def test_size_respects_fixed_fractional() -> None:
     stop_ticks = 60
     sized = calculate_max_contracts(equity=equity, stop_ticks=stop_ticks, hard_cap=1000)
     assert not sized.rejected
-    # $10k × 1% = $100 → 1 MES @ $75; $15k → 2 MES
-    assert sized.contracts == 1
+    # $15k × 1% = $150 → 2 MES @ $75
+    assert sized.contracts == 2
     assert sized.risk_pct <= FIXED_FRACTIONAL_RISK_PCT + 1e-12
-    two = calculate_max_contracts(equity=15_000.0, stop_ticks=stop_ticks, hard_cap=1000)
-    assert not two.rejected
-    assert two.contracts == 2
     assert int(PAPER_MAX_MES_CONTRACTS) >= 2
+    one = calculate_max_contracts(equity=10_000.0, stop_ticks=stop_ticks, hard_cap=1000)
+    assert not one.rejected
+    assert one.contracts == 1
     # Over-size must reject
     too_many = sized.contracts + 50
     gate = reject_if_over_risk(equity=equity, contracts=too_many, stop_ticks=stop_ticks)
@@ -316,13 +316,10 @@ def test_validate_order_symbol_size_stale() -> None:
 def test_risk_math_consistency() -> None:
     from engine.config import STARTING_NAV
 
-    # 1% of $10k = $100; 60 ticks * $1.25 = $75/contract → 1 MES
+    # 1% of $15k = $150; 60 ticks * $1.25 = $75/contract → 2 MES
     sized = calculate_max_contracts(equity=float(STARTING_NAV), stop_ticks=60, hard_cap=100)
     assert sized.contracts == int((float(STARTING_NAV) * FIXED_FRACTIONAL_RISK_PCT) // (60 * TICK_VALUE))
-    assert sized.contracts == 1
-    # Scale-out profile: $15k × 1% = $150 → 2 MES
-    two = calculate_max_contracts(equity=15_000.0, stop_ticks=60, hard_cap=100)
-    assert two.contracts == 2
+    assert sized.contracts == 2
 
 
 def test_position_exclusivity_helpers() -> None:
@@ -357,7 +354,7 @@ def test_forward_test_paper_nav_allows_sizing() -> None:
 
     sized = calculate_max_contracts(equity=STARTING_NAV, stop_ticks=60)
     assert not sized.rejected
-    assert sized.contracts == 1
+    assert sized.contracts == 2
 
 
 def test_stop_hit_and_flat_exit_helpers() -> None:
@@ -401,22 +398,30 @@ def test_take_profit_and_scale_out_qty() -> None:
     )
 
 
-def test_session_uses_tighter_entry_band() -> None:
+def test_session_uses_timely_entry_band() -> None:
     from engine.config import (
+        VIRTUE_NO_NEW_ENTRY_HOUR,
+        VIRTUE_NO_NEW_ENTRY_MINUTE,
         VIRTUE_REQUIRED_STREAK,
+        VIRTUE_SCORE_LONG_CHASE_MAX,
         VIRTUE_SCORE_LONG_ENTER,
         VIRTUE_SCORE_LONG_EXIT,
+        VIRTUE_SCORE_SHORT_CHASE_MIN,
         VIRTUE_SCORE_SHORT_ENTER,
         VIRTUE_SCORE_SHORT_EXIT,
     )
     from main import VirtueSession
 
     s = VirtueSession()
-    assert s.strategy.long_enter == float(VIRTUE_SCORE_LONG_ENTER) == 58.0
-    assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 42.0
+    assert s.strategy.long_enter == float(VIRTUE_SCORE_LONG_ENTER) == 55.0
+    assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 45.0
     assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 42.0
     assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 58.0
-    assert int(VIRTUE_REQUIRED_STREAK) == 2
+    assert int(VIRTUE_REQUIRED_STREAK) == 1
+    assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 70.0
+    assert float(VIRTUE_SCORE_SHORT_CHASE_MIN) == 30.0
+    assert int(VIRTUE_NO_NEW_ENTRY_HOUR) == 15
+    assert int(VIRTUE_NO_NEW_ENTRY_MINUTE) == 0
 
 
 def test_weighted_avg_entry() -> None:
@@ -435,9 +440,9 @@ def test_capital_drag_allows_irreducible_1_mes() -> None:
     from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 
     m = CapitalProtectionMatrix(
-        starting_nav=10_000.0,
-        account_nav=9_000.0,
-        peak_nav=10_000.0,
+        starting_nav=15_000.0,
+        account_nav=13_500.0,
+        peak_nav=15_000.0,
     )
     assert m.capital_drag_active is True
     # Dragged ceiling is tight; undragged paper tol still covers $150 (2×$75).

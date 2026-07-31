@@ -96,7 +96,8 @@ def virtue_session_open(now: datetime | None = None) -> bool:
 def virtue_entries_allowed(now: datetime | None = None) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
-    Last 15 minutes of RTH are manage/exit only (no overnight gap from late entries).
+    After VIRTUE_NO_NEW_ENTRY_* (default 15:00 ET) manage/exit only —
+    blocks late-day chase entries that get flattened at 16:00.
     """
     if not virtue_session_open(now):
         return False
