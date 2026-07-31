@@ -138,27 +138,57 @@ class WisdomStrategy:
 
     def rebase_anchors_to_price(self, live_price: float) -> None:
         """
-        Shift rolling VWAP/TWAP onto the live quote so seeded 5m bars
-        do not disagree with the Alpaca live print (Justice).
+        Pin rolling VWAP/TWAP (and OHLC path) onto the live quote (Justice).
+
+        1) Shift OHLC so last close == live (preserve relative path / ATR).
+        2) Rebuild VWAP/TWAP from that aligned window.
+        3) If the average is still ≥1% off live (ghost seed), flat-pin anchors
+           at the live print so scores cannot clamp to 0/100 and fake a SHORT/LONG.
         """
         assert self.vwap_tracker is not None and self.twap_tracker is not None
-        closes = list(self.closes)
         px = float(live_price)
-        if not closes or px <= 0:
+        if px <= 0:
             return
-        shift = px - float(closes[-1])
+        closes = list(self.closes)
+        highs = list(self.highs)
+        lows = list(self.lows)
+        if closes:
+            shift = px - float(closes[-1])
+            if abs(shift) > 1e-12:
+                self.closes = deque((float(c) + shift for c in closes), maxlen=self.closes.maxlen)
+                self.highs = deque((float(h) + shift for h in highs), maxlen=self.highs.maxlen)
+                self.lows = deque((float(lo) + shift for lo in lows), maxlen=self.lows.maxlen)
+            window = list(self.closes)[-self.anchor_window :]
+        else:
+            window = [px]
         self.vwap_tracker.reset()
         self.twap_tracker.reset()
-        window = closes[-self.anchor_window :]
         for c in window:
-            p = float(c) + shift
+            p = float(c)
             self.vwap_tracker.update_trade(price=p, size=1.0)
             self.twap_tracker.update(p)
+        vwap = float(self.vwap_tracker.vwap or 0.0)
+        if vwap > 0 and abs(px - vwap) / px >= 0.01:
+            # Ghost mean survived the close-align — pin anchors and collapse OHLC
+            # so ATR/ADX are not haunted by a cliff in the seed window.
+            n_ohlc = len(self.closes) if self.closes else max(int(self.min_anchor_samples), 20)
+            self.closes = deque([px] * n_ohlc, maxlen=self.closes.maxlen)
+            self.highs = deque([px] * n_ohlc, maxlen=self.highs.maxlen)
+            self.lows = deque([px] * n_ohlc, maxlen=self.lows.maxlen)
+            self.vwap_tracker.reset()
+            self.twap_tracker.reset()
+            n = max(int(self.min_anchor_samples), min(int(self.anchor_window), n_ohlc))
+            for _ in range(n):
+                self.vwap_tracker.update_trade(price=px, size=1.0)
+                self.twap_tracker.update(px)
 
     def anchor_gap_too_wide(self, price: float) -> bool:
         """
-        True on a sudden live disconnect from rolling VWAP (seed/live mismatch).
-        Organic trends widen gap slowly — those must NOT trigger rebase every cycle.
+        True on seed/live disconnect from rolling VWAP (Justice).
+
+        - Sudden jump: gap wide AND last close jumped (classic seed cutover).
+        - Ghost VWAP: average ≥1% off live even when last close already matches
+          (the deploy failure that left blend=0 / false SHORT in a bull).
         """
         assert self.vwap_tracker is not None
         px = float(price)
@@ -171,7 +201,9 @@ class WisdomStrategy:
         jump = abs(px - float(closes[-1]))
         jump_gate = max(2.0 * atr if atr > 0 else 0.0, px * 0.002, 5.0)
         gap_gate = max(self.max_anchor_gap_pct, (3.0 * atr / px) if atr > 0 else self.max_anchor_gap_pct)
-        return gap_pct > gap_gate and jump > jump_gate
+        sudden = gap_pct > gap_gate and jump > jump_gate
+        ghost = gap_pct >= 0.01  # ≥100 bps — never trade on a ghost average
+        return sudden or ghost
 
     def anchors_diverged(self, *, atr_mult: float = 3.0) -> bool:
         """

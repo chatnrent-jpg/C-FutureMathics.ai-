@@ -90,12 +90,53 @@ def test_rebase_anchors_aligns_scores_to_live() -> None:
     live = last - 70.0
     s.rebase_anchors_to_price(live)
     assert s.vwap_tracker is not None and s.twap_tracker is not None
-    assert abs(float(s.twap_tracker._samples[-1]) - live) < 1e-6
+    assert abs(float(list(s.closes)[-1]) - live) < 1e-6
+    assert abs(float(s.vwap_tracker.vwap) - live) / live < 0.01
     # After rebase + live update near the rebased path, scores should not clamp to 0
     s.update_price(live)
     d = s.evaluate()
     assert d.vwap_score > 5.0
     assert d.twap_score > 5.0
+
+
+def test_rebase_fixes_ghost_vwap_when_last_close_already_matches() -> None:
+    """Deploy bug: last close ≈ live, but rolling VWAP still on a ghost seed level."""
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=1.0))
+    live = float(list(s.closes)[-1])
+    assert s.vwap_tracker is not None and s.twap_tracker is not None
+    # Poison averages ~100 pts above live without touching last close (≥1% ghost)
+    s.vwap_tracker.reset()
+    s.twap_tracker.reset()
+    for _ in range(40):
+        s.vwap_tracker.update_trade(price=live + 100.0, size=1.0)
+        s.twap_tracker.update(live + 100.0)
+    assert float(s.vwap_tracker.vwap) > live + 50.0
+    assert s.anchor_gap_too_wide(live) is True
+    s.rebase_anchors_to_price(live)
+    # Rebuild from true OHLC (last already matched) — ghost tracker poison discarded
+    assert abs(float(s.vwap_tracker.vwap) - live) / live < 0.01
+    assert abs(float(s.twap_tracker.twap) - live) / live < 0.01
+    s.update_price(live + 1.0)
+    d = s.evaluate()
+    assert d.blended_score > 40.0  # must not clamp to 0 / false SHORT
+
+
+def test_rebase_flat_pins_when_seed_mean_is_ghost_level() -> None:
+    """If OHLC window mean stays ≥1% off live after shift, flat-pin anchors at live."""
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5, anchor_window=30)
+    # Synthetic: last close already at live, but older closes sit 150 pts higher
+    live = 9300.0
+    for i in range(30):
+        c = live + 150.0 if i < 29 else live
+        s.update(Bar(high=c + 0.5, low=c - 0.5, close=c))
+    assert s.vwap_tracker is not None
+    assert abs(float(s.vwap_tracker.vwap) - live) / live >= 0.01
+    s.rebase_anchors_to_price(live)
+    assert abs(float(s.vwap_tracker.vwap) - live) < 1e-6
+    s.update_price(live + 0.5)
+    d = s.evaluate()
+    assert d.blended_score > 40.0
 
 
 def test_anchors_diverged_atr_gate() -> None:
@@ -608,6 +649,8 @@ if __name__ == "__main__":
     test_score_discontinuity_stands_aside()
     test_anchor_gap_too_wide()
     test_rebase_anchors_aligns_scores_to_live()
+    test_rebase_fixes_ghost_vwap_when_last_close_already_matches()
+    test_rebase_flat_pins_when_seed_mean_is_ghost_level()
     test_anchors_diverged_atr_gate()
     test_target_ticks_from_atr_floor_and_scale()
     test_position_tp_ticks_for_dollar_target()
