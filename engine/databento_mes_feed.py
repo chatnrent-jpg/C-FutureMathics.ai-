@@ -266,7 +266,8 @@ class DatabentoMESFeed:
             import databento as db
 
             schema = "ohlcv-1m" if timeframe in {"1m", "1Min", "1min"} else "ohlcv-1m"
-            end = datetime.now(timezone.utc)
+            # Historical availability lags wall clock — keep end inside published range.
+            end = datetime.now(timezone.utc) - timedelta(minutes=20)
             start = end - timedelta(hours=max(1, int(lookback_hours)))
             client = db.Historical(key=self.api_key)
             data = await asyncio.to_thread(
