@@ -183,10 +183,10 @@ VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
 # Databento quote staleness ceiling (seconds)
 DATABENTO_MAX_QUOTE_AGE_S = 5.0
-# Hysteresis bands — stability first: wider no-trade mid-band, clear trend only.
-# Enter 60/40 (not 55/45). Exit 40/60 so holds survive mid-band noise (Temperance + Wisdom).
-VIRTUE_SCORE_LONG_ENTER = 60.0   # both VWAP+TWAP >= this to ENTER long from flat
-VIRTUE_SCORE_SHORT_ENTER = 40.0  # both VWAP+TWAP <= this to ENTER short from flat
+# Hysteresis bands — timely entry (55/45) with wide exits so holds survive mid-band noise.
+# 60/40 was missing clear bulls at blend≈59; user directed back to 55 enter (Wisdom + Courage).
+VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 45.0  # both VWAP+TWAP <= this to ENTER short from flat
 VIRTUE_SCORE_LONG_EXIT = 40.0    # while LONG, exit only when both <= this
 VIRTUE_SCORE_SHORT_EXIT = 60.0   # while SHORT, exit only when both >= this
 VIRTUE_REQUIRED_STREAK = 2       # need 2 clear cycles — blocks random short↔long whip-saws
