@@ -102,7 +102,9 @@ def test_rth_mode_still_blocks_overnight(monkeypatch) -> None:
     assert virtue_session_open(mon_open) is True
     assert virtue_entries_allowed(mon_open) is True
     mon_1500 = datetime(2026, 7, 27, 15, 0, tzinfo=tz)
-    assert virtue_entries_allowed(mon_1500) is False
+    assert virtue_entries_allowed(mon_1500) is True  # afternoon trend still allowed
+    mon_1545 = datetime(2026, 7, 27, 15, 45, tzinfo=tz)
+    assert virtue_entries_allowed(mon_1545) is False
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ def virtue_entries_allowed(now: datetime | None = None) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
 
-    - RTH mode (Alpaca): after VIRTUE_NO_NEW_ENTRY_* (default 15:00 ET) manage/exit only.
+    - RTH mode (Alpaca): after VIRTUE_NO_NEW_ENTRY_* (default 15:45 ET) manage/exit only.
     - CME mode (Databento): overnight OK; block last 15 minutes before 5:00 PM ET maintenance.
     """
     if not virtue_session_open(now):

@@ -482,7 +482,7 @@ def test_session_uses_timely_entry_band() -> None:
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 90.0
     assert float(VIRTUE_SCORE_SHORT_CHASE_MIN) == 10.0
     assert int(VIRTUE_NO_NEW_ENTRY_HOUR) == 15
-    assert int(VIRTUE_NO_NEW_ENTRY_MINUTE) == 0
+    assert int(VIRTUE_NO_NEW_ENTRY_MINUTE) == 45
 
 
 def test_weighted_avg_entry() -> None:

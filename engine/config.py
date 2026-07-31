@@ -172,9 +172,9 @@ VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
 VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET (RTH mode)
 VIRTUE_RTH_CLOSE_MINUTE = 0
-# RTH mode: no new entries after 3:00 PM ET (manage/exit only).
+# RTH mode: allow trend continuation into the afternoon; cut new entries 15m before 4:00 flatten.
 VIRTUE_NO_NEW_ENTRY_HOUR = 15
-VIRTUE_NO_NEW_ENTRY_MINUTE = 0
+VIRTUE_NO_NEW_ENTRY_MINUTE = 45
 # CME mode: no new entries in last 15 minutes before 5:00 PM ET maintenance.
 VIRTUE_CME_NO_NEW_ENTRY_HOUR = 16
 VIRTUE_CME_NO_NEW_ENTRY_MINUTE = 45
