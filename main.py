@@ -74,6 +74,7 @@ from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 from manus.heartbeat import BrokerHeartbeatAgent, HeartbeatState
 from engine.ui_state_bridge import (
     load_persisted_book_equity,
+    load_persisted_day_bucket,
     load_persisted_open_positions,
     persist_virtue_system_state,
 )
@@ -1228,6 +1229,18 @@ async def run_loop(
             "BOOT restored_paper_positions n=%s exposure=%s",
             len(restored),
             session.broker.net_exposure(),
+        )
+    # Justice: same ET day → restore Closed-today PnL / trade count (deploy must not wipe).
+    day_bucket = load_persisted_day_bucket(et_session_date())
+    if day_bucket.get("restored"):
+        session.session_date_et = str(day_bucket["session_date_et"])
+        session.realized_pnl_today = float(day_bucket["realized_pnl_today"])
+        session.trades_today = int(day_bucket["trades_today"])
+        logger.info(
+            "BOOT restored_day_bucket et_date=%s realized_today=%.2f trades_today=%s",
+            session.session_date_et,
+            session.realized_pnl_today,
+            session.trades_today,
         )
     logger.info(
         "VIRTUE LOOP start equity=%.2f symbol=%s stop_ticks=%s tp_floor=%st "

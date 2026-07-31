@@ -471,6 +471,34 @@ def test_credit_pnl_updates_paper_book_only() -> None:
         assert float(s.broker.equity) == before
 
 
+def test_load_persisted_day_bucket_same_day_only(tmp_path) -> None:
+    """Deploy/restart on the same ET day must restore Closed-today PnL (Justice)."""
+    import json
+    from engine.ui_state_bridge import load_persisted_day_bucket
+
+    state = tmp_path / "system_state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "book_equity": 15401.0,
+                "session": {
+                    "session_date_et": "2026-07-31",
+                    "realized_pnl_today": 401.0,
+                    "trades_today": 7,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    same = load_persisted_day_bucket("2026-07-31", state_path=state)
+    assert same["restored"] is True
+    assert same["realized_pnl_today"] == 401.0
+    assert same["trades_today"] == 7
+    other = load_persisted_day_bucket("2026-08-01", state_path=state)
+    assert other["restored"] is False
+    assert other["realized_pnl_today"] == 0.0
+
+
 def test_take_profit_independent_of_signal_side() -> None:
     """TP must fire from position geometry even if signal has flipped opposite."""
     from broker import VirtueBroker

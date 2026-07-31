@@ -218,6 +218,7 @@ def build_virtue_system_state(
         "book_equity": round(broker_equity, 2) if broker_equity > 0 else round(starting, 2),
         "session": {
             "realized_pnl_today": daily_pnl,
+            "session_date_et": str(getattr(session, "session_date_et", "") or ""),
             "open_risk_notional": open_risk,
             "trades_today": int(getattr(session, "trades_today", 0) or 0),
             "halted": bool(getattr(session, "halted", False)),
@@ -360,11 +361,72 @@ def load_persisted_open_positions() -> list[dict[str, Any]]:
     return out
 
 
+def load_persisted_day_bucket(
+    today_et: str,
+    *,
+    state_path: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Restore same-ET-day Temperance counters after restart/deploy (Justice).
+
+    If persisted session_date_et != today_et, returns zeros (true new day).
+    Deploy must not wipe Closed-today PnL when the calendar day is unchanged.
+    """
+    from pathlib import Path
+    import json
+    import logging
+
+    log = logging.getLogger("virtue.ui_state")
+    empty = {
+        "session_date_et": "",
+        "realized_pnl_today": 0.0,
+        "trades_today": 0,
+        "restored": False,
+    }
+    path = (
+        Path(state_path)
+        if state_path is not None
+        else Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    )
+    try:
+        if not path.is_file():
+            return empty
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        sess = raw.get("session") or {}
+        persisted_date = str(sess.get("session_date_et") or "").strip()
+        pnl = float(sess.get("realized_pnl_today") or 0.0)
+        trades = int(sess.get("trades_today") or 0)
+        # Legacy payloads: no session_date_et — use updated_at ET date if present.
+        if not persisted_date:
+            updated = str(raw.get("updated_at") or "")
+            if updated:
+                try:
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
+
+                    ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                    persisted_date = ts.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+                except Exception:
+                    persisted_date = ""
+        if not persisted_date or persisted_date != str(today_et):
+            return empty
+        return {
+            "session_date_et": persisted_date,
+            "realized_pnl_today": round(pnl, 2),
+            "trades_today": max(0, trades),
+            "restored": True,
+        }
+    except Exception as exc:
+        log.exception("load_persisted_day_bucket_failed err=%s", exc)
+        return empty
+
+
 __all__ = [
     "build_system_state",
     "build_virtue_system_state",
     "ensure_boot_system_state",
     "load_persisted_book_equity",
+    "load_persisted_day_bucket",
     "load_persisted_open_positions",
     "persist_virtue_system_state",
 ]
