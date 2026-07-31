@@ -49,7 +49,11 @@ def build_system_state(orchestrator: Any, last_price: float | None = None) -> di
     # Detect data source
     broker = orchestrator.broker
     data_source = "sim"
-    if hasattr(broker, "_using_alpaca") and broker._using_alpaca:
+    if hasattr(broker, "data_source") and broker.data_source:
+        data_source = str(broker.data_source)
+    elif hasattr(broker, "_data_source") and broker._data_source:
+        data_source = str(broker._data_source)
+    elif hasattr(broker, "_using_alpaca") and broker._using_alpaca:
         data_source = "alpaca_spy_proxy"
     elif hasattr(broker, "_using_webull") and broker._using_webull:
         data_source = "webull_mes"

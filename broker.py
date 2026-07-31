@@ -1,10 +1,9 @@
 """
-FutureMathics virtue broker — Webull execution + Alpaca market data.
+FutureMathics virtue broker — Webull execution + Databento/Alpaca market data.
 
 - Trade / positions / reconcile: Webull OpenAPI (ApiClient + TradeClient)
-- Live prices: Alpaca SPY → MES proxy (existing $99 market-data subscription)
+- Live prices: Databento CME MES L1 (primary) → Alpaca SPY proxy fallback → Webull snapshot
 - No Interactive Brokers / ib_insync
-- No Webull US_FUTURES quote subscription required
 
 Guardrails (intact):
   1. Position exclusivity — flatten opposite before new entry; wait for fill confirm
@@ -25,16 +24,19 @@ from enum import Enum
 from typing import Any
 
 from engine.config import (
+    DATABENTO_MAX_QUOTE_AGE_S,
     EXECUTION_SYMBOL,
     FIXED_FRACTIONAL_RISK_PCT,
     STARTING_NAV,
     WEBULL_NETWORK_TIMEOUT_S,
     forward_test_force_paper,
     paper_max_mes_contracts,
+    primary_data_source,
     webull_credentials_configured,
     webull_futures_account_id,
 )
 from engine.alpaca_spy_feed import AlpacaSPYFeed
+from engine.databento_mes_feed import DatabentoMESFeed
 from engine.futures_broker_adapter import OrderExecutionResult, RoutingMode
 from engine.webull_clients import ApiClient, TradeClient
 from engine.webull_openapi import webull_is_sandbox
@@ -223,13 +225,15 @@ class VirtueBroker:
     """
     Virtue execution gate.
 
-    - AlpacaSPYFeed: live MES proxy prices (market data you already pay for)
+    - DatabentoMESFeed: primary CME MES L1 (overnight-capable)
+    - AlpacaSPYFeed: SPY → MES proxy fallback
     - TradeClient: Webull futures account, orders, positions, reconcile
     """
 
     api: ApiClient = field(default_factory=ApiClient)
     trade: TradeClient | None = None
     data: AlpacaSPYFeed = field(default_factory=AlpacaSPYFeed)
+    mes_data: DatabentoMESFeed | None = None
     equity: float = STARTING_NAV
     realized_pnl: float = 0.0
     triage: TriageState = TriageState.READY
@@ -239,23 +243,39 @@ class VirtueBroker:
     _last_price: float = 0.0
     _last_disconnect_at: float | None = None
     _contract: str = EXECUTION_SYMBOL
+    _data_source: str = "alpaca_spy_mes_proxy"
 
     def __post_init__(self) -> None:
         if self.trade is None:
             self.trade = TradeClient(api=self.api, product_root=EXECUTION_SYMBOL)
+        if self.mes_data is None:
+            self.mes_data = DatabentoMESFeed(max_quote_age_s=float(DATABENTO_MAX_QUOTE_AGE_S))
         if not webull_credentials_configured():
             logger.error("WEBULL credentials missing — set WEBULL_APP_KEY / WEBULL_APP_SECRET in .env.local")
-        if not self.data.is_configured():
-            logger.error("ALPACA credentials missing — set ALPACA_API_KEY / ALPACA_API_SECRET for live prices")
-        else:
+        src = primary_data_source()
+        if src == "databento" and self.mes_data.is_configured():
+            self._data_source = "databento_mes"
+            self.mes_data.ensure_started()
+            logger.info("VirtueBroker market data: Databento CME MES L1 (primary)")
+        elif self.data.is_configured():
+            self._data_source = "alpaca_spy_mes_proxy"
             logger.info("VirtueBroker market data: Alpaca SPY → MES proxy")
+        else:
+            logger.error(
+                "No market data — set DATABENTO_API_KEY (preferred) or ALPACA_API_KEY / ALPACA_API_SECRET"
+            )
         acct = webull_futures_account_id() or "(resolve-at-runtime)"
         logger.info(
-            "VirtueBroker Webull execution account=%s product=%s timeout=%.1fs",
+            "VirtueBroker Webull execution account=%s product=%s timeout=%.1fs data_source=%s",
             acct,
             EXECUTION_SYMBOL,
             self.network_timeout_s,
+            self._data_source,
         )
+
+    @property
+    def data_source(self) -> str:
+        return str(self._data_source or "unknown")
 
     # --- compatibility shim for older main/tests that expect .adapter ---
     @property
@@ -299,10 +319,10 @@ class VirtueBroker:
         return await self.health_check_timed()
 
     async def health_check_timed(self) -> tuple[bool, str]:
-        """Healthy when Webull trade API is up; Alpaca data preferred for prices."""
+        """Healthy when Webull trade API is up and primary market data is fresh."""
         parts: list[str] = []
         webull_ok = False
-        alpaca_ok = False
+        data_ok = False
         try:
             webull_ok, wdetail = await _await_timeout(
                 asyncio.to_thread(self.trade.health_check),
@@ -314,9 +334,21 @@ class VirtueBroker:
             logger.exception("webull_health_check_failed err=%s", exc)
             parts.append(f"webull_error={exc}")
 
-        if self.data.is_configured():
+        prefer = primary_data_source()
+        if prefer == "databento" and self.mes_data and self.mes_data.is_configured():
             try:
-                alpaca_ok, adetail = await _await_timeout(
+                data_ok, ddetail = await _await_timeout(
+                    self.mes_data.health_check(),
+                    timeout=max(self.network_timeout_s, 8.0),
+                    label="databento_health",
+                )
+                parts.append(f"databento={ddetail}")
+            except Exception as exc:
+                logger.exception("databento_health_check_failed err=%s", exc)
+                parts.append(f"databento_error={exc}")
+        elif self.data.is_configured():
+            try:
+                data_ok, adetail = await _await_timeout(
                     self.data.health_check(),
                     timeout=self.network_timeout_s,
                     label="alpaca_health",
@@ -325,11 +357,15 @@ class VirtueBroker:
             except Exception as exc:
                 logger.exception("alpaca_health_check_failed err=%s", exc)
                 parts.append(f"alpaca_error={exc}")
+        else:
+            data_ok = True  # no MD configured → don't block webull-only health
 
-        # Execution broker must be up; market data should be up when Alpaca is configured
         if not webull_ok:
             return False, " | ".join(parts)
-        if self.data.is_configured() and not alpaca_ok:
+        # Require primary MD when configured
+        if prefer == "databento" and self.mes_data and self.mes_data.is_configured() and not data_ok:
+            return False, " | ".join(parts)
+        if prefer != "databento" and self.data.is_configured() and not data_ok:
             return False, " | ".join(parts)
         return True, " | ".join(parts)
 
@@ -338,12 +374,41 @@ class VirtueBroker:
 
     async def resolve_market_context_timed(self) -> dict[str, Any]:
         """
-        Prefer Alpaca SPY → MES proxy (paid market data).
-        Fall back to Webull futures snapshot only if Alpaca unavailable.
+        Prefer Databento CME MES L1 when configured.
+        Fall back to Alpaca SPY → MES proxy, then Webull futures snapshot.
         """
         self._contract = self.trade.contract_symbol() if self.trade else EXECUTION_SYMBOL
 
-        # Primary: Alpaca
+        # Primary: Databento CME MES
+        if self.mes_data and self.mes_data.is_configured() and primary_data_source() == "databento":
+            try:
+                mes_quote = await _await_timeout(
+                    self.mes_data.fetch_quote(max_age_s=float(DATABENTO_MAX_QUOTE_AGE_S)),
+                    timeout=max(self.network_timeout_s, 8.0),
+                    label="databento_quote",
+                )
+            except Exception as exc:
+                logger.exception("databento_quote_failed err=%s", exc)
+                mes_quote = None
+            if mes_quote:
+                price = float(mes_quote.get("price") or mes_quote.get("last") or 0.0)
+                if price > 0:
+                    self._last_price = price
+                    self._data_source = "databento_mes"
+                    tick = {
+                        **mes_quote,
+                        "symbol": self._contract,
+                        "source": "databento_mes",
+                    }
+                    return {
+                        "tick": tick,
+                        "live_stream": True,
+                        "databento": True,
+                        "webull_contract": self._contract,
+                    }
+            logger.warning("Databento MES quote unavailable/stale — trying Alpaca SPY proxy")
+
+        # Secondary: Alpaca SPY → MES proxy
         if self.data.is_configured():
             try:
                 spy_quote = await _await_timeout(
@@ -364,12 +429,12 @@ class VirtueBroker:
                         MAX_SPY_QUOTE_AGE_S,
                         spy_quote.get("timestamp"),
                     )
-                    # Fall through to Webull MES quote; if that fails, caller stands aside
                 else:
                     tick = self.data.get_mes_proxy_tick(spy_quote)
                     price = float(tick.get("price") or tick.get("last") or 0.0)
                     if price > 0:
                         self._last_price = price
+                        self._data_source = "alpaca_spy_mes_proxy"
                         tick = {
                             **tick,
                             "symbol": self._contract,
@@ -386,7 +451,7 @@ class VirtueBroker:
                         }
             logger.warning("Alpaca quote unavailable/stale — trying Webull futures snapshot")
 
-        # Fallback: Webull (requires US_FUTURES subscription)
+        # Tertiary: Webull (requires US_FUTURES subscription)
         try:
             quote = await _await_timeout(
                 asyncio.to_thread(self.trade.get_quote),
@@ -395,14 +460,12 @@ class VirtueBroker:
             )
         except Exception as exc:
             logger.exception("webull_quote_failed err=%s", exc)
-            raise RuntimeError(f"market_data_unavailable alpaca_and_webull_failed: {exc}") from exc
+            raise RuntimeError(f"market_data_unavailable all_sources_failed: {exc}") from exc
 
         if not quote or quote.get("needs_subscription"):
             detail = (quote or {}).get("error") or "webull_quote_unavailable"
-            # Soft fail: Sunday/overnight MES needs live futures quotes; SPY proxy is stale.
-            # Do not raise — caller stands aside (Justice) instead of outage reconnect theater.
             logger.error(
-                "market_data_stand_aside alpaca_stale_or_down webull=%s — no fresh MES price",
+                "market_data_stand_aside databento/alpaca_down webull=%s — no fresh MES price",
                 detail,
             )
             return {
@@ -418,6 +481,7 @@ class VirtueBroker:
 
         self._last_price = price
         self._contract = str(quote.get("symbol") or self._contract)
+        self._data_source = "webull"
         tick = {
             "symbol": self._contract,
             "price": price,

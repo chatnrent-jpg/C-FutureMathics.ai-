@@ -28,6 +28,7 @@ scp @ssh `
 
 scp @ssh `
     "$Root\engine\alpaca_spy_feed.py" `
+    "$Root\engine\databento_mes_feed.py" `
     "$Root\engine\webull_clients.py" `
     "$Root\engine\webull_openapi.py" `
     "$Root\engine\webull_futures.py" `
@@ -36,6 +37,10 @@ scp @ssh `
     "$Root\engine\env_loader.py" `
     "$Root\engine\ui_state_bridge.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/engine/"
+
+scp @ssh `
+    "$Root\requirements.txt" `
+    "${Remote}:/home/ubuntu/FutureMathics.ai/"
 
 # main.py imports scripts.run_daily_session.in_market_hours + manus risk/heartbeat
 scp @ssh `
@@ -72,6 +77,7 @@ if ($StopGrade) {
     $remoteCmd += "echo Leaving futuremathics_grade as-is use -StopGrade to cut over"
 }
 $remoteCmd += @(
+    "python3 -m pip install --user -q 'databento>=0.45.0,<1.0.0' || sudo python3 -m pip install -q 'databento>=0.45.0,<1.0.0' || true",
     "sudo systemctl enable futuremathics_virtue",
     "sudo systemctl restart futuremathics_virtue",
     "sudo systemctl restart futuremathics_dashboard || true",

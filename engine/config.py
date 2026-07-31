@@ -162,19 +162,25 @@ FORWARD_TEST_MAINTENANCE_START_HOUR = 17  # 5:00 PM ET (daily break start)
 FORWARD_TEST_MAINTENANCE_END_HOUR = 18     # 6:00 PM ET (daily break end)
 FORWARD_TEST_TIMEZONE = "America/New_York"
 
-# Virtue live / paper session: cash Regular Trading Hours only (Alpaca SPY live).
-# Avoids evening / weekend MES gap risk when decisions are SPY-proxied.
-VIRTUE_RTH_ONLY = True
+# Virtue session hours:
+# - Alpaca SPY proxy → cash RTH only (no overnight SPY-proxy guesses)
+# - Databento CME MES primary → full CME session (overnight OK); see virtue_rth_only()
+VIRTUE_RTH_ONLY = True  # default when Alpaca is primary; overridden when Databento primary
 VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
-VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET
+VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET (RTH mode)
 VIRTUE_RTH_CLOSE_MINUTE = 0
-# No new entries after 3:00 PM ET (manage/exit only — avoid late-day chase + RTH flatten losers).
+# RTH mode: no new entries after 3:00 PM ET (manage/exit only).
 VIRTUE_NO_NEW_ENTRY_HOUR = 15
 VIRTUE_NO_NEW_ENTRY_MINUTE = 0
-# Outside RTH: retry flatten until flat (or attempts exhausted).
+# CME mode: no new entries in last 15 minutes before 5:00 PM ET maintenance.
+VIRTUE_CME_NO_NEW_ENTRY_HOUR = 16
+VIRTUE_CME_NO_NEW_ENTRY_MINUTE = 45
+# Outside session: retry flatten until flat (or attempts exhausted).
 VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
+# Databento quote staleness ceiling (seconds)
+DATABENTO_MAX_QUOTE_AGE_S = 5.0
 # Hysteresis bands — enter early on clear turn; hold through mid-band; never chase the end.
 # Wisdom: right action @ right time (55/45), not late confirmation (58+) after the move is done.
 VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP >= this to ENTER long from flat
@@ -227,6 +233,37 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def databento_api_key() -> str:
+    return _env_str("DATABENTO_API_KEY")
+
+
+def databento_configured() -> bool:
+    return bool(databento_api_key())
+
+
+def primary_data_source() -> str:
+    """
+    Resolve primary market-data source.
+    FM_DATA_SOURCE=databento|alpaca|auto (default auto → databento if key set).
+    """
+    forced = os.getenv("FM_DATA_SOURCE", "auto").strip().lower()
+    if forced in {"databento", "databento_mes", "cme"}:
+        return "databento"
+    if forced in {"alpaca", "alpaca_spy", "alpaca_spy_mes_proxy", "spy"}:
+        return "alpaca"
+    # auto
+    if databento_configured():
+        return "databento"
+    return "alpaca"
+
+
+def virtue_rth_only() -> bool:
+    """True → cash RTH gate; False → full CME hours (Databento primary)."""
+    if primary_data_source() == "databento":
+        return False
+    return bool(VIRTUE_RTH_ONLY)
 
 
 def forward_test_force_paper() -> bool:

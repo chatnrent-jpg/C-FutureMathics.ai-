@@ -24,14 +24,16 @@ from engine.config import (
     FORWARD_TEST_MARKET_OPEN_MINUTE,
     FORWARD_TEST_TIMEZONE,
     HANDSHAKE_EQUITY_BASE,
+    VIRTUE_CME_NO_NEW_ENTRY_HOUR,
+    VIRTUE_CME_NO_NEW_ENTRY_MINUTE,
     VIRTUE_NO_NEW_ENTRY_HOUR,
     VIRTUE_NO_NEW_ENTRY_MINUTE,
     VIRTUE_RTH_CLOSE_HOUR,
     VIRTUE_RTH_CLOSE_MINUTE,
-    VIRTUE_RTH_ONLY,
     VIRTUE_RTH_OPEN_HOUR,
     VIRTUE_RTH_OPEN_MINUTE,
     forward_test_force_paper,
+    virtue_rth_only,
 )
 from engine.futures_broker_adapter import FuturesBrokerAdapter
 from engine.futures_orchestrator import FuturesOrchestrator, OrchestratorConfig
@@ -87,8 +89,8 @@ def in_rth_hours(now: datetime | None = None) -> bool:
 
 
 def virtue_session_open(now: datetime | None = None) -> bool:
-    """Session gate for virtue main: RTH-only when enabled, else CME hours."""
-    if VIRTUE_RTH_ONLY:
+    """Session gate for virtue main: RTH-only (Alpaca) or full CME hours (Databento)."""
+    if virtue_rth_only():
         return in_rth_hours(now)
     return in_market_hours(now)
 
@@ -96,14 +98,22 @@ def virtue_session_open(now: datetime | None = None) -> bool:
 def virtue_entries_allowed(now: datetime | None = None) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
-    After VIRTUE_NO_NEW_ENTRY_* (default 15:00 ET) manage/exit only —
-    blocks late-day chase entries that get flattened at 16:00.
+
+    - RTH mode (Alpaca): after VIRTUE_NO_NEW_ENTRY_* (default 15:00 ET) manage/exit only.
+    - CME mode (Databento): overnight OK; block last 15 minutes before 5:00 PM ET maintenance.
     """
     if not virtue_session_open(now):
         return False
     dt = (now or datetime.now(TZ)).astimezone(TZ)
-    cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
-    return dt.time() < cutoff
+    if virtue_rth_only():
+        cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
+        return dt.time() < cutoff
+    # CME: Mon–Fri block 16:45–17:00 (pre-maintenance); overnight otherwise open.
+    if dt.weekday() < 5:
+        cme_cutoff = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
+        if dt.time() >= cme_cutoff:
+            return False
+    return True
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
     ensure_boot_system_state()

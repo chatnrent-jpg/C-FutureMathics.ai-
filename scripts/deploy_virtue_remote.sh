@@ -21,11 +21,22 @@ scp -i "$KEY" -o StrictHostKeyChecking=no \
 
 scp -i "$KEY" -o StrictHostKeyChecking=no \
   "$ROOT_LOCAL/engine/alpaca_spy_feed.py" \
+  "$ROOT_LOCAL/engine/databento_mes_feed.py" \
   "$ROOT_LOCAL/engine/webull_clients.py" \
   "$ROOT_LOCAL/engine/webull_openapi.py" \
   "$ROOT_LOCAL/engine/config.py" \
+  "$ROOT_LOCAL/engine/env_loader.py" \
+  "$ROOT_LOCAL/engine/ui_state_bridge.py" \
   "$ROOT_LOCAL/engine/futures_broker_adapter.py" \
   "$REMOTE:/home/ubuntu/FutureMathics.ai/engine/"
+
+scp -i "$KEY" -o StrictHostKeyChecking=no \
+  "$ROOT_LOCAL/scripts/run_daily_session.py" \
+  "$REMOTE:/home/ubuntu/FutureMathics.ai/scripts/"
+
+scp -i "$KEY" -o StrictHostKeyChecking=no \
+  "$ROOT_LOCAL/requirements.txt" \
+  "$REMOTE:/home/ubuntu/FutureMathics.ai/"
 
 scp -i "$KEY" -o StrictHostKeyChecking=no \
   "$ROOT_LOCAL/deploy/systemd/futuremathics_virtue.service" \
@@ -35,14 +46,13 @@ ssh -i "$KEY" -o StrictHostKeyChecking=no "$REMOTE" bash -s <<'EOF'
 set -euo pipefail
 sudo cp /tmp/futuremathics_virtue.service /etc/systemd/system/futuremathics_virtue.service
 sudo systemctl daemon-reload
-# Keep grade path stopped when promoting virtue (optional — comment out to run both)
-# sudo systemctl stop futuremathics_grade || true
-# sudo systemctl disable futuremathics_grade || true
+# Ensure Databento client is installed for CME MES L1
+python3 -m pip install --user -q 'databento>=0.45.0,<1.0.0' || sudo python3 -m pip install -q 'databento>=0.45.0,<1.0.0' || true
 sudo systemctl enable futuremathics_virtue
 sudo systemctl restart futuremathics_virtue
-sleep 3
+sleep 4
 systemctl is-active futuremathics_virtue
-sudo journalctl -u futuremathics_virtue -n 30 --no-pager
+sudo journalctl -u futuremathics_virtue -n 40 --no-pager
 EOF
 
 echo "Done."

@@ -390,27 +390,49 @@ async def _heartbeat_probe(broker: VirtueBroker) -> tuple[bool, str]:
         return False, str(exc)
 
 
-async def seed_wisdom_from_alpaca(session: VirtueSession, *, limit: int = 120) -> int:
-    """Warm WisdomStrategy with Alpaca SPY→MES proxy bars so ATR/ADX are ready."""
-    try:
-        spy_bars = await session.broker.data.fetch_spy_bars(timeframe="5Min", limit=limit)
-    except Exception as exc:
-        logger.exception("alpaca_bar_seed_failed err=%s", exc)
-        return 0
-    mes_bars = session.broker.data.mes_proxy_bars_from_spy(spy_bars)
-    bars = [
-        Bar(high=float(b["high"]), low=float(b["low"]), close=float(b["close"]))
-        for b in mes_bars
-    ]
+async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -> int:
+    """Warm WisdomStrategy from Databento MES bars (preferred) or Alpaca SPY→MES proxy."""
+    bars: list[Bar] = []
+    seed_src = "none"
+    mes_data = getattr(session.broker, "mes_data", None)
+    if mes_data is not None and mes_data.is_configured():
+        try:
+            raw = await mes_data.fetch_ohlcv_bars(timeframe="1m", limit=limit, lookback_hours=36)
+            ohlc = mes_data.bars_as_strategy_ohlc(raw)
+            bars = [
+                Bar(high=float(b["high"]), low=float(b["low"]), close=float(b["close"]))
+                for b in ohlc
+            ]
+            if bars:
+                seed_src = "databento_mes"
+                session.last_data_source = "databento_mes"
+        except Exception as exc:
+            logger.exception("databento_bar_seed_failed err=%s", exc)
+
     if not bars:
-        logger.warning("alpaca_bar_seed empty — Wisdom stays in WARMUP until live ticks accumulate")
+        try:
+            spy_bars = await session.broker.data.fetch_spy_bars(timeframe="5Min", limit=limit)
+            mes_bars = session.broker.data.mes_proxy_bars_from_spy(spy_bars)
+            bars = [
+                Bar(high=float(b["high"]), low=float(b["low"]), close=float(b["close"]))
+                for b in mes_bars
+            ]
+            if bars:
+                seed_src = "alpaca_spy_mes_proxy"
+                session.last_data_source = "alpaca_spy_mes_proxy"
+        except Exception as exc:
+            logger.exception("alpaca_bar_seed_failed err=%s", exc)
+            return 0
+
+    if not bars:
+        logger.warning("bar_seed empty — Wisdom stays in WARMUP until live ticks accumulate")
         return 0
     session.strategy.seed(bars)
-    # Anchor last price from seed
     session.broker._last_price = float(bars[-1].close)
     decision = session.strategy.evaluate()
     logger.info(
-        "WISDOM_SEEDED bars=%s regime=%s action=%s vwap=%.1f twap=%.1f blend=%.1f adx=%.1f",
+        "WISDOM_SEEDED src=%s bars=%s regime=%s action=%s vwap=%.1f twap=%.1f blend=%.1f adx=%.1f",
+        seed_src,
         len(bars),
         decision.regime.value,
         decision.action.value,
@@ -420,6 +442,11 @@ async def seed_wisdom_from_alpaca(session: VirtueSession, *, limit: int = 120) -
         decision.adx,
     )
     return len(bars)
+
+
+# Backward-compatible alias
+async def seed_wisdom_from_alpaca(session: VirtueSession, *, limit: int = 120) -> int:
+    return await seed_wisdom_from_market(session, limit=limit)
 
 
 async def _survive_outage(session: VirtueSession, reason: str) -> bool:
@@ -552,17 +579,20 @@ async def _rth_gate_or_flatten(
 ) -> bool:
     """
     Return True if trading cycle may continue.
-    Outside RTH: flatten residual risk and return False (Temperance — no gap).
+    Outside session (RTH or CME): flatten residual risk and return False (Temperance).
     """
     if ignore_hours or virtue_session_open():
         return True
-    session.last_regime = "OUTSIDE_RTH"
-    session.last_signal_reason = "rth_only_stand_aside"
+    session.last_regime = "OUTSIDE_SESSION"
+    session.last_signal_reason = "outside_session_stand_aside"
     _, net_size = session.broker.net_exposure()
     if net_size > 0:
-        await _flatten_until_flat(session, stop_ticks=stop_ticks, reason="rth_close_flatten")
+        await _flatten_until_flat(session, stop_ticks=stop_ticks, reason="session_close_flatten")
     else:
-        logger.info("CYCLE %s outside_RTH — stand aside (Alpaca SPY / gap avoidance)", session.cycle)
+        logger.info(
+            "CYCLE %s outside_session — stand aside (CME closed / maintenance or RTH-only mode)",
+            session.cycle,
+        )
     session.last_action = "FLAT"
     return False
 
@@ -583,8 +613,8 @@ async def run_cycle(
     if session.entry_cooldown_cycles > 0:
         session.entry_cooldown_cycles -= 1
 
-    # Cash RTH only (Alpaca SPY live): Mon–Fri 9:30–16:00 ET.
-    # Outside RTH → flatten any residual risk (Temperance: no overnight/weekend gaps).
+    # Session gate: RTH-only when Alpaca primary; full CME hours when Databento primary.
+    # Outside session → flatten residual risk (Temperance).
     if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
         return
 
@@ -947,7 +977,7 @@ async def run_cycle(
     # Temperance: last 15 min of RTH — manage/exit only, no new overnight risk.
     if not ignore_hours and not virtue_entries_allowed():
         logger.info(
-            "CYCLE %s no_new_entry_cutoff — manage/exit only (gap avoidance before 16:00 flatten)",
+            "CYCLE %s no_new_entry_cutoff — manage/exit only (pre-close / pre-maintenance)",
             session.cycle,
         )
         session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
@@ -1219,9 +1249,9 @@ async def run_loop(
     except Exception as exc:
         logger.exception("boot_reconcile_failed err=%s", exc)
 
-    # Seed Wisdom from Alpaca history
+    # Seed Wisdom from Databento MES (preferred) or Alpaca SPY proxy history
     try:
-        await seed_wisdom_from_alpaca(session)
+        await seed_wisdom_from_market(session)
     except Exception as exc:
         logger.exception("boot_seed_failed err=%s", exc)
 

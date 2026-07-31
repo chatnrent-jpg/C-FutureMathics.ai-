@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Test cash RTH gate used by virtue loop."""
+"""Test cash RTH gate used by virtue loop (Alpaca / RTH-only mode)."""
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,10 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Force Alpaca/RTH mode so these assertions stay stable regardless of local Databento keys.
+os.environ.pop("DATABENTO_API_KEY", None)
+os.environ["FM_DATA_SOURCE"] = "alpaca"
 
 from scripts.run_daily_session import in_rth_hours, virtue_session_open
 

@@ -6,4 +6,5 @@ numpy>=1.26.0,<3.0.0
 pandas>=2.1.0,<3.0.0
 streamlit>=1.32.0,<2.0.0
 requests>=2.31.0,<3.0.0
+databento>=0.45.0,<1.0.0
 # Phase 2 live broker: tradovate-api or ib_insync
