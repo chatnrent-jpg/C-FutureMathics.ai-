@@ -560,6 +560,32 @@ def test_load_persisted_day_bucket_same_day_only(tmp_path) -> None:
     assert other["realized_pnl_today"] == 0.0
 
 
+def test_paper_book_survives_system_state_wipe_to_starting_nav(tmp_path, monkeypatch) -> None:
+    """Friday gains in paper_book.json must not vanish when system_state snaps to $15k."""
+    import json
+    from engine import ui_state_bridge as bridge
+
+    data = tmp_path
+    monkeypatch.setattr(bridge, "_data_dir", lambda: data)
+    # Durable ledger has compounded equity
+    bridge.save_paper_book(15_531.40, peak_equity=15_600.0, source="test")
+    # Dashboard/state file looks "reset"
+    (data / "system_state.json").write_text(
+        json.dumps(
+            {
+                "book_equity": 15_000.0,
+                "account_nav": 15_000.0,
+                "session": {"session_date_et": "2026-08-01", "realized_pnl_today": 0.0, "trades_today": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert bridge.load_persisted_book_equity(15_000.0) == 15_531.40
+    ledger = bridge.load_paper_book(15_000.0)
+    assert ledger["restored"] is True
+    assert ledger["book_equity"] == 15_531.40
+
+
 def test_take_profit_independent_of_signal_side() -> None:
     """TP must fire from open PnL even if signal has flipped opposite."""
     from broker import VirtueBroker
@@ -676,5 +702,6 @@ if __name__ == "__main__":
     test_weighted_avg_entry()
     test_capital_drag_allows_irreducible_1_mes()
     test_credit_pnl_updates_paper_book_only()
+    test_load_persisted_day_bucket_same_day_only()
     test_session_day_roll_clears_yesterdays_profit_lock()
     print("ALL VIRTUE BRAIN TESTS PASSED")

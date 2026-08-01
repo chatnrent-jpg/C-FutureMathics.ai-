@@ -10,6 +10,8 @@
 
 # --- Runtime / crash-recovery state (local only) ---
 data/system_state.json
+data/paper_book.json
+data/paper_book.json.tmp
 
 # --- Generated performance & simulation exports ---
 reports/

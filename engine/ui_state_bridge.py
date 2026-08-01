@@ -103,11 +103,100 @@ def build_system_state(orchestrator: Any, last_price: float | None = None) -> di
     }
 
 
+def _data_dir() -> Any:
+    from pathlib import Path
+
+    return Path(__file__).resolve().parent.parent / "data"
+
+
+def paper_book_path() -> Any:
+    return _data_dir() / "paper_book.json"
+
+
+def _atomic_write_json(path: Any, payload: dict[str, Any]) -> None:
+    from pathlib import Path
+    import json
+    import os
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def load_paper_book(default: float | None = None) -> dict[str, Any]:
+    """
+    Durable compounded paper book (Justice).
+
+    Lives in data/paper_book.json — never wiped by day-roll, dashboard bootstrap,
+    or a bad system_state.json rewrite. This is why Friday gains must survive Saturday.
+    """
+    from pathlib import Path
+    import json
+    import logging
+
+    log = logging.getLogger("virtue.ui_state")
+    base = float(default if default is not None else STARTING_NAV)
+    empty = {
+        "book_equity": base,
+        "peak_equity": base,
+        "updated_at": "",
+        "source": "default",
+        "restored": False,
+    }
+    path = paper_book_path()
+    try:
+        if path.is_file():
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            book = float(raw.get("book_equity") or 0.0)
+            if book > 0:
+                peak = float(raw.get("peak_equity") or book)
+                return {
+                    "book_equity": round(book, 2),
+                    "peak_equity": round(max(peak, book), 2),
+                    "updated_at": str(raw.get("updated_at") or ""),
+                    "source": "paper_book.json",
+                    "restored": True,
+                }
+    except Exception as exc:
+        log.exception("load_paper_book_failed err=%s", exc)
+    return empty
+
+
+def save_paper_book(
+    book_equity: float,
+    *,
+    peak_equity: float | None = None,
+    source: str = "virtue",
+) -> None:
+    """Persist compounded book equity atomically (Temperance — protect principal record)."""
+    import logging
+
+    log = logging.getLogger("virtue.ui_state")
+    book = round(float(book_equity), 2)
+    if book <= 0:
+        return
+    try:
+        prev = load_paper_book(book)
+        peak = float(peak_equity) if peak_equity is not None else float(prev.get("peak_equity") or book)
+        peak = round(max(peak, book, float(prev.get("book_equity") or 0.0)), 2)
+        payload = {
+            "book_equity": book,
+            "peak_equity": peak,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "source": str(source or "virtue"),
+        }
+        _atomic_write_json(paper_book_path(), payload)
+    except Exception as exc:
+        log.exception("save_paper_book_failed err=%s", exc)
+
+
 def ensure_boot_system_state(path: Any = None) -> None:
     from pathlib import Path
     import json
 
-    state_path = Path(path) if path else Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    state_path = Path(path) if path else _data_dir() / "system_state.json"
     if state_path.exists():
         try:
             raw = json.loads(state_path.read_text(encoding="utf-8"))
@@ -115,17 +204,19 @@ def ensure_boot_system_state(path: Any = None) -> None:
                 return
         except Exception:
             pass
-    equity = HANDSHAKE_EQUITY_BASE
+    # Prefer durable paper book over handshake default (never invent a wipe to $15k).
+    equity = float(load_paper_book(HANDSHAKE_EQUITY_BASE).get("book_equity") or HANDSHAKE_EQUITY_BASE)
     payload = {
         "version": 1,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "symbol": "MES",
         "account_nav": equity,
+        "book_equity": equity,
         "session": {"realized_pnl_today": 0.0, "cycle_count": 0, "trades_today": 0, "halted": False},
         "open_positions": [],
         "dashboard": {
             "account_nav": equity,
-            "starting_nav": equity,
+            "starting_nav": HANDSHAKE_EQUITY_BASE,
             "daily_pnl": 0.0,
             "boot_status": "starting",
             "mode": "PAPER",
@@ -133,7 +224,7 @@ def ensure_boot_system_state(path: Any = None) -> None:
     }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"[CELINE] Boot state seeded — handshake equity ${equity:,.2f}", flush=True)
+    print(f"[CELINE] Boot state seeded — book equity ${equity:,.2f}", flush=True)
 
 
 def build_virtue_system_state(
@@ -288,38 +379,74 @@ def persist_virtue_system_state(session: Any, **kwargs: Any) -> None:
     import logging
 
     log = logging.getLogger("virtue.ui_state")
-    state_path = Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    state_path = _data_dir() / "system_state.json"
     try:
         payload = build_virtue_system_state(session, **kwargs)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Mirror compounded equity into the durable ledger (survives day-roll / UI rewrites).
+        broker = getattr(session, "broker", None)
+        book = float(getattr(broker, "equity", 0.0) or 0.0)
+        if book > 0:
+            peak = float(getattr(getattr(session, "risk", None), "peak_nav", book) or book)
+            save_paper_book(book, peak_equity=peak, source="system_state_persist")
     except Exception as exc:
         log.exception("persist_virtue_system_state_failed err=%s", exc)
 
 
 def load_persisted_book_equity(default: float | None = None) -> float:
     """
-    Load compounded paper/live book equity from system_state.json.
-    Falls back to account_nav − unrealized, then STARTING_NAV.
+    Load compounded paper book equity.
+
+    Order (Justice — never invent a wipe to STARTING_NAV when a higher truth exists):
+      0) PAPER_BOOK_EQUITY env (manual recovery of a known good book)
+      1) data/paper_book.json (durable ledger)
+      2) data/system_state.json book_equity / account_nav
+      3) default STARTING_NAV
+
+    Exactly-default system_state values are NOT sealed into the ledger (avoids
+    locking in a wiped $15k dashboard after a bad rewrite).
     """
-    from pathlib import Path
     import json
     import logging
+    import os
+    from pathlib import Path
 
     log = logging.getLogger("virtue.ui_state")
     base = float(default if default is not None else STARTING_NAV)
-    state_path = Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+
+    forced = os.getenv("PAPER_BOOK_EQUITY", "").strip()
+    if forced:
+        try:
+            val = round(float(forced), 2)
+            if val > 0:
+                save_paper_book(val, source="env_PAPER_BOOK_EQUITY")
+                return val
+        except ValueError:
+            log.error("PAPER_BOOK_EQUITY invalid value=%r", forced)
+
+    ledger = load_paper_book(base)
+    if ledger.get("restored") and float(ledger.get("book_equity") or 0.0) > 0:
+        return round(float(ledger["book_equity"]), 2)
+
+    state_path = _data_dir() / "system_state.json"
     try:
-        if not state_path.is_file():
-            return base
-        raw = json.loads(state_path.read_text(encoding="utf-8"))
-        book = float(raw.get("book_equity") or 0.0)
-        if book > 0:
-            return round(book, 2)
-        nav = float(raw.get("account_nav") or 0.0)
-        unreal = float(raw.get("unrealized_pnl") or 0.0)
-        if nav > 0:
-            return round(max(base, nav - unreal), 2)
+        if state_path.is_file():
+            raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            book = float(raw.get("book_equity") or 0.0)
+            if book > 0:
+                # Migrate only non-default books — a wiped $15k state must not seal the ledger.
+                if abs(book - base) > 0.009:
+                    save_paper_book(book, source="migrate_system_state")
+                return round(book, 2)
+            nav = float(raw.get("account_nav") or 0.0)
+            unreal = float(raw.get("unrealized_pnl") or 0.0)
+            if nav > 0:
+                migrated = round(nav - unreal, 2)
+                if migrated > 0 and abs(migrated - base) > 0.009:
+                    save_paper_book(migrated, source="migrate_system_state_nav")
+                    return migrated
+                return round(max(base, migrated), 2) if migrated > 0 else base
     except Exception as exc:
         log.exception("load_persisted_book_equity_failed err=%s", exc)
     return base
@@ -429,8 +556,11 @@ __all__ = [
     "build_system_state",
     "build_virtue_system_state",
     "ensure_boot_system_state",
+    "load_paper_book",
     "load_persisted_book_equity",
     "load_persisted_day_bucket",
     "load_persisted_open_positions",
+    "paper_book_path",
     "persist_virtue_system_state",
+    "save_paper_book",
 ]

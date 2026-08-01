@@ -74,10 +74,12 @@ _ET = ZoneInfo(FORWARD_TEST_TIMEZONE)
 from manus.capital_protection import CapitalProtectionMatrix, RiskVerdict
 from manus.heartbeat import BrokerHeartbeatAgent, HeartbeatState
 from engine.ui_state_bridge import (
+    load_paper_book,
     load_persisted_book_equity,
     load_persisted_day_bucket,
     load_persisted_open_positions,
     persist_virtue_system_state,
+    save_paper_book,
 )
 from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
 from strategy import Bar, SignalAction, WisdomStrategy
@@ -221,7 +223,14 @@ def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
     session.realized_pnl_today = round(session.realized_pnl_today + delta, 2)
     if abs(delta) >= 1e-12 and _local_paper_book():
         session.broker.update_equity(round(float(session.broker.equity) + delta, 2))
+        # Durable ledger — day-roll / weekend / dashboard bootstrap must not erase gains.
+        save_paper_book(
+            float(session.broker.equity),
+            peak_equity=float(session.risk.peak_nav),
+            source="credit_realized_pnl",
+        )
     session.risk.update_nav(session.broker.equity)
+    session.risk.peak_nav = max(float(session.risk.peak_nav), float(session.broker.equity))
 
 
 
@@ -1235,11 +1244,22 @@ async def run_loop(
     ignore_hours: bool,
 ) -> None:
     session = VirtueSession()
-    # Compounded book equity + open paper positions persist across restarts.
+    # Compounded book equity + open paper positions persist across restarts / weekends.
+    ledger = load_paper_book(STARTING_NAV)
     book = load_persisted_book_equity(STARTING_NAV)
     session.broker.update_equity(book)
     session.risk.update_nav(book)
-    session.risk.peak_nav = max(float(session.risk.peak_nav), book)
+    peak = max(float(ledger.get("peak_equity") or book), book)
+    session.risk.peak_nav = max(float(session.risk.peak_nav), peak)
+    # Seal durable ledger when we have a real restored/migrated book — not a wiped $15k default.
+    if bool(ledger.get("restored")) or abs(float(book) - float(STARTING_NAV)) > 0.009:
+        save_paper_book(book, peak_equity=peak, source="boot_restore")
+    logger.info(
+        "BOOT restored_paper_book equity=%.2f peak=%.2f source=%s",
+        book,
+        peak,
+        ledger.get("source") if ledger.get("restored") else "system_state_or_default",
+    )
     restored = load_persisted_open_positions()
     if restored:
         session.broker.open_positions = list(restored)
