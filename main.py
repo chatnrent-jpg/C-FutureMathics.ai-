@@ -68,6 +68,8 @@ from engine.config import (
     VIRTUE_TICK_POLL_S,
     fixed_fractional_risk_pct,
     forward_test_force_paper,
+    primary_data_source,
+    virtue_session_mode,
 )
 
 _ET = ZoneInfo(FORWARD_TEST_TIMEZONE)
@@ -81,7 +83,11 @@ from engine.ui_state_bridge import (
     persist_virtue_system_state,
     save_paper_book,
 )
-from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
+from scripts.run_daily_session import (
+    virtue_entries_allowed,
+    virtue_session_label,
+    virtue_session_open,
+)
 from strategy import Bar, SignalAction, WisdomStrategy
 
 logging.basicConfig(
@@ -626,8 +632,9 @@ async def _rth_gate_or_flatten(
         await _flatten_until_flat(session, stop_ticks=stop_ticks, reason="session_close_flatten")
     else:
         logger.info(
-            "CYCLE %s outside_session — stand aside (CME closed / maintenance or RTH-only mode)",
+            "CYCLE %s outside_session — stand aside (%s)",
             session.cycle,
+            virtue_session_label(),
         )
     session.last_action = "FLAT"
     return False
@@ -1281,11 +1288,14 @@ async def run_loop(
             session.trades_today,
         )
     logger.info(
-        "VIRTUE LOOP start equity=%.2f symbol=%s position_tp=$%.0f position_sl=$%.0f "
-        "day_lock=$%.0f exit_cooldown=%s long_enter=%.1f short_enter=%.1f "
-        "long_exit=%.1f short_exit=%.1f streak=%s anchor_div_atr=%.1f network_timeout=%.1fs",
+        "VIRTUE LOOP start equity=%.2f symbol=%s session_mode=%s data_source=%s "
+        "position_tp=$%.0f position_sl=$%.0f day_lock=$%.0f exit_cooldown=%s "
+        "long_enter=%.1f short_enter=%.1f long_exit=%.1f short_exit=%.1f "
+        "streak=%s anchor_div_atr=%.1f network_timeout=%.1fs | %s",
         session.broker.equity,
         EXECUTION_SYMBOL,
+        virtue_session_mode().upper(),
+        primary_data_source(),
         float(VIRTUE_POSITION_TP_DOLLARS),
         float(VIRTUE_POSITION_STOP_DOLLARS),
         float(GRADE_DAILY_PROFIT_LOCK),
@@ -1297,6 +1307,7 @@ async def run_loop(
         int(VIRTUE_REQUIRED_STREAK),
         float(VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT),
         NETWORK_TIMEOUT_S,
+        virtue_session_label(),
     )
 
     # Boot reconcile (Webull absolute truth — including equity=0)

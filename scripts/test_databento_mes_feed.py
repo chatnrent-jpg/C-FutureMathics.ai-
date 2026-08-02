@@ -19,21 +19,32 @@ def test_primary_data_source_auto_and_forced(monkeypatch) -> None:
     from engine import config as cfg
 
     monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
+    monkeypatch.delenv("VIRTUE_SESSION_MODE", raising=False)
     monkeypatch.setenv("FM_DATA_SOURCE", "auto")
     assert cfg.primary_data_source() == "alpaca"
+    assert cfg.virtue_session_mode() == "rth"
     assert cfg.virtue_rth_only() is True
 
     monkeypatch.setenv("DATABENTO_API_KEY", "db-test-key")
     monkeypatch.setenv("FM_DATA_SOURCE", "auto")
     assert cfg.primary_data_source() == "databento"
+    assert cfg.virtue_session_mode() == "cme"
     assert cfg.virtue_rth_only() is False
 
     monkeypatch.setenv("FM_DATA_SOURCE", "alpaca")
     assert cfg.primary_data_source() == "alpaca"
+    assert cfg.virtue_session_mode() == "rth"
     assert cfg.virtue_rth_only() is True
 
     monkeypatch.setenv("FM_DATA_SOURCE", "databento")
     assert cfg.primary_data_source() == "databento"
+    assert cfg.virtue_session_mode() == "cme"
+    assert cfg.virtue_rth_only() is False
+
+    # Explicit session override wins (e.g. force CME even while debugging feeds)
+    monkeypatch.setenv("FM_DATA_SOURCE", "alpaca")
+    monkeypatch.setenv("VIRTUE_SESSION_MODE", "cme")
+    assert cfg.virtue_session_mode() == "cme"
     assert cfg.virtue_rth_only() is False
 
 
@@ -63,8 +74,13 @@ def test_cached_quote_rejects_stale() -> None:
 def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     monkeypatch.setenv("DATABENTO_API_KEY", "db-test-key")
     monkeypatch.setenv("FM_DATA_SOURCE", "databento")
-    # Reload helpers that close over config at import time — call functions fresh
-    from scripts.run_daily_session import in_market_hours, virtue_entries_allowed, virtue_session_open
+    monkeypatch.setenv("VIRTUE_SESSION_MODE", "cme")
+    from scripts.run_daily_session import (
+        in_market_hours,
+        virtue_entries_allowed,
+        virtue_session_label,
+        virtue_session_open,
+    )
 
     tz = ZoneInfo("America/New_York")
     # Sunday evening CME open — session open, entries allowed
@@ -72,6 +88,10 @@ def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     assert in_market_hours(sun) is True
     assert virtue_session_open(sun) is True
     assert virtue_entries_allowed(sun) is True
+
+    # Sunday just before Globex open — closed
+    sun_pre = datetime(2026, 7, 26, 17, 59, tzinfo=tz)
+    assert virtue_session_open(sun_pre) is False
 
     # Monday 16:30 — session open, entries still allowed
     mon_ok = datetime(2026, 7, 27, 16, 30, tzinfo=tz)
@@ -88,9 +108,16 @@ def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     assert virtue_session_open(mon_maint) is False
     assert virtue_entries_allowed(mon_maint) is False
 
+    # After maintenance reopen — overnight session
+    mon_overnight = datetime(2026, 7, 27, 18, 5, tzinfo=tz)
+    assert virtue_session_open(mon_overnight) is True
+    assert virtue_entries_allowed(mon_overnight) is True
+    assert "CME_GLOBEX" in virtue_session_label()
+
 
 def test_rth_mode_still_blocks_overnight(monkeypatch) -> None:
     monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
+    monkeypatch.delenv("VIRTUE_SESSION_MODE", raising=False)
     monkeypatch.setenv("FM_DATA_SOURCE", "alpaca")
     from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
 

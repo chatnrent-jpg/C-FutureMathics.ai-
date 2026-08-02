@@ -165,9 +165,10 @@ FORWARD_TEST_MAINTENANCE_END_HOUR = 18     # 6:00 PM ET (daily break end)
 FORWARD_TEST_TIMEZONE = "America/New_York"
 
 # Virtue session hours:
-# - Alpaca SPY proxy → cash RTH only (no overnight SPY-proxy guesses)
-# - Databento CME MES primary → full CME session (overnight OK); see virtue_rth_only()
-VIRTUE_RTH_ONLY = True  # default when Alpaca is primary; overridden when Databento primary
+# - Databento CME MES primary → full Globex timetable (Sun 18:00 – Fri 17:00 ET)
+# - Alpaca SPY proxy fallback → cash RTH only (no overnight proxy guesses)
+# Override with VIRTUE_SESSION_MODE=cme|rth|auto (default auto → follow data source)
+VIRTUE_RTH_ONLY = True  # used only when session mode resolves to RTH (Alpaca)
 VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
 VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET (RTH mode)
@@ -175,7 +176,7 @@ VIRTUE_RTH_CLOSE_MINUTE = 0
 # RTH mode: allow trend continuation into the afternoon; cut new entries 15m before 4:00 flatten.
 VIRTUE_NO_NEW_ENTRY_HOUR = 15
 VIRTUE_NO_NEW_ENTRY_MINUTE = 45
-# CME mode: no new entries in last 15 minutes before 5:00 PM ET maintenance.
+# CME Globex: no new entries in last 15 minutes before 5:00 PM ET daily maintenance.
 VIRTUE_CME_NO_NEW_ENTRY_HOUR = 16
 VIRTUE_CME_NO_NEW_ENTRY_MINUTE = 45
 # Outside session: retry flatten until flat (or attempts exhausted).
@@ -270,9 +271,25 @@ def primary_data_source() -> str:
     return "alpaca"
 
 
+def virtue_session_mode() -> str:
+    """
+    Trading timetable: 'cme' (Globex futures) or 'rth' (cash hours).
+
+    VIRTUE_SESSION_MODE=cme|rth|auto
+      auto → CME when Databento is primary, else RTH (Alpaca proxy).
+    """
+    forced = os.getenv("VIRTUE_SESSION_MODE", "auto").strip().lower()
+    if forced in {"cme", "globex", "futures", "overnight"}:
+        return "cme"
+    if forced in {"rth", "cash", "equity"}:
+        return "rth"
+    # auto — follow the live data source (Databento ⇒ CME timetable)
+    return "cme" if primary_data_source() == "databento" else "rth"
+
+
 def virtue_rth_only() -> bool:
-    """True → cash RTH gate; False → full CME hours (Databento primary)."""
-    if primary_data_source() == "databento":
+    """True → cash RTH gate; False → full CME Globex hours."""
+    if virtue_session_mode() == "cme":
         return False
     return bool(VIRTUE_RTH_ONLY)
 
