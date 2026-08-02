@@ -33,7 +33,8 @@ from engine.config import (
     VIRTUE_RTH_OPEN_HOUR,
     VIRTUE_RTH_OPEN_MINUTE,
     forward_test_force_paper,
-    virtue_rth_only,
+    primary_data_source,
+    virtue_session_mode,
 )
 from engine.futures_broker_adapter import FuturesBrokerAdapter
 from engine.futures_orchestrator import FuturesOrchestrator, OrchestratorConfig
@@ -89,33 +90,48 @@ def in_rth_hours(now: datetime | None = None) -> bool:
 
 
 def virtue_session_open(now: datetime | None = None) -> bool:
-    """Session gate for virtue main: RTH-only (Alpaca) or full CME hours (Databento)."""
-    if virtue_rth_only():
-        return in_rth_hours(now)
-    return in_market_hours(now)
+    """
+    Session gate for virtue main.
+
+    CME (Databento): Sun 18:00 ET → Fri 17:00 ET, daily maint 17:00–18:00 ET.
+    RTH (Alpaca fallback): Mon–Fri 09:30–16:00 ET only.
+    """
+    if virtue_session_mode() == "cme":
+        return in_market_hours(now)
+    return in_rth_hours(now)
 
 
 def virtue_entries_allowed(now: datetime | None = None) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
 
-    - RTH mode (Alpaca): after VIRTUE_NO_NEW_ENTRY_* (default 15:45 ET) manage/exit only.
-    - CME mode (Databento): overnight OK; block only last 15 minutes before 5:00 PM ET
-      daily maintenance (Mon–Fri 16:45–17:00). After the 17:00–18:00 break, entries resume.
+    - CME Globex: overnight OK; manage/exit only from 16:45 ET until maintenance.
+    - RTH (Alpaca fallback): after 15:45 ET manage/exit only until 16:00 flatten.
     """
     if not virtue_session_open(now):
         return False
     dt = (now or datetime.now(TZ)).astimezone(TZ)
-    if virtue_rth_only():
-        cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
-        return dt.time() < cutoff
-    # CME: Mon–Fri block ONLY 16:45–17:00 (pre-maintenance). Do NOT blank the overnight session.
-    if dt.weekday() < 5:
-        cme_cutoff = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
-        maint_start = time(FORWARD_TEST_MARKET_CLOSE_HOUR, FORWARD_TEST_MARKET_CLOSE_MINUTE)
-        if cme_cutoff <= dt.time() < maint_start:
-            return False
-    return True
+    if virtue_session_mode() == "cme":
+        # Mon–Fri: manage/exit only in the last 15 minutes before 17:00 maintenance.
+        # After 18:00 Globex reopen, new entries are allowed again (overnight).
+        if dt.weekday() < 5:
+            t = dt.time()
+            cut = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
+            maint_start = time(17, 0)
+            if cut <= t < maint_start:
+                return False
+        return True
+    cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
+    return dt.time() < cutoff
+
+
+def virtue_session_label() -> str:
+    """Human-readable timetable for boot logs / dashboard."""
+    mode = virtue_session_mode()
+    src = primary_data_source()
+    if mode == "cme":
+        return f"CME_GLOBEX data={src} hours=Sun18:00-Fri17:00ET maint=17:00-18:00 entry_cut=16:45"
+    return f"RTH_CASH data={src} hours=Mon-Fri 09:30-16:00ET entry_cut=15:45"
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
     ensure_boot_system_state()

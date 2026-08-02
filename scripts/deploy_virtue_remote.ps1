@@ -37,6 +37,7 @@ if (-not $dbKey) {
         [System.IO.File]::WriteAllLines($tmpEnv, @(
             "DATABENTO_API_KEY=$dbKey"
             "FM_DATA_SOURCE=databento"
+            "VIRTUE_SESSION_MODE=cme"
         ))
         scp @ssh $tmpEnv "${Remote}:/tmp/fm_databento_env.txt"
         scp @ssh "$Root\scripts\merge_remote_env_keys.py" "${Remote}:/tmp/merge_remote_env_keys.py"
@@ -104,15 +105,50 @@ if ($StopGrade) {
 } else {
     $remoteCmd += "echo Leaving futuremathics_grade as-is use -StopGrade to cut over"
 }
+# Enable CME Globex timetable on the host when Databento key is present (no secret echo).
+$cmeEnvPy = @'
+from pathlib import Path
+p = Path("/home/ubuntu/FutureMathics.ai/.env.local")
+text = p.read_text(encoding="utf-8") if p.exists() else ""
+lines = text.splitlines()
+keys = {}
+for line in lines:
+    if "=" in line and not line.strip().startswith("#"):
+        k, _, v = line.partition("=")
+        keys[k.strip()] = v
+if not keys.get("DATABENTO_API_KEY", "").strip():
+    print("WARN: DATABENTO_API_KEY missing in .env.local — still RTH/Alpaca mode")
+else:
+    keys["FM_DATA_SOURCE"] = "databento"
+    keys["VIRTUE_SESSION_MODE"] = "cme"
+    out = []
+    seen = set()
+    for line in lines:
+        if "=" in line and not line.strip().startswith("#"):
+            k = line.split("=", 1)[0].strip()
+            if k in ("FM_DATA_SOURCE", "VIRTUE_SESSION_MODE"):
+                out.append(f"{k}={keys[k]}")
+                seen.add(k)
+                continue
+        out.append(line)
+    for k in ("FM_DATA_SOURCE", "VIRTUE_SESSION_MODE"):
+        if k not in seen:
+            out.append(f"{k}={keys[k]}")
+    p.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    print("CME timetable enabled (FM_DATA_SOURCE=databento VIRTUE_SESSION_MODE=cme)")
+'@
+$cmeEnvB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($cmeEnvPy))
+
 $remoteCmd += @(
     "python3 -m pip install --user -q 'databento>=0.45.0,<1.0.0' || sudo python3 -m pip install -q 'databento>=0.45.0,<1.0.0' || true",
+    "python3 -c `"import base64,pathlib; pathlib.Path('/tmp/fm_cme_env.py').write_bytes(base64.b64decode('$cmeEnvB64'))`" && python3 /tmp/fm_cme_env.py",
     "sudo systemctl enable futuremathics_virtue",
     "sudo systemctl restart futuremathics_virtue",
     "sudo systemctl restart futuremathics_dashboard || true",
     "sleep 4",
     "systemctl is-active futuremathics_virtue",
     "systemctl is-active futuremathics_dashboard",
-    "sudo journalctl -u futuremathics_virtue -n 40 --no-pager"
+    "sudo journalctl -u futuremathics_virtue -n 50 --no-pager"
 )
 ssh @ssh $Remote ($remoteCmd -join " && ")
 

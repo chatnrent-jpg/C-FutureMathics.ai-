@@ -249,7 +249,12 @@ def build_virtue_system_state(
         EXECUTION_SYMBOL,
         VIRTUE_POSITION_STOP_DOLLARS,
         forward_test_force_paper,
+        virtue_session_mode,
     )
+    from scripts.run_daily_session import virtue_session_label
+
+    session_mode = virtue_session_mode()
+    session_label = virtue_session_label()
 
     broker = session.broker
     risk = session.risk
@@ -307,6 +312,8 @@ def build_virtue_system_state(
         "symbol": EXECUTION_SYMBOL,
         "strategy": "virtue_wisdom",
         "data_source": data_source,
+        "session_mode": session_mode,
+        "session_label": session_label,
         "last_price": last_price,
         "unrealized_pnl": unrealized,
         "account_nav": nav,
@@ -340,6 +347,8 @@ def build_virtue_system_state(
             "symbol": EXECUTION_SYMBOL,
             "mode": mode,
             "data_source": data_source,
+            "session_mode": session_mode,
+            "session_label": session_label,
             "daily_pnl": daily_pnl,
             "daily_pnl_pct": round((daily_pnl / max(starting, 1.0)) * 100, 2),
             "unrealized_pnl": unrealized,

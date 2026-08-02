@@ -62,7 +62,6 @@ def _unrealized(positions: list, last_price: float | None) -> float:
 
 st.set_page_config(page_title="FutureMathics", layout="wide")
 st.title("FutureMathics.ai")
-st.caption("MES futures — Virtue Wisdom brain · Manus risk (Alpaca data + Webull execution)")
 
 if os.environ.get("FM_EXTERNAL_ORCHESTRATOR", "").strip().lower() in {"1", "true", "yes"}:
     st.caption("Cloud view — fed by background virtue loop (`system_state.json` poll)")
@@ -82,6 +81,17 @@ if unrealized is None:
     unrealized = _unrealized(positions, float(last_price) if last_price else None)
 
 strategy = str(data.get("strategy") or dash.get("strategy") or "—")
+data_source = str(data.get("data_source") or dash.get("data_source") or "—")
+session_mode = str(data.get("session_mode") or dash.get("session_mode") or "").upper()
+session_label = str(data.get("session_label") or dash.get("session_label") or "")
+if session_mode == "CME" or "databento" in data_source.lower():
+    st.caption("MES futures — Virtue Wisdom · Manus risk · Databento CME Globex + Webull execution")
+elif session_mode == "RTH":
+    st.caption("MES futures — Virtue Wisdom · Manus risk · Alpaca RTH proxy + Webull execution")
+else:
+    st.caption("MES futures — Virtue Wisdom brain · Manus risk (Webull execution)")
+if session_label:
+    st.caption(session_label)
 if age_s is not None and age_s > 30:
     st.warning(
         f"Engine looks idle — last update {int(age_s)}s ago. "
