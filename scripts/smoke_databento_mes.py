@@ -58,10 +58,10 @@ def main() -> int:
         if rows:
             last = rows[-1]
             close = getattr(last, "pretty_close", None) or (float(getattr(last, "close", 0)) * 1e-9)
-            print(f"  last_close≈{float(close):.2f}")
+            print(f"  last_close~={float(close):.2f}")
     except Exception as exc:
         print(f"  historical_FAIL: {type(exc).__name__}: {exc}")
-        print("  → Fix API key / historical entitlement in Databento portal first.")
+        print("  -> Fix API key / historical entitlement in Databento portal first.")
 
     # --- Live probe (needs Standard + activated CME live license) ---
     print("\n[2/2] Live mbp-1 probe (MES.FUT) — 12s...")
@@ -108,13 +108,13 @@ def main() -> int:
             pass
         if not got_quote and not live_err:
             print(f"  live_FAIL: no MBP-1 in 12s (records_seen={n})")
-            print("  → Most common cause: live CME not activated.")
-            print("     Databento portal → Plans and live data → Activate live data for CME / GLBX.MDP3")
+            print("  -> Most common cause: live CME not activated.")
+            print("     Databento portal -> Plans and live data -> Activate live data for CME / GLBX.MDP3")
             print("     Personal use is included with Standard (~$199/mo), but you must complete the license questionnaire.")
             print("     Free historical credits alone do NOT enable Live().")
     except Exception as exc:
         print(f"  live_FAIL: {type(exc).__name__}: {exc}")
-        print("  → If you see Not authorized / AuthFailed: activate CME live license in the portal.")
+        print("  -> If you see Not authorized / AuthFailed: activate CME live license in the portal.")
         return 2
 
     return 0 if got_quote else 2

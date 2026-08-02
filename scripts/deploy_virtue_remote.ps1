@@ -18,6 +18,34 @@ if (-not (Test-Path $Key)) {
 
 $ssh = @("-i", $Key, "-o", "StrictHostKeyChecking=no")
 
+# Ensure AWS .env.local has Databento primary (CME hours). Key travels via scp temp file only.
+Write-Host "Syncing Databento env flags on $Remote ..."
+$localEnv = Join-Path $Root ".env.local"
+$dbKey = ""
+if (Test-Path $localEnv) {
+    foreach ($line in Get-Content $localEnv) {
+        if ($line -match '^\s*DATABENTO_API_KEY=(.+)\s*$') {
+            $dbKey = $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+}
+if (-not $dbKey) {
+    Write-Warning "DATABENTO_API_KEY missing in local .env.local — AWS may stay on Alpaca/RTH hours"
+} else {
+    $tmpEnv = Join-Path $env:TEMP ("fm_databento_env_{0}.txt" -f [guid]::NewGuid().ToString("n"))
+    try {
+        [System.IO.File]::WriteAllLines($tmpEnv, @(
+            "DATABENTO_API_KEY=$dbKey"
+            "FM_DATA_SOURCE=databento"
+        ))
+        scp @ssh $tmpEnv "${Remote}:/tmp/fm_databento_env.txt"
+        scp @ssh "$Root\scripts\merge_remote_env_keys.py" "${Remote}:/tmp/merge_remote_env_keys.py"
+        ssh @ssh $Remote "python3 /tmp/merge_remote_env_keys.py --src /tmp/fm_databento_env.txt --envf /home/ubuntu/FutureMathics.ai/.env.local && rm -f /tmp/merge_remote_env_keys.py /tmp/fm_databento_env.txt"
+    } finally {
+        Remove-Item -Force $tmpEnv -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host "Uploading virtue files to $Remote ..."
 
 scp @ssh `

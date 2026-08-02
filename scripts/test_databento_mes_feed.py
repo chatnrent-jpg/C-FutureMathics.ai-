@@ -78,7 +78,7 @@ def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     assert virtue_session_open(mon_ok) is True
     assert virtue_entries_allowed(mon_ok) is True
 
-    # Monday 16:45 — pre-maintenance cutoff
+    # Monday 16:45 — pre-maintenance cutoff (manage/exit only)
     mon_cut = datetime(2026, 7, 27, 16, 45, tzinfo=tz)
     assert virtue_session_open(mon_cut) is True
     assert virtue_entries_allowed(mon_cut) is False
@@ -87,6 +87,26 @@ def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     mon_maint = datetime(2026, 7, 27, 17, 30, tzinfo=tz)
     assert virtue_session_open(mon_maint) is False
     assert virtue_entries_allowed(mon_maint) is False
+
+    # Monday 18:00 reopen — overnight session; entries allowed again
+    mon_reopen = datetime(2026, 7, 27, 18, 0, tzinfo=tz)
+    assert virtue_session_open(mon_reopen) is True
+    assert virtue_entries_allowed(mon_reopen) is True
+
+    # Tuesday 02:00 ET overnight — still in CME session
+    tue_ow = datetime(2026, 7, 28, 2, 0, tzinfo=tz)
+    assert virtue_session_open(tue_ow) is True
+    assert virtue_entries_allowed(tue_ow) is True
+
+    # Friday 16:50 — pre-weekend close cutoff
+    fri_cut = datetime(2026, 7, 24, 16, 50, tzinfo=tz)
+    assert virtue_session_open(fri_cut) is True
+    assert virtue_entries_allowed(fri_cut) is False
+
+    # Friday 17:05 — weekend closed
+    fri_closed = datetime(2026, 7, 24, 17, 5, tzinfo=tz)
+    assert virtue_session_open(fri_closed) is False
+    assert virtue_entries_allowed(fri_closed) is False
 
 
 def test_rth_mode_still_blocks_overnight(monkeypatch) -> None:

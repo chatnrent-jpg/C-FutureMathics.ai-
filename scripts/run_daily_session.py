@@ -100,7 +100,8 @@ def virtue_entries_allowed(now: datetime | None = None) -> bool:
     True when new LONG/SHORT entries are allowed.
 
     - RTH mode (Alpaca): after VIRTUE_NO_NEW_ENTRY_* (default 15:45 ET) manage/exit only.
-    - CME mode (Databento): overnight OK; block last 15 minutes before 5:00 PM ET maintenance.
+    - CME mode (Databento): overnight OK; block only last 15 minutes before 5:00 PM ET
+      daily maintenance (Mon–Fri 16:45–17:00). After the 17:00–18:00 break, entries resume.
     """
     if not virtue_session_open(now):
         return False
@@ -108,10 +109,11 @@ def virtue_entries_allowed(now: datetime | None = None) -> bool:
     if virtue_rth_only():
         cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
         return dt.time() < cutoff
-    # CME: Mon–Fri block 16:45–17:00 (pre-maintenance); overnight otherwise open.
+    # CME: Mon–Fri block ONLY 16:45–17:00 (pre-maintenance). Do NOT blank the overnight session.
     if dt.weekday() < 5:
         cme_cutoff = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
-        if dt.time() >= cme_cutoff:
+        maint_start = time(FORWARD_TEST_MARKET_CLOSE_HOUR, FORWARD_TEST_MARKET_CLOSE_MINUTE)
+        if cme_cutoff <= dt.time() < maint_start:
             return False
     return True
 

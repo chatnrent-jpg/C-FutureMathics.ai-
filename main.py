@@ -2,12 +2,12 @@
 FutureMathics virtue main loop — native Wisdom brain.
 
 Execution: Webull futures (TradeClient)
-Market data: Alpaca SPY → MES proxy (paid data feed)
+Market data: Databento CME MES L1 (primary) → Alpaca SPY→MES proxy fallback
 No Interactive Brokers / VolumeWatch grade feed / Webull US_FUTURES quotes required.
 
 Production hardening:
-  1. Seed WisdomStrategy from Alpaca historical bars (ATR/ADX ready immediately)
-  2. CME MES market-hours gate
+  1. Seed WisdomStrategy from Databento MES bars (preferred) or Alpaca proxy
+  2. Session gate: full CME hours when Databento primary; cash RTH when Alpaca-only
   3. Manus CapitalProtectionMatrix (daily halt / reduce size / concurrent risk)
   4. Position exclusivity, 5s timeouts, reconcile, infinite reconnect
 
@@ -68,6 +68,8 @@ from engine.config import (
     VIRTUE_TICK_POLL_S,
     fixed_fractional_risk_pct,
     forward_test_force_paper,
+    primary_data_source,
+    virtue_rth_only,
 )
 
 _ET = ZoneInfo(FORWARD_TEST_TIMEZONE)
@@ -1022,7 +1024,8 @@ async def run_cycle(
         session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
         return
 
-    # Temperance: last 15 min of RTH — manage/exit only, no new overnight risk.
+    # Temperance: pre-close / pre-maintenance window — manage/exit only (no new risk).
+    # CME (Databento): 16:45–17:00 ET only; overnight after 18:00 remains open.
     if not ignore_hours and not virtue_entries_allowed():
         logger.info(
             "CYCLE %s no_new_entry_cutoff — manage/exit only (pre-close / pre-maintenance)",
@@ -1280,12 +1283,16 @@ async def run_loop(
             session.realized_pnl_today,
             session.trades_today,
         )
+    session_mode = "RTH_ALPACA" if virtue_rth_only() else "CME_DATABENTO"
     logger.info(
-        "VIRTUE LOOP start equity=%.2f symbol=%s position_tp=$%.0f position_sl=$%.0f "
+        "VIRTUE LOOP start equity=%.2f symbol=%s data_source=%s session_mode=%s "
+        "position_tp=$%.0f position_sl=$%.0f "
         "day_lock=$%.0f exit_cooldown=%s long_enter=%.1f short_enter=%.1f "
         "long_exit=%.1f short_exit=%.1f streak=%s anchor_div_atr=%.1f network_timeout=%.1fs",
         session.broker.equity,
         EXECUTION_SYMBOL,
+        primary_data_source(),
+        session_mode,
         float(VIRTUE_POSITION_TP_DOLLARS),
         float(VIRTUE_POSITION_STOP_DOLLARS),
         float(GRADE_DAILY_PROFIT_LOCK),
