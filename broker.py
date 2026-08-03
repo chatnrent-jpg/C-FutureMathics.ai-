@@ -392,13 +392,15 @@ class VirtueBroker:
                 mes_quote = None
             if mes_quote:
                 price = float(mes_quote.get("price") or mes_quote.get("last") or 0.0)
-                if price > 0:
+                # Justice: MES outrights are thousands; reject spread/garbage prints.
+                if 1000.0 <= price <= 20000.0:
                     self._last_price = price
                     self._data_source = "databento_mes"
                     tick = {
                         **mes_quote,
                         "symbol": self._contract,
                         "source": "databento_mes",
+                        "databento_symbol": mes_quote.get("symbol"),
                     }
                     return {
                         "tick": tick,
@@ -406,6 +408,11 @@ class VirtueBroker:
                         "databento": True,
                         "webull_contract": self._contract,
                     }
+                logger.error(
+                    "databento_quote_rejected_insane price=%.4f sym=%s — Justice stand aside path",
+                    price,
+                    mes_quote.get("symbol"),
+                )
             logger.warning("Databento MES quote unavailable/stale — trying Alpaca SPY proxy")
 
         # Secondary: Alpaca SPY → MES proxy

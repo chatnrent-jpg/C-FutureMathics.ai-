@@ -1,7 +1,9 @@
 """
 Databento CME Globex MES L1 feed (primary overnight-capable market data).
 
-Streams GLBX.MDP3 mbp-1 for MES.FUT (parent) into a thread-safe quote cache.
+Streams GLBX.MDP3 mbp-1 for MES.FUT (parent) into a thread-safe quote cache,
+but ONLY the front-month outright — never calendar spreads or back months.
+
 Never fabricates prices — unavailable/stale returns None (Justice).
 """
 
@@ -10,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,12 +26,64 @@ DATASET = "GLBX.MDP3"
 SCHEMA = "mbp-1"
 SYMBOLS = "MES.FUT"
 STYPE_IN = "parent"
+# Continuous front for historical warmup (single series, no spread mix).
+CONTINUOUS_SYMBOL = "MES.c.0"
+CONTINUOUS_STYPE = "continuous"
 DEFAULT_MAX_QUOTE_AGE_S = 5.0
+
+# Justice: MES outrights trade in the thousands; spreads print dozens/hundreds.
+MES_MIN_SANE_PRICE = 1000.0
+MES_MAX_SANE_PRICE = 20000.0
+
+# CME month codes → month number
+_MONTH_CODE = {
+    "F": 1,
+    "G": 2,
+    "H": 3,
+    "J": 4,
+    "K": 5,
+    "M": 6,
+    "N": 7,
+    "Q": 8,
+    "U": 9,
+    "V": 10,
+    "X": 11,
+    "Z": 12,
+}
+_OUTRIGHT_RE = re.compile(r"^MES([FGHJKMNQUVXZ])(\d)$", re.IGNORECASE)
+
+
+def is_mes_outright(symbol: str) -> bool:
+    """True for MESU6 / MESZ6 style outrights; False for spreads (MESU6-MESZ6) or junk."""
+    return bool(_OUTRIGHT_RE.match((symbol or "").strip().upper()))
+
+
+def mes_expiry_rank(symbol: str) -> tuple[int, int] | None:
+    """
+    Sort key for MES outrights: (year, month). Smaller = nearer / front.
+    Year digit: 6 → 2026, 7 → 2027 (CME single-digit year in root+month+year).
+    """
+    m = _OUTRIGHT_RE.match((symbol or "").strip().upper())
+    if not m:
+        return None
+    month = _MONTH_CODE.get(m.group(1).upper())
+    if month is None:
+        return None
+    year = 2020 + int(m.group(2))
+    return year, month
+
+
+def is_sane_mes_price(px: float) -> bool:
+    try:
+        v = float(px)
+    except (TypeError, ValueError):
+        return False
+    return MES_MIN_SANE_PRICE <= v <= MES_MAX_SANE_PRICE
 
 
 @dataclass
 class DatabentoMESFeed:
-    """Live MES top-of-book via Databento Live API."""
+    """Live MES top-of-book via Databento Live API (front-month outright only)."""
 
     api_key: str = field(default="")
     max_quote_age_s: float = DEFAULT_MAX_QUOTE_AGE_S
@@ -50,13 +105,20 @@ class DatabentoMESFeed:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
+    # instrument_id → raw symbol (from SymbolMappingMsg)
+    _id_to_symbol: dict[int, str] = field(default_factory=dict, repr=False)
+    # Locked front-month outright (e.g. MESU6); None until first mapping resolves
+    _front_symbol: str | None = None
+    _front_instrument_id: int | None = None
+    _rejected_non_front: int = 0
 
     def __post_init__(self) -> None:
         if not self.api_key:
             self.api_key = os.getenv("DATABENTO_API_KEY", "").strip()
         if self.is_configured():
             logger.info(
-                "Databento MES feed configured dataset=%s schema=%s symbols=%s",
+                "Databento MES feed configured dataset=%s schema=%s symbols=%s "
+                "(front-month outright filter ON)",
                 self.dataset,
                 self.schema,
                 self.symbols,
@@ -117,7 +179,7 @@ class DatabentoMESFeed:
         self._connected = True
         self._last_error = ""
         logger.info(
-            "Databento subscribed dataset=%s schema=%s symbols=%s",
+            "Databento subscribed dataset=%s schema=%s symbols=%s front_filter=outright",
             self.dataset,
             self.schema,
             self.symbols,
@@ -134,18 +196,100 @@ class DatabentoMESFeed:
             except Exception as exc:
                 logger.warning("databento_record_handle_failed err=%s", exc)
 
+    def _maybe_set_front(self, symbol: str, instrument_id: int | None) -> None:
+        """Choose nearest-expiry outright as the only quote source."""
+        if not is_mes_outright(symbol):
+            return
+        rank = mes_expiry_rank(symbol)
+        if rank is None:
+            return
+        with self._lock:
+            current = self._front_symbol
+            if current is None:
+                self._front_symbol = symbol.upper()
+                self._front_instrument_id = instrument_id
+                self._raw_symbol = self._front_symbol
+                logger.info(
+                    "Databento front-month locked symbol=%s instrument_id=%s",
+                    self._front_symbol,
+                    self._front_instrument_id,
+                )
+                return
+            cur_rank = mes_expiry_rank(current)
+            if cur_rank is not None and rank < cur_rank:
+                # A nearer outright appeared (or first mapping order was back-month).
+                self._front_symbol = symbol.upper()
+                self._front_instrument_id = instrument_id
+                self._raw_symbol = self._front_symbol
+                logger.info(
+                    "Databento front-month upgraded symbol=%s instrument_id=%s",
+                    self._front_symbol,
+                    self._front_instrument_id,
+                )
+
     def _handle_record(self, record: Any) -> None:
         import databento as db
 
         if isinstance(record, db.SymbolMappingMsg):
-            sym = str(getattr(record, "stype_out_symbol", "") or getattr(record, "stype_in_symbol", "") or "")
-            if sym:
+            sym = str(
+                getattr(record, "stype_out_symbol", "")
+                or getattr(record, "stype_in_symbol", "")
+                or ""
+            ).strip()
+            iid = getattr(record, "instrument_id", None)
+            try:
+                iid_i = int(iid) if iid is not None else None
+            except (TypeError, ValueError):
+                iid_i = None
+            if sym and iid_i is not None:
                 with self._lock:
-                    self._raw_symbol = sym
+                    self._id_to_symbol[iid_i] = sym.upper()
+            if sym:
+                self._maybe_set_front(sym, iid_i)
             return
 
         if not isinstance(record, db.MBP1Msg):
             return
+
+        iid = getattr(record, "instrument_id", None)
+        try:
+            iid_i = int(iid) if iid is not None else None
+        except (TypeError, ValueError):
+            iid_i = None
+
+        with self._lock:
+            front_sym = self._front_symbol
+            front_id = self._front_instrument_id
+            id_map = dict(self._id_to_symbol)
+
+        # Resolve symbol for this tick
+        sym = id_map.get(iid_i or -1, "")
+        if front_id is not None and iid_i is not None and iid_i != front_id:
+            with self._lock:
+                self._rejected_non_front += 1
+                n = self._rejected_non_front
+            if n in (1, 10, 100) or n % 500 == 0:
+                logger.info(
+                    "databento_skip_non_front n=%s got_id=%s front_id=%s sym=%s",
+                    n,
+                    iid_i,
+                    front_id,
+                    sym or "?",
+                )
+            return
+        if front_sym and sym and sym.upper() != front_sym.upper():
+            # Front locked by symbol but id not yet known — still reject mismatches.
+            if is_mes_outright(sym) or ("-" in sym):
+                with self._lock:
+                    self._rejected_non_front += 1
+                return
+        if front_sym is None:
+            # No front yet: only accept a sane outright; lock it from the first good tick.
+            if not sym or not is_mes_outright(sym):
+                return
+            self._maybe_set_front(sym, iid_i)
+            with self._lock:
+                front_sym = self._front_symbol
 
         levels = getattr(record, "levels", None) or ()
         if not levels:
@@ -160,13 +304,23 @@ class DatabentoMESFeed:
         if ask <= 0:
             ask = bid
         mid = round((bid + ask) / 2.0, 2)
+        # Justice: reject spreads / garbage that slip through mapping gaps.
+        if not is_sane_mes_price(mid) or not is_sane_mes_price(bid) or not is_sane_mes_price(ask):
+            logger.warning(
+                "databento_reject_insane_price mid=%.4f bid=%.4f ask=%.4f sym=%s — Justice",
+                mid,
+                bid,
+                ask,
+                sym or front_sym or "?",
+            )
+            return
+        # Reject crossed / absurd width (spread quotes sometimes survive)
+        if ask < bid or (ask - bid) > 50.0:
+            return
+
         size = int(getattr(level0, "ask_sz", 0) or getattr(level0, "bid_sz", 0) or 0)
-        # Prefer exchange event time; fall back to recv / wall clock.
         ts_ns = int(getattr(record, "ts_event", 0) or getattr(record, "ts_recv", 0) or 0)
-        if ts_ns > 0:
-            ts_epoch = ts_ns / 1e9
-        else:
-            ts_epoch = time.time()
+        ts_epoch = (ts_ns / 1e9) if ts_ns > 0 else time.time()
 
         with self._lock:
             self._bid = bid
@@ -176,6 +330,10 @@ class DatabentoMESFeed:
             self._ts_epoch = ts_epoch
             self._sequence += 1
             self._connected = True
+            if front_sym:
+                self._raw_symbol = front_sym
+            if self._front_instrument_id is None and iid_i is not None:
+                self._front_instrument_id = iid_i
 
     def quote_age_seconds(self) -> float | None:
         with self._lock:
@@ -199,6 +357,8 @@ class DatabentoMESFeed:
             sym = str(self._raw_symbol or "MES")
             size = int(self._size)
         if mid <= 0 or bid <= 0 or ask <= 0 or ts <= 0:
+            return None
+        if not is_sane_mes_price(mid):
             return None
         age = max(0.0, time.time() - ts)
         if age > ceiling:
@@ -245,7 +405,10 @@ class DatabentoMESFeed:
             self.ensure_started()
             quote = await self.fetch_quote(max_age_s=max(self.max_quote_age_s, 15.0))
             if quote and float(quote.get("price") or 0) > 0:
-                return True, f"databento_ok mes={quote['price']:.2f} src={quote.get('symbol')}"
+                return True, (
+                    f"databento_ok mes={quote['price']:.2f} src={quote.get('symbol')} "
+                    f"front={self._front_symbol or '?'}"
+                )
             err = self._last_error or "no_fresh_quote"
             return False, f"databento_waiting:{err}"
         except Exception as exc:
@@ -259,53 +422,65 @@ class DatabentoMESFeed:
         limit: int = 120,
         lookback_hours: int = 24,
     ) -> list[dict[str, Any]]:
-        """Historical OHLCV for Wisdom warmup (Justice: empty on failure)."""
+        """Historical OHLCV for Wisdom warmup — continuous front (no spread mix)."""
         if not self.is_configured():
             return []
         try:
             import databento as db
 
             schema = "ohlcv-1m" if timeframe in {"1m", "1Min", "1min"} else "ohlcv-1m"
-            # Historical availability lags wall clock — keep end inside published range.
             end = datetime.now(timezone.utc) - timedelta(minutes=20)
             start = end - timedelta(hours=max(1, int(lookback_hours)))
             client = db.Historical(key=self.api_key)
-            data = await asyncio.to_thread(
-                client.timeseries.get_range,
-                dataset=self.dataset,
-                schema=schema,
-                symbols=self.symbols,
-                stype_in=self.stype_in,
-                start=start.isoformat(),
-                end=end.isoformat(),
-            )
-            rows: list[dict[str, Any]] = []
-            for rec in data:
-                try:
-                    close = float(getattr(rec, "pretty_close", 0) or 0)
-                    high = float(getattr(rec, "pretty_high", 0) or 0)
-                    low = float(getattr(rec, "pretty_low", 0) or 0)
-                    open_ = float(getattr(rec, "pretty_open", 0) or 0)
-                    if close <= 0:
-                        # Fallback fixed-point scale if pretty_* missing
-                        scale = 1e-9
-                        close = float(getattr(rec, "close", 0) or 0) * scale
-                        high = float(getattr(rec, "high", 0) or 0) * scale
-                        low = float(getattr(rec, "low", 0) or 0) * scale
-                        open_ = float(getattr(rec, "open", 0) or 0) * scale
-                    if close <= 0:
+
+            async def _pull(symbols: str, stype_in: str) -> list[dict[str, Any]]:
+                data = await asyncio.to_thread(
+                    client.timeseries.get_range,
+                    dataset=self.dataset,
+                    schema=schema,
+                    symbols=symbols,
+                    stype_in=stype_in,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                )
+                rows: list[dict[str, Any]] = []
+                for rec in data:
+                    try:
+                        close = float(getattr(rec, "pretty_close", 0) or 0)
+                        high = float(getattr(rec, "pretty_high", 0) or 0)
+                        low = float(getattr(rec, "pretty_low", 0) or 0)
+                        open_ = float(getattr(rec, "pretty_open", 0) or 0)
+                        if close <= 0:
+                            scale = 1e-9
+                            close = float(getattr(rec, "close", 0) or 0) * scale
+                            high = float(getattr(rec, "high", 0) or 0) * scale
+                            low = float(getattr(rec, "low", 0) or 0) * scale
+                            open_ = float(getattr(rec, "open", 0) or 0) * scale
+                        if not is_sane_mes_price(close):
+                            continue
+                        rows.append(
+                            {
+                                "open": open_,
+                                "high": high if high > 0 else close,
+                                "low": low if low > 0 else close,
+                                "close": close,
+                                "timestamp": getattr(rec, "ts_event", None),
+                            }
+                        )
+                    except Exception:
                         continue
-                    rows.append(
-                        {
-                            "open": open_,
-                            "high": high if high > 0 else close,
-                            "low": low if low > 0 else close,
-                            "close": close,
-                            "timestamp": getattr(rec, "ts_event", None),
-                        }
-                    )
-                except Exception:
-                    continue
+                return rows
+
+            # Prefer continuous front-month series (single clean path).
+            rows = await _pull(CONTINUOUS_SYMBOL, CONTINUOUS_STYPE)
+            if not rows:
+                logger.warning(
+                    "databento_ohlcv continuous empty — falling back to parent %s",
+                    self.symbols,
+                )
+                rows = await _pull(self.symbols, self.stype_in)
+                # Parent may still mix — keep only sane MES price levels.
+                rows = [r for r in rows if is_sane_mes_price(float(r.get("close") or 0))]
             if limit and len(rows) > limit:
                 rows = rows[-int(limit) :]
             return rows
@@ -317,11 +492,14 @@ class DatabentoMESFeed:
         out: list[dict[str, float]] = []
         for row in bars:
             try:
+                close = float(row["close"])
+                if not is_sane_mes_price(close):
+                    continue
                 out.append(
                     {
                         "high": float(row["high"]),
                         "low": float(row["low"]),
-                        "close": float(row["close"]),
+                        "close": close,
                     }
                 )
             except (KeyError, TypeError, ValueError):
@@ -332,6 +510,11 @@ class DatabentoMESFeed:
     def last_price(self) -> float:
         with self._lock:
             return float(self._mid)
+
+    @property
+    def front_symbol(self) -> str | None:
+        with self._lock:
+            return self._front_symbol
 
 
 async def smoke_databento_mes(*, seconds: float = 8.0) -> None:
@@ -352,7 +535,8 @@ async def smoke_databento_mes(*, seconds: float = 8.0) -> None:
         if q:
             print(
                 f"MES {q.get('symbol')} mid={q['price']:.2f} "
-                f"bid={q['bid']:.2f} ask={q['ask']:.2f} age={q.get('quote_age_s'):.2f}s"
+                f"bid={q['bid']:.2f} ask={q['ask']:.2f} age={q.get('quote_age_s'):.2f}s "
+                f"front={feed.front_symbol}"
             )
         else:
             print("waiting for quote...")

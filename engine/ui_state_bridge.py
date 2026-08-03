@@ -260,6 +260,14 @@ def build_virtue_system_state(
     risk = session.risk
     starting = float(getattr(risk, "starting_nav", STARTING_NAV) or STARTING_NAV)
     broker_equity = float(getattr(broker, "equity", 0.0) or 0.0)
+    # Paper mode: never let a transient broker/default wipe undercut the durable ledger.
+    if forward_test_force_paper():
+        try:
+            ledger_eq = float(load_paper_book(starting).get("book_equity") or 0.0)
+            if ledger_eq > broker_equity + 0.009:
+                broker_equity = ledger_eq
+        except Exception:
+            pass
     # Manus / sizing baseline unchanged — do not feed mark-to-market into risk caps.
     risk_nav = broker_equity or float(getattr(risk, "account_nav", 0.0) or 0.0) or starting
     net_dir, net_size = broker.net_exposure()

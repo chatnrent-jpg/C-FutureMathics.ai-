@@ -71,6 +71,98 @@ def test_cached_quote_rejects_stale() -> None:
     assert stale is None
 
 
+def test_front_month_helpers_and_insane_price() -> None:
+    from engine.databento_mes_feed import (
+        DatabentoMESFeed,
+        is_mes_outright,
+        is_sane_mes_price,
+        mes_expiry_rank,
+    )
+
+    assert is_mes_outright("MESU6") is True
+    assert is_mes_outright("MESZ6") is True
+    assert is_mes_outright("MESU6-MESZ6") is False
+    assert is_mes_outright("MESH7") is True
+    assert mes_expiry_rank("MESU6") < mes_expiry_rank("MESZ6")
+    assert mes_expiry_rank("MESU6") < mes_expiry_rank("MESH7")
+    assert is_sane_mes_price(7588.25) is True
+    assert is_sane_mes_price(66.07) is False
+    assert is_sane_mes_price(0) is False
+
+    feed = DatabentoMESFeed(api_key="db-test-key")
+    feed._maybe_set_front("MESZ6", 111)
+    feed._maybe_set_front("MESU6", 222)  # nearer → upgrade
+    feed._maybe_set_front("MESU6-MESZ6", 333)  # spread ignored
+    assert feed.front_symbol == "MESU6"
+    assert feed._front_instrument_id == 222
+
+    # Insane mid must not surface as a quote
+    with feed._lock:
+        feed._bid = 66.0
+        feed._ask = 66.25
+        feed._mid = 66.12
+        feed._ts_epoch = time.time()
+        feed._sequence = 2
+    assert feed.get_cached_quote(max_age_s=5.0) is None
+
+
+def test_handle_record_ignores_non_front(monkeypatch) -> None:
+    """Simulated SymbolMapping + MBP1: only front-month updates the cache."""
+    from engine.databento_mes_feed import DatabentoMESFeed
+
+    class _Map:
+        def __init__(self, iid: int, sym: str) -> None:
+            self.instrument_id = iid
+            self.stype_out_symbol = sym
+            self.stype_in_symbol = "MES.FUT"
+
+    class _Lvl:
+        def __init__(self, bid: float, ask: float) -> None:
+            self.pretty_bid_px = bid
+            self.pretty_ask_px = ask
+            self.bid_sz = 1
+            self.ask_sz = 1
+
+    class _Mbp:
+        def __init__(self, iid: int, bid: float, ask: float) -> None:
+            self.instrument_id = iid
+            self.levels = (_Lvl(bid, ask),)
+            self.ts_event = int(time.time() * 1e9)
+            self.ts_recv = self.ts_event
+
+    class _FakeDb:
+        SymbolMappingMsg = _Map
+        MBP1Msg = _Mbp
+        ErrorMsg = type("ErrorMsg", (), {})
+
+    import sys
+    import types
+
+    fake = types.ModuleType("databento")
+    fake.SymbolMappingMsg = _Map
+    fake.MBP1Msg = _Mbp
+    fake.ErrorMsg = _FakeDb.ErrorMsg
+    monkeypatch.setitem(sys.modules, "databento", fake)
+
+    feed = DatabentoMESFeed(api_key="db-test-key")
+    feed._handle_record(_Map(1, "MESZ6"))
+    feed._handle_record(_Map(2, "MESU6"))
+    feed._handle_record(_Map(3, "MESU6-MESZ6"))
+    assert feed.front_symbol == "MESU6"
+
+    feed._handle_record(_Mbp(1, 7655.0, 7655.25))  # back month — ignore
+    assert feed.get_cached_quote(max_age_s=5.0) is None
+
+    feed._handle_record(_Mbp(3, 66.0, 66.25))  # spread — ignore
+    assert feed.get_cached_quote(max_age_s=5.0) is None
+
+    feed._handle_record(_Mbp(2, 7588.0, 7588.25))  # front — accept
+    q = feed.get_cached_quote(max_age_s=5.0)
+    assert q is not None
+    assert abs(q["price"] - 7588.12) < 0.02
+    assert q["symbol"] == "MESU6"
+
+
 def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     monkeypatch.setenv("DATABENTO_API_KEY", "db-test-key")
     monkeypatch.setenv("FM_DATA_SOURCE", "databento")
