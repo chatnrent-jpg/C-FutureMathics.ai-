@@ -113,16 +113,21 @@ else:
     exposure = str(grade.get("exposure") or "FLAT").upper()
     st.info(f"FLAT — no open MES position (engine exposure: {exposure})")
 
-# Mark-to-market balance from fields that already update (do not trust frozen account_nav).
-starting = float(dash.get("starting_nav") or data.get("starting_nav") or HANDSHAKE_EQUITY_BASE)
+# Mark-to-market from compounded book equity (never handshake $15k starting_nav).
+book = float(
+    data.get("book_equity")
+    or dash.get("book_equity")
+    or HANDSHAKE_EQUITY_BASE
+)
 pnl = float(dash.get("daily_pnl") or session.get("realized_pnl_today") or 0)
 open_pnl = float(unrealized or 0)
-nav = round(starting + pnl + open_pnl, 2)
+nav = round(book + open_pnl, 2)
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Account NAV", f"${nav:,.2f}")
 c2.metric("Open P&L", f"${open_pnl:+,.2f}")
 c3.metric("Closed today P&L", f"${pnl:,.2f}")
 c4.metric("Open risk", f"${session.get('open_risk_notional', 0):,.0f}")
+st.caption(f"Book equity ${book:,.2f} (compounded paper ledger)")
 
 st.write(
     f"**Mode:** {dash.get('mode', '—')} · **Strategy:** {strategy} · "
