@@ -157,12 +157,14 @@ class TradeClient:
             logger.exception("TradeClient.get_balance_failed err=%s", exc)
             return {"ok": False, "error": str(exc)}
 
-    def get_positions(self) -> list[dict[str, Any]]:
+    def get_positions(self) -> tuple[list[dict[str, Any]], str | None]:
+        """Returns (rows, err). err set ⇒ fetch failed (do NOT treat as flat)."""
         try:
-            return list(get_futures_positions() or [])
+            rows, err = get_futures_positions()
+            return list(rows or []), err
         except Exception as exc:
             logger.exception("TradeClient.get_positions_failed err=%s", exc)
-            return []
+            return [], str(exc)
 
     def get_quote(self, contract: str | None = None) -> dict[str, Any] | None:
         sym = contract or self.contract_symbol()
@@ -224,8 +226,19 @@ class TradeClient:
                 or bal.get("day_pnl")
                 or 0.0
             )
+            pos_rows, pos_err = self.get_positions()
+            if pos_err:
+                # Justice: never report ok=True with an empty book when the fetch failed.
+                return {
+                    "ok": False,
+                    "equity": equity,
+                    "realized_pnl": realized,
+                    "positions": [],
+                    "detail": f"positions_fetch_failed:{pos_err}",
+                    "account_id": bal.get("account_id") or self.account_id,
+                }
             normalized: list[dict[str, Any]] = []
-            for row in self.get_positions():
+            for row in pos_rows:
                 if not isinstance(row, dict):
                     continue
                 qty = row.get("quantity") or row.get("qty") or row.get("position") or row.get("size") or 0

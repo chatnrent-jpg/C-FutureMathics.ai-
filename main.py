@@ -1268,14 +1268,31 @@ async def run_loop(
         peak,
         ledger.get("source") if ledger.get("restored") else "system_state_or_default",
     )
-    restored = load_persisted_open_positions()
-    if restored:
-        session.broker.open_positions = list(restored)
-        logger.info(
-            "BOOT restored_paper_positions n=%s exposure=%s",
-            len(restored),
-            session.broker.net_exposure(),
-        )
+    from engine.config import forward_test_force_paper, live_cash_arming_status
+
+    armed, arm_reason = live_cash_arming_status()
+    logger.info(
+        "BOOT routing_mode=%s arming=%s detail=%s",
+        "PAPER" if forward_test_force_paper() else "LIVE_CANDIDATE",
+        "ARMED" if armed else "NOT_ARMED",
+        arm_reason,
+    )
+
+    # Paper only: restore local ghost positions across restarts.
+    # Live cash: never invent size from system_state — Webull reconcile is absolute truth.
+    if forward_test_force_paper():
+        restored = load_persisted_open_positions()
+        if restored:
+            session.broker.open_positions = list(restored)
+            logger.info(
+                "BOOT restored_paper_positions n=%s exposure=%s",
+                len(restored),
+                session.broker.net_exposure(),
+            )
+    else:
+        session.broker.open_positions = []
+        logger.info("BOOT live_mode — cleared local positions pending Webull reconcile")
+
     # Justice: same ET day → restore Closed-today PnL / trade count (deploy must not wipe).
     day_bucket = load_persisted_day_bucket(et_session_date())
     if day_bucket.get("restored"):
@@ -1330,8 +1347,19 @@ async def run_loop(
                     "BOOT forward_test_paper_nav equity=%.2f — local paper fills (not Webull app sandbox)",
                     session.broker.equity,
                 )
+        else:
+            logger.error("BOOT reconcile_failed detail=%s", truth.detail)
+            if not forward_test_force_paper():
+                # Live cash: halt rather than trade on an unknown book (Temperance / Justice).
+                session.halted = True
+                logger.error(
+                    "BOOT LIVE HALTED — reconcile failed; refusing entries/flatten-from-ghosts until Webull truth returns"
+                )
     except Exception as exc:
         logger.exception("boot_reconcile_failed err=%s", exc)
+        if not forward_test_force_paper():
+            session.halted = True
+            logger.error("BOOT LIVE HALTED — reconcile exception")
 
     # Seed Wisdom from Databento MES (preferred) or Alpaca SPY proxy history
     try:

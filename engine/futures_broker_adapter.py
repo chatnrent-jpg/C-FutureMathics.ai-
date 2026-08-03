@@ -180,7 +180,7 @@ class FuturesBrokerAdapter:
                     asyncio.to_thread(get_account_balance),
                     timeout=NETWORK_TIMEOUT_S,
                 )
-                positions = await asyncio.wait_for(
+                positions, pos_err = await asyncio.wait_for(
                     asyncio.to_thread(get_futures_positions),
                     timeout=NETWORK_TIMEOUT_S,
                 )
@@ -191,6 +191,14 @@ class FuturesBrokerAdapter:
                         "realized_pnl": 0.0,
                         "positions": [],
                         "detail": str(bal.get("error") or "balance_failed"),
+                    }
+                if pos_err:
+                    return {
+                        "ok": False,
+                        "equity": float(bal.get("equity") or 0.0),
+                        "realized_pnl": 0.0,
+                        "positions": [],
+                        "detail": f"positions_fetch_failed:{pos_err}",
                     }
                 equity = float(bal.get("equity") or 0.0)
                 realized = float(

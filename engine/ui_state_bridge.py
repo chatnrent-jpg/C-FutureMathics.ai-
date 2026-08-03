@@ -401,12 +401,16 @@ def persist_virtue_system_state(session: Any, **kwargs: Any) -> None:
         payload = build_virtue_system_state(session, **kwargs)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        # Mirror compounded equity into the durable ledger (survives day-roll / UI rewrites).
-        broker = getattr(session, "broker", None)
-        book = float(getattr(broker, "equity", 0.0) or 0.0)
-        if book > 0:
-            peak = float(getattr(getattr(session, "risk", None), "peak_nav", book) or book)
-            save_paper_book(book, peak_equity=peak, source="system_state_persist")
+        # Mirror compounded equity into the durable paper ledger ONLY in paper mode.
+        # Live cash equity must not rewrite paper_book.json (Justice — no false ledger).
+        from engine.config import forward_test_force_paper
+
+        if forward_test_force_paper():
+            broker = getattr(session, "broker", None)
+            book = float(getattr(broker, "equity", 0.0) or 0.0)
+            if book > 0:
+                peak = float(getattr(getattr(session, "risk", None), "peak_nav", book) or book)
+                save_paper_book(book, peak_equity=peak, source="system_state_persist")
     except Exception as exc:
         log.exception("persist_virtue_system_state_failed err=%s", exc)
 

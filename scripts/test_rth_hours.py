@@ -15,7 +15,9 @@ if str(ROOT) not in sys.path:
 
 # Force Alpaca/RTH mode so these assertions stay stable regardless of local Databento keys.
 os.environ.pop("DATABENTO_API_KEY", None)
+os.environ.pop("VIRTUE_SESSION_MODE", None)
 os.environ["FM_DATA_SOURCE"] = "alpaca"
+os.environ["VIRTUE_SESSION_MODE"] = "rth"
 
 from scripts.run_daily_session import in_rth_hours, virtue_session_open
 

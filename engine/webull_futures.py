@@ -240,20 +240,26 @@ def get_account_balance() -> dict[str, Any]:
     }
 
 
-def get_futures_positions() -> list[dict[str, Any]]:
+def get_futures_positions() -> tuple[list[dict[str, Any]], str | None]:
+    """
+    Fetch futures positions.
+
+    Justice: distinguish empty book ([], None) from fetch failure ([], err).
+    Callers must NOT treat a failed fetch as flat.
+    """
     acct_id, err = resolve_account_id()
     if err or not acct_id:
-        return []
+        return [], err or "no_account"
     status, payload, err = signed_request("GET", "/openapi/assets/positions", query={"account_id": acct_id})
     if err or status != 200:
-        return []
+        return [], err or f"positions_http_{status}"
     rows: list[Any]
     if isinstance(payload, list):
         rows = payload
     elif isinstance(payload, dict):
         rows = payload.get("data") or payload.get("positions") or []
     else:
-        return []
+        return [], "positions_payload_invalid"
     out: list[dict[str, Any]] = []
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
@@ -264,7 +270,7 @@ def get_futures_positions() -> list[dict[str, Any]]:
             continue
         if sym.upper().startswith(EXECUTION_SYMBOL) or inst == "FUTURES":
             out.append(row)
-    return out
+    return out, None
 
 
 def submit_futures_market_order(

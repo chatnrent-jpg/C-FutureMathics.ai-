@@ -97,6 +97,7 @@ LIVE_RISK_NAV_CAP = 15_000.0
 LIVE_MAX_DAILY_LOSS = 300.0
 LIVE_MAX_CONCURRENT_RISK_PCT = 0.05
 LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.01
+LIVE_MAX_MES_CONTRACTS = 2  # hard Temperance cap for cash MES
 
 DRAWDOWN_BRAKE_PCT = 0.10
 CAPITAL_DRAG_MULTIPLIER = 0.5
@@ -349,6 +350,46 @@ def paper_max_mes_contracts() -> int:
         except ValueError:
             pass
     return PAPER_MAX_MES_CONTRACTS
+
+
+def live_max_mes_contracts() -> int:
+    """Hard contract cap for cash MES (Temperance). Override: FM_LIVE_MAX_MES_CONTRACTS."""
+    raw = os.getenv("FM_LIVE_MAX_MES_CONTRACTS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return int(LIVE_MAX_MES_CONTRACTS)
+
+
+def max_mes_contracts() -> int:
+    """Active hard cap — paper vs live."""
+    if risk_mode_paper():
+        return paper_max_mes_contracts()
+    return live_max_mes_contracts()
+
+
+def live_cash_arming_status() -> tuple[bool, str]:
+    """
+    Justice: true live cash requires an unambiguous arming set.
+    Returns (armed, reason). Paper mode is never 'armed'.
+    """
+    if forward_test_force_paper():
+        return False, "FORWARD_TEST_MODE=True (paper locked — safe default)"
+    from engine.webull_futures import futures_live_orders_allowed, webull_is_sandbox
+
+    if webull_is_sandbox():
+        return False, "WEBULL_API_HOST is sandbox (not cash live)"
+    if not webull_credentials_configured():
+        return False, "Webull credentials missing"
+    if not futures_live_orders_allowed():
+        return False, "FM_ALLOW_LIVE_ORDERS not set to 1"
+    if not databento_configured() or primary_data_source() != "databento":
+        return False, "DATABENTO_API_KEY + FM_DATA_SOURCE=databento required for live CME"
+    if virtue_session_mode() != "cme":
+        return False, "VIRTUE_SESSION_MODE must be cme for live Globex MES"
+    return True, "live_cash_armed"
 
 
 def paper_max_open_mes_positions() -> int:

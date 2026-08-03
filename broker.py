@@ -30,7 +30,9 @@ from engine.config import (
     STARTING_NAV,
     WEBULL_NETWORK_TIMEOUT_S,
     forward_test_force_paper,
+    max_mes_contracts,
     paper_max_mes_contracts,
+    virtue_session_mode,
     primary_data_source,
     webull_credentials_configured,
     webull_futures_account_id,
@@ -150,7 +152,7 @@ def calculate_max_contracts(
     max_risk = eq * limit_pct
     risk_per_contract = stop * tv
     raw = int(max_risk // risk_per_contract)
-    cap = hard_cap if hard_cap is not None else paper_max_mes_contracts()
+    cap = hard_cap if hard_cap is not None else max_mes_contracts()
     contracts = max(0, min(raw, int(cap)))
     if contracts < 1:
         return SizeResult(
@@ -210,7 +212,12 @@ def _opposite(direction: str) -> str:
 
 
 def _fill_confirmed(status: str) -> bool:
-    return str(status or "").upper() in {"FILLED", "SUBMITTED", "ACCEPTED", "PARTIAL"}
+    """True only for exchange-confirmed fills (Justice — SUBMITTED is not a fill)."""
+    return str(status or "").upper() in {"FILLED", "PARTIAL"}
+
+
+def _order_working(status: str) -> bool:
+    return str(status or "").upper() in {"SUBMITTED", "ACCEPTED", "PENDING", "NEW"}
 
 
 async def _await_timeout(coro, *, timeout: float = NETWORK_TIMEOUT_S, label: str = "network"):
@@ -394,13 +401,37 @@ class VirtueBroker:
                 price = float(mes_quote.get("price") or mes_quote.get("last") or 0.0)
                 # Justice: MES outrights are thousands; reject spread/garbage prints.
                 if 1000.0 <= price <= 20000.0:
+                    db_sym = str(mes_quote.get("symbol") or "").upper()
+                    wb_sym = str(self._contract or "").upper()
+                    # Live cash: Databento front month must match Webull execution contract.
+                    if (
+                        not forward_test_force_paper()
+                        and db_sym
+                        and wb_sym
+                        and db_sym != wb_sym
+                        and db_sym.startswith("MES")
+                        and wb_sym.startswith("MES")
+                    ):
+                        logger.error(
+                            "symbol_mismatch databento=%s webull=%s — Justice stand aside "
+                            "(set WEBULL_FUTURES_SYMBOL=%s)",
+                            db_sym,
+                            wb_sym,
+                            db_sym,
+                        )
+                        return {
+                            "tick": {"price": 0.0, "last": 0.0, "source": "symbol_mismatch"},
+                            "live_stream": False,
+                            "stand_aside": True,
+                            "detail": f"symbol_mismatch:{db_sym}!={wb_sym}",
+                        }
                     self._last_price = price
                     self._data_source = "databento_mes"
                     tick = {
                         **mes_quote,
-                        "symbol": self._contract,
+                        "symbol": self._contract or db_sym or EXECUTION_SYMBOL,
                         "source": "databento_mes",
-                        "databento_symbol": mes_quote.get("symbol"),
+                        "databento_symbol": db_sym or mes_quote.get("symbol"),
                     }
                     return {
                         "tick": tick,
@@ -413,9 +444,20 @@ class VirtueBroker:
                     price,
                     mes_quote.get("symbol"),
                 )
+            # CME primary: never invent overnight tape from SPY (Justice / Wisdom).
+            if virtue_session_mode() == "cme" and primary_data_source() == "databento":
+                logger.error(
+                    "market_data_stand_aside databento_primary_down — no Alpaca SPY proxy under CME hours"
+                )
+                return {
+                    "tick": {"price": 0.0, "last": 0.0, "source": "databento_unavailable"},
+                    "live_stream": False,
+                    "stand_aside": True,
+                    "detail": "databento_unavailable_cme_mode",
+                }
             logger.warning("Databento MES quote unavailable/stale — trying Alpaca SPY proxy")
 
-        # Secondary: Alpaca SPY → MES proxy
+        # Secondary: Alpaca SPY → MES proxy (RTH / non-CME fallback only)
         if self.data.is_configured():
             try:
                 spy_quote = await _await_timeout(
@@ -1115,7 +1157,19 @@ class VirtueBroker:
             self.enter_triage("submit_exception")
             return None
 
-        if _fill_confirmed(result.status):
+        status_u = str(result.status or "").upper()
+        if result.routing_mode == RoutingMode.PAPER_ROUTE and _fill_confirmed(status_u):
+            self.open_positions.append(
+                {
+                    "direction": _normalize_direction(order.direction),
+                    "size": order.size,
+                    "price": result.fill_price,
+                    "order_id": result.order_id,
+                    "symbol": result.contract or order.symbol,
+                    "source": "webull_paper_fill",
+                }
+            )
+        elif result.routing_mode == RoutingMode.LIVE_ROUTE and _fill_confirmed(status_u):
             self.open_positions.append(
                 {
                     "direction": _normalize_direction(order.direction),
@@ -1126,6 +1180,23 @@ class VirtueBroker:
                     "source": "webull_fill",
                 }
             )
+        elif result.routing_mode == RoutingMode.LIVE_ROUTE and _order_working(status_u):
+            # Justice: SUBMITTED/ACCEPTED is not a fill — confirm via remote positions.
+            logger.info(
+                "live_order_working status=%s id=%s — reconciling before trusting size",
+                status_u,
+                result.order_id,
+            )
+            try:
+                await asyncio.sleep(0.75)
+                truth = await self.reconcile_with_broker()
+                if not truth.ok:
+                    logger.error(
+                        "live_order_working_reconcile_failed detail=%s — no local size invent",
+                        truth.detail,
+                    )
+            except Exception as exc:
+                logger.exception("live_order_working_reconcile_exception err=%s", exc)
         return result
 
 
