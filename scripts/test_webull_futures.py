@@ -65,10 +65,13 @@ def main() -> None:
     else:
         print("Quote: unavailable — engine uses local price sim until quotes work")
 
-    positions = get_futures_positions()
-    print(f"Open futures positions: {len(positions)}")
-    for p in positions[:5]:
-        print(f"  - {p.get('symbol')} qty={p.get('quantity') or p.get('qty')}")
+    positions, pos_err = get_futures_positions()
+    if pos_err:
+        print(f"Open futures positions: FETCH FAILED — {pos_err}")
+    else:
+        print(f"Open futures positions: {len(positions)}")
+        for p in positions[:5]:
+            print(f"  - {p.get('symbol')} qty={p.get('quantity') or p.get('qty')}")
 
     print("")
     print("Step 2 OK when Balance shows your Futures account (WEBULL_FUTURES_ACCOUNT_ID in .env.local)")
