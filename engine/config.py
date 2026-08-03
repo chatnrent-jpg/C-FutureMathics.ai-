@@ -296,7 +296,39 @@ def virtue_rth_only() -> bool:
 
 
 def forward_test_force_paper() -> bool:
+    """
+    Paper lock. Env override (Justice — no silent half-arm):
+      FM_FORWARD_TEST_MODE=0|false|live  → paper OFF (live candidate)
+      FM_FORWARD_TEST_MODE=1|true|paper → paper ON
+      unset → FORWARD_TEST_MODE constant (default True)
+    """
+    raw = os.getenv("FM_FORWARD_TEST_MODE", "").strip().lower()
+    if raw in {"0", "false", "no", "live", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "paper", "on"}:
+        return True
     return bool(FORWARD_TEST_MODE)
+
+
+def trading_halted() -> bool:
+    """Operator kill switch: FM_TRADING_HALTED=1 → no new risk."""
+    return os.getenv("FM_TRADING_HALTED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def live_allow_overnight() -> bool:
+    """
+    Live cash default: NO overnight Globex holds (Temperance for $15k).
+    Paper CME may overnight. Opt-in live overnight: FM_LIVE_ALLOW_OVERNIGHT=1.
+    """
+    if forward_test_force_paper():
+        return True
+    return os.getenv("FM_LIVE_ALLOW_OVERNIGHT", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def live_halt_flattens() -> bool:
+    """When kill switch is on, also flatten open risk (default yes for cash)."""
+    raw = os.getenv("FM_HALT_FLATTEN", "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def risk_mode_paper() -> bool:
@@ -376,7 +408,9 @@ def live_cash_arming_status() -> tuple[bool, str]:
     Returns (armed, reason). Paper mode is never 'armed'.
     """
     if forward_test_force_paper():
-        return False, "FORWARD_TEST_MODE=True (paper locked — safe default)"
+        return False, "paper locked (FORWARD_TEST_MODE / FM_FORWARD_TEST_MODE)"
+    if trading_halted():
+        return False, "FM_TRADING_HALTED=1"
     from engine.webull_futures import futures_live_orders_allowed, webull_is_sandbox
 
     if webull_is_sandbox():
@@ -389,6 +423,9 @@ def live_cash_arming_status() -> tuple[bool, str]:
         return False, "DATABENTO_API_KEY + FM_DATA_SOURCE=databento required for live CME"
     if virtue_session_mode() != "cme":
         return False, "VIRTUE_SESSION_MODE must be cme for live Globex MES"
+    forced_sym = _env_str("WEBULL_FUTURES_SYMBOL", "FM_EXECUTION_CONTRACT")
+    if not forced_sym:
+        return False, "WEBULL_FUTURES_SYMBOL must be set (e.g. MESU6) for live symbol lock"
     return True, "live_cash_armed"
 
 

@@ -10,6 +10,8 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -23,13 +25,15 @@ from engine.env_loader import load_project_env
 def main() -> int:
     load_project_env(ROOT)
     from engine.config import (
-        FORWARD_TEST_MODE,
+        live_allow_overnight,
         live_cash_arming_status,
         live_max_mes_contracts,
         max_mes_contracts,
         primary_data_source,
+        trading_halted,
         virtue_session_mode,
         webull_credentials_configured,
+        forward_test_force_paper,
     )
     from engine.webull_futures import (
         front_month_contract,
@@ -39,7 +43,6 @@ def main() -> int:
         webull_is_sandbox,
     )
     from engine.databento_mes_feed import DatabentoMESFeed
-    import asyncio
 
     print("=== FutureMathics LIVE CASH PREFLIGHT ===\n")
     fails = 0
@@ -52,13 +55,17 @@ def main() -> int:
         print(f"[{mark}] {label}" + (f" — {detail}" if detail else ""))
 
     armed, reason = live_cash_arming_status()
-    check(not FORWARD_TEST_MODE, "FORWARD_TEST_MODE=False", f"current={FORWARD_TEST_MODE}")
+    check(not forward_test_force_paper(), "Paper lock OFF (FM_FORWARD_TEST_MODE=0)", f"paper={forward_test_force_paper()}")
+    check(not trading_halted(), "FM_TRADING_HALTED unset", "kill switch must be off to trade")
     check(not webull_is_sandbox(), "Webull host is live (not sandbox)")
     check(webull_credentials_configured(), "Webull credentials present")
     check(futures_live_orders_allowed(), "FM_ALLOW_LIVE_ORDERS=1")
     check(primary_data_source() == "databento", "FM_DATA_SOURCE=databento", primary_data_source())
     check(virtue_session_mode() == "cme", "VIRTUE_SESSION_MODE=cme", virtue_session_mode())
+    forced = (os.getenv("WEBULL_FUTURES_SYMBOL") or os.getenv("FM_EXECUTION_CONTRACT") or "").strip()
+    check(bool(forced), "WEBULL_FUTURES_SYMBOL set", forced or "MISSING")
     check(max_mes_contracts() <= 2, "MES contract hard cap <= 2", f"cap={max_mes_contracts()} live={live_max_mes_contracts()}")
+    check(not live_allow_overnight(), "Overnight OFF for live cash (safer default)", "set FM_LIVE_ALLOW_OVERNIGHT=1 only if intentional")
     check(armed, "live_cash_arming_status", reason)
 
     bal = get_account_balance()
@@ -68,8 +75,8 @@ def main() -> int:
 
     positions, pos_err = get_futures_positions()
     check(pos_err is None, "Webull positions API", pos_err or f"n={len(positions)}")
-    if pos_err is None and positions:
-        print(f"       NOTE: account already has {len(positions)} futures row(s) — flatten before first live boot")
+    if pos_err is None:
+        check(len(positions) == 0, "Account flat before first live boot", f"open_rows={len(positions)}")
 
     wb_sym = front_month_contract()
     print(f"\nWebull execution symbol: {wb_sym}")
@@ -97,9 +104,11 @@ def main() -> int:
     print("\n=== RESULT ===")
     if fails:
         print(f"NOT READY — {fails} check(s) failed. Do NOT arm live cash.")
-        print("Keep FORWARD_TEST_MODE=True until every check PASSes.")
+        print("Keep FM_FORWARD_TEST_MODE=1 (or unset) until every check PASSes.")
         return 2
-    print("READY — all gates passed. Set FORWARD_TEST_MODE=False only when you intend to fire real orders.")
+    print("READY — all gates passed.")
+    print("To arm: FM_FORWARD_TEST_MODE=0 FM_ALLOW_LIVE_ORDERS=1 WEBULL_FUTURES_SYMBOL=<front>")
+    print("Kill switch anytime: FM_TRADING_HALTED=1")
     return 0
 
 

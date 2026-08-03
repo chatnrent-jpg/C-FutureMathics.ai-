@@ -157,7 +157,17 @@ class FuturesBrokerAdapter:
                     self._sequence += 1
                     return {"tick": tick, "live_stream": True, "webull": True}
 
-            # Priority 3: Local sim fallback
+            # Priority 3: Local sim — paper/dev only. Never invent tape for live cash.
+            from engine.config import forward_test_force_paper
+
+            if not forward_test_force_paper():
+                logger.error("market_data_stand_aside — refusing sim ticks in live mode")
+                return {
+                    "tick": {"price": 0.0, "last": 0.0, "source": "unavailable"},
+                    "live_stream": False,
+                    "stand_aside": True,
+                    "detail": "sim_forbidden_live",
+                }
             tick = self._sim_tick()
             if self._using_webull:
                 tick["webull_quote_missing"] = True

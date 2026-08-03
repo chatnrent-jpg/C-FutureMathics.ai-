@@ -657,12 +657,35 @@ async def run_cycle(
         session.entry_cooldown_cycles -= 1
 
     # Session gate: RTH-only when Alpaca primary; full CME hours when Databento primary.
+    # Live cash default: daytime-only (no overnight) unless FM_LIVE_ALLOW_OVERNIGHT=1.
     # Outside session → flatten residual risk (Temperance).
     if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
         return
 
+    from engine.config import live_halt_flattens, trading_halted
+
+    if trading_halted():
+        session.last_regime = "OPERATOR_HALT"
+        session.last_signal_reason = "FM_TRADING_HALTED"
+        _, net_size = session.broker.net_exposure()
+        if net_size > 0 and live_halt_flattens():
+            await _flatten_until_flat(session, stop_ticks=stop_ticks, reason="operator_halt_flatten")
+        else:
+            logger.warning("CYCLE %s FM_TRADING_HALTED — stand aside (kill switch)", session.cycle)
+        session.last_action = "FLAT"
+        return
+
     if session.halted:
         logger.warning("CYCLE %s session_halted by Manus — stand aside", session.cycle)
+        session.last_action = "FLAT"
+        return
+
+    if session.broker.has_pending_live_order():
+        logger.warning(
+            "CYCLE %s pending_live_order id=%s — stand aside new risk",
+            session.cycle,
+            session.broker._pending_live_order_id,
+        )
         session.last_action = "FLAT"
         return
 
@@ -1118,6 +1141,20 @@ async def run_cycle(
         _credit_realized_pnl(session, excl_pnl)
         session.trades_today += 1
 
+    # Temperance: reject wide spreads before live entry.
+    from engine.config import MAX_ALLOWED_SPREAD_TICKS, forward_test_force_paper
+
+    spread_ticks = session.broker.quote_spread_ticks()
+    if spread_ticks is not None and spread_ticks > float(MAX_ALLOWED_SPREAD_TICKS):
+        logger.warning(
+            "CYCLE %s spread_too_wide ticks=%.1f max=%.1f — stand aside",
+            session.cycle,
+            spread_ticks,
+            float(MAX_ALLOWED_SPREAD_TICKS),
+        )
+        session.last_action = "FLAT"
+        return
+
     # Drag-aware sizing (single risk source of truth with Manus).
     drag_mult = float(session.risk.capital_drag_multiplier)
     size_pct = float(fixed_fractional_risk_pct()) * drag_mult
@@ -1126,8 +1163,13 @@ async def run_cycle(
         stop_ticks=stop_ticks,
         risk_limit_pct=size_pct,
     )
-    # Under drag, budget may reject 1 MES — retry undragged for irreducible unit.
-    if (sized.rejected or sized.contracts < 1) and drag_mult < 1.0 - 1e-12:
+    # Paper only: under drag, budget may reject 1 MES — retry undragged for irreducible unit.
+    # Live cash: never waive drag (Temperance).
+    if (
+        forward_test_force_paper()
+        and (sized.rejected or sized.contracts < 1)
+        and drag_mult < 1.0 - 1e-12
+    ):
         sized = session.broker.size_for_direction(
             direction=decision.action.value,
             stop_ticks=stop_ticks,
@@ -1437,9 +1479,22 @@ def main() -> None:
     parser.add_argument(
         "--ignore-hours",
         action="store_true",
-        help="Run outside CME MES hours (testing only)",
+        help="Run outside CME MES hours (paper/testing only — forbidden when live)",
     )
     args = parser.parse_args()
+    from engine.config import forward_test_force_paper, live_cash_arming_status
+
+    if args.ignore_hours and not forward_test_force_paper():
+        raise SystemExit(
+            "REFUSE: --ignore-hours is forbidden in live cash mode. "
+            "Keep FM_FORWARD_TEST_MODE paper or unset --ignore-hours."
+        )
+    armed, arm_reason = live_cash_arming_status()
+    if not forward_test_force_paper() and not armed:
+        raise SystemExit(
+            f"REFUSE: live candidate but NOT_ARMED ({arm_reason}). "
+            "Fix preflight gates or set FM_FORWARD_TEST_MODE=1 for paper."
+        )
     asyncio.run(
         run_loop(
             cycles=args.cycles,

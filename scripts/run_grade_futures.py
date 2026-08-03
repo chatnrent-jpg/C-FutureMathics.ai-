@@ -45,6 +45,11 @@ logger = logging.getLogger("run_grade_futures")
 
 
 async def run_grade_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
+    if not forward_test_force_paper():
+        raise SystemExit(
+            "REFUSE: VolumeWatch grade path is not allowed for live cash. "
+            "Use main.py virtue path only, or keep FM_FORWARD_TEST_MODE paper."
+        )
     ensure_boot_system_state()
     orch = GradeOrchestrator()
     orch.risk.update_nav(HANDSHAKE_EQUITY_BASE)

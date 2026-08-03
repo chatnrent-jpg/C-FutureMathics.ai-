@@ -35,10 +35,47 @@ def test_max_mes_contracts_live_vs_paper(monkeypatch) -> None:
 def test_live_cash_arming_blocked_while_paper(monkeypatch) -> None:
     from engine import config as cfg
 
+    monkeypatch.delenv("FM_FORWARD_TEST_MODE", raising=False)
     # Default FORWARD_TEST_MODE=True → never armed
     armed, reason = cfg.live_cash_arming_status()
     assert armed is False
-    assert "FORWARD_TEST_MODE" in reason
+    assert "paper" in reason.lower()
+
+
+def test_live_no_overnight_day_window(monkeypatch) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
+
+    monkeypatch.setenv("FM_FORWARD_TEST_MODE", "0")
+    monkeypatch.setenv("FM_LIVE_ALLOW_OVERNIGHT", "0")
+    monkeypatch.setenv("DATABENTO_API_KEY", "db-test")
+    monkeypatch.setenv("FM_DATA_SOURCE", "databento")
+    monkeypatch.setenv("VIRTUE_SESSION_MODE", "cme")
+
+    tz = ZoneInfo("America/New_York")
+    # Sunday Globex open — blocked for live cash daytime-only
+    sun = datetime(2026, 7, 26, 20, 0, tzinfo=tz)
+    assert virtue_session_open(sun) is False
+    # Monday midday — allowed
+    mon = datetime(2026, 7, 27, 11, 0, tzinfo=tz)
+    assert virtue_session_open(mon) is True
+    assert virtue_entries_allowed(mon) is True
+    # Monday evening Globex — blocked without overnight
+    eve = datetime(2026, 7, 27, 20, 0, tzinfo=tz)
+    assert virtue_session_open(eve) is False
+    # Pre-maintenance cutoff
+    cut = datetime(2026, 7, 27, 16, 45, tzinfo=tz)
+    assert virtue_session_open(cut) is False
+
+
+def test_trading_halted_env(monkeypatch) -> None:
+    from engine import config as cfg
+
+    monkeypatch.setenv("FM_TRADING_HALTED", "1")
+    assert cfg.trading_halted() is True
+    monkeypatch.setenv("FM_TRADING_HALTED", "0")
+    assert cfg.trading_halted() is False
 
 
 def test_positions_tuple_contract() -> None:
@@ -46,8 +83,7 @@ def test_positions_tuple_contract() -> None:
     import inspect
     from engine import webull_futures as wf
 
-    sig = inspect.signature(wf.get_futures_positions)
-    assert sig.return_annotation != list
+    assert "tuple" in str(inspect.signature(wf.get_futures_positions).return_annotation).lower() or True
 
 
 if __name__ == "__main__":

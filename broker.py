@@ -248,9 +248,13 @@ class VirtueBroker:
     open_positions: list[dict[str, Any]] = field(default_factory=list)
     network_timeout_s: float = NETWORK_TIMEOUT_S
     _last_price: float = 0.0
+    _last_bid: float = 0.0
+    _last_ask: float = 0.0
     _last_disconnect_at: float | None = None
     _contract: str = EXECUTION_SYMBOL
     _data_source: str = "alpaca_spy_mes_proxy"
+    _pending_live_order_id: str = ""
+    _pending_live_order_at: float = 0.0
 
     def __post_init__(self) -> None:
         if self.trade is None:
@@ -426,6 +430,8 @@ class VirtueBroker:
                             "detail": f"symbol_mismatch:{db_sym}!={wb_sym}",
                         }
                     self._last_price = price
+                    self._last_bid = float(mes_quote.get("bid") or price)
+                    self._last_ask = float(mes_quote.get("ask") or price)
                     self._data_source = "databento_mes"
                     tick = {
                         **mes_quote,
@@ -705,6 +711,18 @@ class VirtueBroker:
             )
         else:
             self.open_positions = synced
+        # Clear pending live order once we have remote truth (or timeout).
+        if self._pending_live_order_id:
+            age = time.time() - float(self._pending_live_order_at or 0.0)
+            if synced or age >= 30.0:
+                logger.info(
+                    "pending_live_order_clear id=%s age=%.1fs remote_positions=%s",
+                    self._pending_live_order_id,
+                    age,
+                    len(synced),
+                )
+                self._pending_live_order_id = ""
+                self._pending_live_order_at = 0.0
         self.triage = TriageState.READY
         logger.info(
             "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=%s",
@@ -714,6 +732,31 @@ class VirtueBroker:
             equity_source,
         )
         return BrokerTruth(True, self.equity, self.realized_pnl, list(self.open_positions), detail=equity_source)
+
+    def has_pending_live_order(self, *, max_age_s: float = 30.0) -> bool:
+        if not self._pending_live_order_id:
+            return False
+        age = time.time() - float(self._pending_live_order_at or 0.0)
+        if age > max_age_s:
+            logger.warning(
+                "pending_live_order_stale id=%s age=%.1fs — clearing lock",
+                self._pending_live_order_id,
+                age,
+            )
+            self._pending_live_order_id = ""
+            self._pending_live_order_at = 0.0
+            return False
+        return True
+
+    def quote_spread_ticks(self) -> float | None:
+        """Bid/ask width in MES ticks (0.25). None if unknown."""
+        from engine.config import TICK_SIZE
+
+        bid = float(self._last_bid or 0.0)
+        ask = float(self._last_ask or 0.0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return (ask - bid) / float(TICK_SIZE)
 
     async def poll_until_reconnected_forever(self) -> bool:
         """Infinite Webull outage survival — 30–60s backoff until health + reconcile succeed."""
@@ -1122,6 +1165,13 @@ class VirtueBroker:
             logger.error("ORDER_BLOCKED exclusivity_flatten_failed")
             return None
 
+        if self.has_pending_live_order():
+            logger.error(
+                "ORDER_BLOCKED pending_live_order id=%s — Temperance no double-fire",
+                self._pending_live_order_id,
+            )
+            return None
+
         order = Order(
             symbol=order.symbol if order.symbol else (self._contract or EXECUTION_SYMBOL),
             direction=order.direction,
@@ -1182,6 +1232,8 @@ class VirtueBroker:
             )
         elif result.routing_mode == RoutingMode.LIVE_ROUTE and _order_working(status_u):
             # Justice: SUBMITTED/ACCEPTED is not a fill — confirm via remote positions.
+            self._pending_live_order_id = str(result.order_id or "unknown")
+            self._pending_live_order_at = time.time()
             logger.info(
                 "live_order_working status=%s id=%s — reconciling before trusting size",
                 status_u,

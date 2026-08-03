@@ -33,6 +33,7 @@ from engine.config import (
     VIRTUE_RTH_OPEN_HOUR,
     VIRTUE_RTH_OPEN_MINUTE,
     forward_test_force_paper,
+    live_allow_overnight,
     primary_data_source,
     virtue_session_mode,
 )
@@ -89,15 +90,33 @@ def in_rth_hours(now: datetime | None = None) -> bool:
     return open_t <= dt.time() < close_t
 
 
+def _live_cash_day_window(now: datetime | None = None) -> bool:
+    """
+    Live cash Temperance window (no overnight): Mon–Fri 09:30–16:45 ET.
+    Outside → flatten / stand aside even if Globex is open.
+    """
+    dt = (now or datetime.now(TZ)).astimezone(TZ)
+    if dt.weekday() >= 5:
+        return False
+    open_t = time(VIRTUE_RTH_OPEN_HOUR, VIRTUE_RTH_OPEN_MINUTE)
+    cut = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
+    return open_t <= dt.time() < cut
+
+
 def virtue_session_open(now: datetime | None = None) -> bool:
     """
     Session gate for virtue main.
 
     CME (Databento): Sun 18:00 ET → Fri 17:00 ET, daily maint 17:00–18:00 ET.
     RTH (Alpaca fallback): Mon–Fri 09:30–16:00 ET only.
+    Live cash default: daytime-only window (no overnight) unless FM_LIVE_ALLOW_OVERNIGHT=1.
     """
     if virtue_session_mode() == "cme":
-        return in_market_hours(now)
+        if not in_market_hours(now):
+            return False
+        if not live_allow_overnight():
+            return _live_cash_day_window(now)
+        return True
     return in_rth_hours(now)
 
 
@@ -105,15 +124,18 @@ def virtue_entries_allowed(now: datetime | None = None) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
 
-    - CME Globex: overnight OK; manage/exit only from 16:45 ET until maintenance.
+    - CME Globex + overnight allowed: manage/exit only 16:45–17:00 ET pre-maintenance.
+    - Live cash no-overnight: entries only inside daytime window (session_open already gates).
     - RTH (Alpaca fallback): after 15:45 ET manage/exit only until 16:00 flatten.
     """
     if not virtue_session_open(now):
         return False
     dt = (now or datetime.now(TZ)).astimezone(TZ)
     if virtue_session_mode() == "cme":
-        # Mon–Fri: manage/exit only in the last 15 minutes before 17:00 maintenance.
-        # After 18:00 Globex reopen, new entries are allowed again (overnight).
+        if not live_allow_overnight():
+            # Day window already exclusive of 16:45+; entries OK while session open.
+            return True
+        # Overnight-enabled CME: Mon–Fri block only 16:45–17:00 pre-maintenance.
         if dt.weekday() < 5:
             t = dt.time()
             cut = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
@@ -130,7 +152,15 @@ def virtue_session_label() -> str:
     mode = virtue_session_mode()
     src = primary_data_source()
     if mode == "cme":
-        return f"CME_GLOBEX data={src} hours=Sun18:00-Fri17:00ET maint=17:00-18:00 entry_cut=16:45"
+        if live_allow_overnight():
+            return (
+                f"CME_GLOBEX data={src} hours=Sun18:00-Fri17:00ET "
+                f"maint=17:00-18:00 entry_cut=16:45 overnight=ON"
+            )
+        return (
+            f"CME_CASH_DAY data={src} hours=Mon-Fri 09:30-16:45ET "
+            f"overnight=OFF (set FM_LIVE_ALLOW_OVERNIGHT=1 to enable)"
+        )
     return f"RTH_CASH data={src} hours=Mon-Fri 09:30-16:00ET entry_cut=15:45"
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
