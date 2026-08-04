@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from broker import NETWORK_TIMEOUT_S, Order, SizeResult, VirtueBroker
+from engine.dual_sleeve import (
+    classify_structural_regime,
+    core_should_open,
+    core_size_default,
+    evaluate_core_macro_safety,
+    structural_confirm_cycles,
+    tactical_entry_allowed,
+)
+from engine.sleeve_order_router import (
+    absolute_contract_footprint,
+    calculate_net_account_exposure,
+    close_all_sleeves_sequential,
+    execute_core_action,
+    execute_tactical_action,
+)
+from engine.observability import (
+    notify_core_macro_invalidation,
+    notify_course_correct,
+    notify_position_opened,
+    notify_profit_guard,
+    notify_time_decay,
+    notify_trade_closed,
+    notify_velocity_gate_block,
+)
 from engine.config import (
     DEFAULT_STOP_TICKS,
     EXECUTION_SYMBOL,
@@ -45,15 +70,48 @@ from engine.config import (
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    VIRTUE_PNL_LOCK_ARM_PEAK,
+    VIRTUE_PNL_LOCK_FLOOR_FRAC,
     VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT,
     VIRTUE_FORCE_EVENT_MAX_S,
     VIRTUE_HEARTBEAT_EVERY_N_CYCLES,
     VIRTUE_MIN_PRICE_MOVE_TICKS,
     VIRTUE_POSITION_STOP_DOLLARS,
     VIRTUE_POSITION_TP_DOLLARS,
+    VIRTUE_BASE_TP_COOLDOWN_CYCLES,
+    VIRTUE_HARD_STOP_COOLDOWN_CYCLES,
+    VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES,
     VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES,
     VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES,
     VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES,
+    VIRTUE_POST_TP_PULLBACK_BLEND_LONG,
+    VIRTUE_POST_TP_PULLBACK_BLEND_SHORT,
+    VIRTUE_POST_TP_STREAK_COOLDOWN_EXTRA,
+    VIRTUE_POST_TP_STREAK_PULLBACK_AFTER,
+    VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES,
+    VIRTUE_MULTI_TP_COOLDOWN_S,
+    VIRTUE_MULTI_TP_COOLDOWN_STREAK,
+    VIRTUE_POST_LOSS_EXTRA_STREAK,
+    VIRTUE_TEMPERANCE_BASE_CONTRACTS,
+    VIRTUE_TEMPERANCE_COURSE_CORRECT_BLEND_BUFFER,
+    VIRTUE_TEMPERANCE_LOSS_BLEND_BUFFER,
+    VIRTUE_TEMPERANCE_LOSS_STREAK_MIN,
+    VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE,
+    VIRTUE_PIPELINE_BULL_SHORT_PENALTY,
+    VIRTUE_PIPELINE_LONG_BLEND_BASE,
+    VIRTUE_PIPELINE_SHORT_BLEND_BASE,
+    VIRTUE_VELOCITY_ADX_FLOOR,
+    VIRTUE_VELOCITY_PENALTY_PER_ADX,
+    VIRTUE_POST_TIME_DECAY_COOLDOWN_CYCLES,
+    VIRTUE_TIME_DECAY_COOLDOWN_CYCLES,
+    VIRTUE_TIME_DECAY_MAX_CYCLES,
+    VIRTUE_TIME_DECAY_MIN_OPEN_PNL,
+    VIRTUE_ADX_ENTER_MIN,
+    VIRTUE_ADX_SHORT_ENTER_MIN,
+    VIRTUE_BULL_DAY_SHORT_ADX_MIN,
+    VIRTUE_BULL_DAY_SHORT_BLEND_MAX,
+    VIRTUE_COURSE_CORRECT_LONG_BLEND,
+    VIRTUE_COURSE_CORRECT_SHORT_BLEND,
     VIRTUE_REQUIRED_STREAK,
     VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS,
     VIRTUE_RTH_FLATTEN_RETRY_S,
@@ -81,6 +139,7 @@ from engine.ui_state_bridge import (
     load_persisted_day_bucket,
     load_persisted_open_positions,
     persist_virtue_system_state,
+    restore_dual_sleeve_books,
     save_paper_book,
 )
 from scripts.run_daily_session import (
@@ -103,6 +162,8 @@ class VirtueSession:
     halted: bool = False
     last_action: str = "FLAT"
     realized_pnl_today: float = 0.0
+    peak_realized_pnl_today: float = 0.0  # high-water mark for trailing profit lock
+    virtue_pnl_lock_active: bool = False  # day shut down after trailing floor breach
     trades_today: int = 0
     session_date_et: str = ""  # YYYY-MM-DD America/New_York — Temperance day bucket
     last_risk_verdict: str = ""
@@ -116,9 +177,39 @@ class VirtueSession:
     last_blended_score: float = 50.0
     last_data_source: str = "alpaca_spy_mes_proxy"
     anchors_aligned: bool = False
-    entry_cooldown_cycles: int = 0  # skip new entries after anchor rebase
+    entry_cooldown_cycles: int = 0  # skip new entries after anchor rebase (non-trade)
+    pipeline_resume_cycle: int = 0  # absolute engine cycle when entries may resume
+    layer1_streak_clear: bool = True  # entry_pipeline Layer-1 readiness flag
+    entry_cycle_marker: int | None = None  # engine cycle when current exposure opened
+    consecutive_tp_streak: int = 0  # Temperance: cool re-entry after multi-TP runs
+    last_tp_timestamp: float = 0.0  # unix time of last TP (system_state + wall-clock lock)
+    require_tp_pullback: bool = False  # after N TPs, wait for blend cool-off
+    macro_bias: str = "NEUTRAL"  # BULL | BEAR | NEUTRAL — day regime for asymmetric shorts
+    long_tps_today: int = 0
+    short_tps_today: int = 0
+    # Outcome block — TACTICAL sleeve only (Temperance; core never writes here)
+    last_result: str = "FLAT"  # WIN | LOSS | FLAT
+    last_reason: str = "none"  # take_profit | stop | course_correct | ...
+    consecutive_wins: int = 0
+    consecutive_losses: int = 0
+    last_trade_pnl: float = 0.0
     long_streak: int = 0
     short_streak: int = 0
+    # Dual-sleeve books (Unified Rules of Engagement)
+    macro_structural_regime: str = "STRUCTURAL_NEUTRAL"
+    structural_bull_streak: int = 0
+    structural_bear_streak: int = 0
+    core_active: bool = False
+    core_side: str = "FLAT"
+    core_size: int = 0
+    core_entry_price: float = 0.0
+    core_realized_pnl_today: float = 0.0
+    core_realized_pnl_this_cycle: float = 0.0
+    tactical_active: bool = False
+    tactical_side: str = "FLAT"
+    tactical_size: int = 0
+    tactical_entry_price: float = 0.0
+    tactical_realized_pnl_today: float = 0.0
     is_running: bool = True  # False stops background state writer (run.py pattern)
     cycles_since_heartbeat: int = 0
     last_heartbeat_ok: bool = True
@@ -130,6 +221,8 @@ class VirtueSession:
             long_exit=float(VIRTUE_SCORE_LONG_EXIT),
             short_exit=float(VIRTUE_SCORE_SHORT_EXIT),
             score_price_pct=float(VIRTUE_SCORE_PRICE_PCT),
+            adx_trend_min=float(VIRTUE_ADX_ENTER_MIN),
+            adx_short_min=float(VIRTUE_ADX_SHORT_ENTER_MIN),
         )
     )
     broker: VirtueBroker = field(default_factory=VirtueBroker)
@@ -140,6 +233,512 @@ class VirtueSession:
             peak_nav=STARTING_NAV,
         )
     )
+
+
+def check_virtue_pnl_lock(
+    session: VirtueSession | dict,
+) -> bool:
+    """
+    Virtue Balance — trailing daily profit lock (Temperance).
+
+    Once peak realized PnL today >= arm threshold, protect floor_frac of that peak.
+    If realized drops to/below the floor, lock the engine for the rest of the ET day.
+    """
+    if isinstance(session, dict):
+        realized = float(session.get("realized_pnl_today", 0.0) or 0.0)
+        peak = float(session.get("peak_realized_pnl_today", 0.0) or 0.0)
+        if realized > peak:
+            session["peak_realized_pnl_today"] = realized
+            peak = realized
+        arm = float(VIRTUE_PNL_LOCK_ARM_PEAK)
+        frac = float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
+        if peak >= arm:
+            floor_lock = peak * frac
+            if realized <= floor_lock:
+                was_active = bool(session.get("virtue_pnl_lock_active"))
+                session["virtue_pnl_lock_active"] = True
+                session["Regime"] = "CHOP_NO_TRADE"
+                session["regime"] = "CHOP_NO_TRADE"
+                if not was_active:
+                    notify_profit_guard(
+                        realized=realized, floor=floor_lock, peak=peak
+                    )
+                return True
+        return bool(session.get("virtue_pnl_lock_active"))
+
+    # Already latched for the day — stay locked (Justice: no silent unlock).
+    if bool(session.virtue_pnl_lock_active):
+        return True
+
+    realized = float(session.realized_pnl_today or 0.0)
+    peak = float(session.peak_realized_pnl_today or 0.0)
+    if realized > peak:
+        session.peak_realized_pnl_today = realized
+        peak = realized
+
+    arm = float(VIRTUE_PNL_LOCK_ARM_PEAK)
+    frac = float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
+    if peak >= arm:
+        floor_lock = peak * frac
+        if realized <= floor_lock + 1e-9:
+            session.virtue_pnl_lock_active = True
+            session.last_regime = "CHOP_NO_TRADE"
+            session.last_signal_reason = (
+                f"virtue_pnl_lock peak={peak:.2f} floor={floor_lock:.2f} "
+                f"realized={realized:.2f}"
+            )
+            logger.error(
+                "VIRTUE_PNL_LOCK triggered peak=%.2f floor=%.2f realized=%.2f — "
+                "day shut down (Temperance)",
+                peak,
+                floor_lock,
+                realized,
+            )
+            notify_profit_guard(realized=realized, floor=floor_lock, peak=peak)
+            return True
+    return False
+
+
+def check_time_decay_exit(
+    session: VirtueSession,
+    current_engine_cycle: int,
+    *,
+    open_pnl: float,
+    exposure: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Failsafe: flatten stagnant holds that never produce momentum toward TP.
+
+    Marks entry_cycle_marker on first observed exposure. Triggers when
+    elapsed >= VIRTUE_TIME_DECAY_MAX_CYCLES and open_pnl <= MIN threshold.
+    """
+    net_dir, net_size = session.broker.net_exposure()
+    exp = (exposure or net_dir or "FLAT").upper()
+    if exp == "FLAT" or net_size <= 0:
+        session.entry_cycle_marker = None
+        return False, ""
+
+    if session.entry_cycle_marker is None:
+        session.entry_cycle_marker = int(current_engine_cycle)
+        return False, ""
+
+    elapsed = int(current_engine_cycle) - int(session.entry_cycle_marker)
+    max_cycles = int(VIRTUE_TIME_DECAY_MAX_CYCLES)
+    min_pnl = float(VIRTUE_TIME_DECAY_MIN_OPEN_PNL)
+    if elapsed >= max_cycles and float(open_pnl) <= min_pnl:
+        reason = (
+            f"time_decay elapsed={elapsed}>={max_cycles} "
+            f"open_pnl={float(open_pnl):.2f}<={min_pnl:.2f}"
+        )
+        logger.warning(
+            "CYCLE %s TIME_DECAY_TRIGGERED holding=%s elapsed=%s open_pnl=%.2f — %s",
+            current_engine_cycle,
+            exp,
+            elapsed,
+            float(open_pnl),
+            reason,
+        )
+        notify_time_decay(
+            elapsed=elapsed, open_pnl=float(open_pnl), exposure=exp
+        )
+        return True, reason
+    return False, ""
+
+
+def check_course_correct(current_position: str, blend: float) -> tuple[bool, str]:
+    """
+    Layer 3 — Execution State (every loop iteration while holding).
+
+    Drop a position immediately on mid-band thesis flip. Independent of strategy
+    hold hysteresis — cannot freeze into the dollar stop.
+    SHORT + blend >= 50 or LONG + blend <= 50 → flatten.
+    """
+    pos = (current_position or "").upper()
+    b = float(blend)
+    if pos == "SHORT" and b >= float(VIRTUE_COURSE_CORRECT_SHORT_BLEND):
+        return (
+            True,
+            f"course_correct_short_vs_bull blend={b:.1f}>={float(VIRTUE_COURSE_CORRECT_SHORT_BLEND):.1f}",
+        )
+    if pos == "LONG" and b <= float(VIRTUE_COURSE_CORRECT_LONG_BLEND):
+        return (
+            True,
+            f"course_correct_long_vs_bear blend={b:.1f}<={float(VIRTUE_COURSE_CORRECT_LONG_BLEND):.1f}",
+        )
+    return False, ""
+
+
+def update_macro_bias(
+    session: VirtueSession,
+    *,
+    regime: str = "",
+    action: str = "",
+    blend: float = 50.0,
+    adx: float = 0.0,
+    banked_side: str | None = None,
+) -> str:
+    """
+    Sticky ET-day macro bias for asymmetric short friction.
+
+    Latch BULL/BEAR from seed regime, strong structure, or banked TP side.
+    Does not flip on single noisy cycles (Temperance).
+    """
+    bias = (session.macro_bias or "NEUTRAL").upper()
+    if bias not in {"BULL", "BEAR", "NEUTRAL"}:
+        bias = "NEUTRAL"
+    reg = (regime or "").upper()
+    act = (action or "").upper()
+    side = (banked_side or "").upper()
+
+    if side == "LONG":
+        bias = "BULL"
+    elif side == "SHORT":
+        bias = "BEAR"
+    elif (
+        act == "LONG"
+        and float(adx) >= float(VIRTUE_ADX_ENTER_MIN)
+        and float(blend) >= 60.0
+    ):
+        bias = "BULL"
+    elif (
+        act == "SHORT"
+        and float(adx) >= float(VIRTUE_ADX_SHORT_ENTER_MIN)
+        and float(blend) <= 40.0
+    ):
+        bias = "BEAR"
+    elif "BULL" in reg and bias == "NEUTRAL":
+        bias = "BULL"
+    elif "BEAR" in reg and bias == "NEUTRAL":
+        bias = "BEAR"
+
+    # Day win skew overrides soft structure (realized truth).
+    if int(session.long_tps_today) > int(session.short_tps_today):
+        bias = "BULL"
+    elif int(session.short_tps_today) > int(session.long_tps_today):
+        bias = "BEAR"
+
+    session.macro_bias = bias
+    return bias
+
+
+def evaluate_directional_gate(
+    entry_signal: str,
+    *,
+    macro_bias: str,
+    blend: float,
+    adx: float,
+) -> tuple[bool, str]:
+    """
+    Layer 2 — Asymmetric Filter (after a directional entry signal passes).
+
+    Shorts on bull days require extreme confirmation. LONG path unchanged.
+    Returns (allowed, reason).
+    """
+    side = (entry_signal or "").upper()
+    bias = (macro_bias or "NEUTRAL").upper()
+    if side == "SHORT" and bias == "BULL":
+        thr = float(VIRTUE_BULL_DAY_SHORT_BLEND_MAX)
+        min_adx = float(VIRTUE_BULL_DAY_SHORT_ADX_MIN)
+        b = float(blend)
+        a = float(adx)
+        if b > thr or a < min_adx:
+            return (
+                False,
+                (
+                    f"bull_day_short_denied bias=BULL blend={b:.1f} need<={thr:.1f} "
+                    f"adx={a:.1f} need>={min_adx:.1f}"
+                ),
+            )
+    return True, ""
+
+
+def calculate_temperance_parameters(
+    system_state: dict | None = None,
+    *,
+    session: VirtueSession | None = None,
+) -> tuple[int, float]:
+    """
+    Dynamically adjust size and entry criteria from recent performance.
+
+    Returns (base_contracts, blend_buffer_modifier).
+    MES irreducible lot stays 1 — friction is applied via wider enter bands.
+    When both loss-streak and course_correct apply, use the stronger buffer (max).
+    """
+    outcome: dict = {}
+    if isinstance(system_state, dict):
+        outcome = system_state.get("last_trade_outcome") or {}
+    if session is not None and not outcome:
+        outcome = {
+            "consecutive_losses": int(getattr(session, "consecutive_losses", 0) or 0),
+            "last_reason": str(getattr(session, "last_reason", "") or ""),
+        }
+
+    consecutive_losses = int(outcome.get("consecutive_losses", 0) or 0)
+    last_reason = str(outcome.get("last_reason", "") or "").strip().lower()
+
+    base_contracts = max(1, int(VIRTUE_TEMPERANCE_BASE_CONTRACTS))
+    blend_buffer_modifier = 0.0
+
+    # Rule 1: losing streak → stronger trend required (cannot halve below 1 MES).
+    if consecutive_losses >= int(VIRTUE_TEMPERANCE_LOSS_STREAK_MIN):
+        blend_buffer_modifier = max(
+            blend_buffer_modifier,
+            float(VIRTUE_TEMPERANCE_LOSS_BLEND_BUFFER),
+        )
+
+    # Rule 2: post course_correct cooling — widen neutral band.
+    if last_reason == "course_correct":
+        blend_buffer_modifier = max(
+            blend_buffer_modifier,
+            float(VIRTUE_TEMPERANCE_COURSE_CORRECT_BLEND_BUFFER),
+        )
+
+    return base_contracts, float(blend_buffer_modifier)
+
+
+def effective_temperance_blend_buffer(
+    blend_buffer: float,
+    *,
+    side: str,
+    adx: float,
+    macro_bias: str,
+) -> float:
+    """
+    Strong with-trend: drop blend widening; keep confirmation-streak Temperance.
+
+    After a loss streak the raw +5 buffer raised live enter to 63 while the
+    strategy still printed enter>=58 — streak stayed 0/4 through ADX 40+ rips.
+    """
+    try:
+        adx_val = float(adx or 0.0)
+    except (TypeError, ValueError):
+        adx_val = 0.0
+    if adx_val < float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE):
+        return float(blend_buffer)
+    bias = (macro_bias or "NEUTRAL").strip().upper()
+    s = (side or "").strip().upper()
+    if bias == "BULL" and s == "LONG":
+        return 0.0
+    if bias == "BEAR" and s == "SHORT":
+        return 0.0
+    return float(blend_buffer)
+
+
+def calculate_dynamic_blend_thresholds(
+    system_state: dict | None = None,
+    *,
+    adx: float | None = None,
+) -> tuple[float, float]:
+    """
+    Velocity gate: widen entry thresholds when ADX is low to block slow drifts.
+
+    If ADX < VIRTUE_VELOCITY_ADX_FLOOR, add (floor - adx) * penalty_per_adx
+    to the long gate and subtract the same from the short gate.
+    """
+    state = system_state if isinstance(system_state, dict) else {}
+    try:
+        adx_val = float(
+            adx
+            if adx is not None
+            else state.get("ADX", state.get("adx", 14.0)) or 14.0
+        )
+    except (TypeError, ValueError):
+        adx_val = 14.0
+    # Missing/zero ADX → treat as weak (Justice: do not pretend trend strength).
+    if adx_val <= 0:
+        adx_val = 14.0
+
+    long_threshold = float(VIRTUE_PIPELINE_LONG_BLEND_BASE)
+    short_threshold = float(VIRTUE_PIPELINE_SHORT_BLEND_BASE)
+    floor = float(VIRTUE_VELOCITY_ADX_FLOOR)
+    if adx_val < floor:
+        volatility_penalty = (floor - adx_val) * float(VIRTUE_VELOCITY_PENALTY_PER_ADX)
+        long_threshold += volatility_penalty
+        short_threshold -= volatility_penalty
+        logger.info(
+            "VELOCITY_GATE low_adx=%.1f penalty=+%.1f → long>=%.1f short<=%.1f",
+            adx_val,
+            volatility_penalty,
+            long_threshold,
+            short_threshold,
+        )
+    return float(long_threshold), float(short_threshold)
+
+
+def velocity_blend_penalty(
+    system_state: dict | None = None,
+    *,
+    adx: float | None = None,
+) -> float:
+    """Points added to long / subtracted from short when ADX is weak."""
+    long_thr, _ = calculate_dynamic_blend_thresholds(system_state, adx=adx)
+    return max(0.0, float(long_thr) - float(VIRTUE_PIPELINE_LONG_BLEND_BASE))
+
+
+def pipeline_system_state(
+    session: VirtueSession,
+    *,
+    blend: float | None = None,
+    adx: float | None = None,
+) -> dict:
+    """Build the system_state dict consumed by verify_pipeline_entry."""
+    try:
+        adx_val = float(
+            adx
+            if adx is not None
+            else getattr(session, "last_adx", 14.0) or 14.0
+        )
+    except (TypeError, ValueError):
+        adx_val = 14.0
+    if adx_val <= 0:
+        adx_val = 14.0
+    return {
+        "last_trade_outcome": {
+            "last_result": str(getattr(session, "last_result", "FLAT") or "FLAT"),
+            "last_reason": str(getattr(session, "last_reason", "none") or "none"),
+            "consecutive_wins": int(getattr(session, "consecutive_wins", 0) or 0),
+            "consecutive_losses": int(getattr(session, "consecutive_losses", 0) or 0),
+            "last_trade_pnl": float(getattr(session, "last_trade_pnl", 0.0) or 0.0),
+        },
+        "vwap_twap_blend": float(
+            blend
+            if blend is not None
+            else getattr(session, "last_blended_score", 50.0) or 50.0
+        ),
+        "macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
+        "ADX": adx_val,
+        "adx": adx_val,
+    }
+
+
+def verify_pipeline_entry(
+    entry_signal: str,
+    system_state: dict | None,
+) -> tuple[bool, str]:
+    """
+    Entry-pipeline validation with Temperance friction + ADX velocity gate.
+
+    Blocks re-entry into chop after a bad stop / course_correct by widening
+    the blend band. Low ADX widens further (slow-drift trap). Bull-day shorts
+    get an extra structural penalty. Returns (allowed, reason).
+    """
+    state = system_state if isinstance(system_state, dict) else {}
+    _, raw_blend_buffer = calculate_temperance_parameters(state)
+    dyn_long, dyn_short = calculate_dynamic_blend_thresholds(state)
+    velocity_penalty = max(
+        0.0, float(dyn_long) - float(VIRTUE_PIPELINE_LONG_BLEND_BASE)
+    )
+
+    try:
+        current_blend = float(state.get("vwap_twap_blend", 50.0) or 50.0)
+    except (TypeError, ValueError):
+        return False, "pipeline_block:invalid_blend"
+    macro_bias = str(state.get("macro_bias", "NEUTRAL") or "NEUTRAL").upper()
+    if macro_bias in {"CHOP", ""}:
+        macro_bias = "NEUTRAL"
+    side = (entry_signal or "").strip().upper()
+    try:
+        adx_for_buf = float(state.get("ADX", state.get("adx", 14.0)) or 14.0)
+    except (TypeError, ValueError):
+        adx_for_buf = 14.0
+    blend_buffer_modifier = effective_temperance_blend_buffer(
+        raw_blend_buffer,
+        side=side,
+        adx=adx_for_buf,
+        macro_bias=macro_bias,
+    )
+
+    if side == "LONG":
+        required_long_blend = float(dyn_long) + float(blend_buffer_modifier)
+        if current_blend < required_long_blend:
+            reason = (
+                f"pipeline_block:long_blend={current_blend:.1f}"
+                f"<required={required_long_blend:.1f}"
+                f"(base={float(VIRTUE_PIPELINE_LONG_BLEND_BASE):.1f}"
+                f"+vel={velocity_penalty:.1f}"
+                f"+buf={float(blend_buffer_modifier):.1f})"
+            )
+            logger.info("PIPELINE_BLOCK %s", reason)
+            notify_velocity_gate_block(
+                side="LONG",
+                blend=current_blend,
+                target=required_long_blend,
+                velocity=velocity_penalty,
+            )
+            return False, reason
+        return True, (
+            f"pipeline_ok:long blend={current_blend:.1f}"
+            f">={required_long_blend:.1f}"
+        )
+
+    if side == "SHORT":
+        required_short_blend = float(dyn_short) - float(blend_buffer_modifier)
+        if macro_bias == "BULL":
+            required_short_blend -= float(VIRTUE_PIPELINE_BULL_SHORT_PENALTY)
+            logger.info(
+                "PIPELINE asymmetric_short_gate BULL day — "
+                "demand structural breakdown blend<=%.1f "
+                "(vel=%.1f buf=%.1f penalty=%.1f)",
+                required_short_blend,
+                velocity_penalty,
+                float(blend_buffer_modifier),
+                float(VIRTUE_PIPELINE_BULL_SHORT_PENALTY),
+            )
+        if current_blend > required_short_blend:
+            reason = (
+                f"pipeline_block:short_blend={current_blend:.1f}"
+                f">required={required_short_blend:.1f}"
+                f"(base={float(VIRTUE_PIPELINE_SHORT_BLEND_BASE):.1f}"
+                f"-vel={velocity_penalty:.1f}"
+                f"-buf={float(blend_buffer_modifier):.1f}"
+                f"{'-bull5' if macro_bias == 'BULL' else ''})"
+            )
+            logger.info("PIPELINE_BLOCK %s", reason)
+            notify_velocity_gate_block(
+                side="SHORT",
+                blend=current_blend,
+                target=required_short_blend,
+                velocity=velocity_penalty,
+            )
+            return False, reason
+        return True, (
+            f"pipeline_ok:short blend={current_blend:.1f}"
+            f"<={required_short_blend:.1f}"
+        )
+
+    return False, f"pipeline_block:unsupported_signal={side or 'EMPTY'}"
+
+
+def verify_cooldown_validity(
+    session: VirtueSession,
+    *,
+    now: float | None = None,
+) -> tuple[bool, int]:
+    """
+    Layer 1 — Streak Validation (first entry gate).
+
+    If consecutive_tp_streak >= 3, block new entries until
+    VIRTUE_MULTI_TP_COOLDOWN_S seconds have elapsed since last_tp_timestamp.
+    When false, the entry pipeline must bypass all further entry calculations.
+    Returns (clear_to_trade, remaining_seconds).
+    """
+    streak = int(getattr(session, "consecutive_tp_streak", 0) or 0)
+    if streak < int(VIRTUE_MULTI_TP_COOLDOWN_STREAK):
+        return True, 0
+    last_tp = float(getattr(session, "last_tp_timestamp", 0.0) or 0.0)
+    if last_tp <= 0:
+        return True, 0
+    ts = float(time.time() if now is None else now)
+    elapsed = ts - last_tp
+    cooldown = float(VIRTUE_MULTI_TP_COOLDOWN_S)
+    if elapsed < cooldown:
+        remaining = max(0, int(cooldown - elapsed))
+        return False, remaining
+    # Lock expired — clear streak so the brake does not latch forever.
+    session.consecutive_tp_streak = 0
+    session.last_tp_timestamp = 0.0
+    session.require_tp_pullback = False
+    return True, 0
 
 
 def target_ticks_from_atr(atr: float) -> int:
@@ -198,7 +797,28 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     prior_trades = int(session.trades_today)
     session.session_date_et = today
     session.realized_pnl_today = 0.0
+    session.peak_realized_pnl_today = 0.0
+    session.virtue_pnl_lock_active = False
     session.trades_today = 0
+    session.consecutive_tp_streak = 0
+    session.last_tp_timestamp = 0.0
+    session.require_tp_pullback = False
+    session.macro_bias = "NEUTRAL"
+    session.long_tps_today = 0
+    session.short_tps_today = 0
+    session.last_result = "FLAT"
+    session.last_reason = "none"
+    session.consecutive_wins = 0
+    session.consecutive_losses = 0
+    session.last_trade_pnl = 0.0
+    session.pipeline_resume_cycle = 0
+    session.entry_cycle_marker = None
+    session.core_realized_pnl_today = 0.0
+    session.core_realized_pnl_this_cycle = 0.0
+    session.tactical_realized_pnl_today = 0.0
+    # Structural confirm streaks reset with the ET day (core position may still be open).
+    session.structural_bull_streak = 0
+    session.structural_bear_streak = 0
     logger.info(
         "SESSION_DAY_ROLL et_date=%s prior_date=%s prior_realized=%.2f prior_trades=%s "
         "book_equity=%.2f — day counters reset; NAV compounds (not reset)",
@@ -218,6 +838,243 @@ def _local_paper_book() -> bool:
     return bool(forward_test_force_paper() and not webull_is_sandbox())
 
 
+def _normalize_outcome_reason(reason: str) -> str:
+    """Map broker/engine exit reasons to stable last_trade_outcome tags."""
+    r = (reason or "").strip().lower()
+    if r.startswith("take_profit") or "take_profit" in r:
+        return "take_profit"
+    if r.startswith("stop_") or r.startswith("stop$") or r == "stop":
+        return "stop"
+    if "course_correct" in r:
+        return "course_correct"
+    if r.startswith("time_decay") or "time_decay" in r:
+        return "time_decay"
+    if "profit_guard" in r or "virtue_pnl_lock" in r:
+        return "virtue_pnl_lock"
+    if "structured_exit" in r:
+        return "structured_exit"
+    if "thesis_invalid" in r or r.startswith("wisdom_flat"):
+        return "thesis_invalid"
+    if not r or r == "none":
+        return "none"
+    return (reason or "unknown")[:48]
+
+
+def pipeline_lock_remaining(session: VirtueSession) -> tuple[bool, int]:
+    """
+    Absolute-cycle pipeline lock from update_outcome_state.
+
+    Returns (locked, remaining_cycles). Entries allowed when cycle >= resume.
+    """
+    resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
+    cur = int(getattr(session, "cycle", 0) or 0)
+    if resume <= 0 or cur >= resume:
+        return False, 0
+    return True, max(0, resume - cur)
+
+
+def is_entry_pipeline_clear(
+    session_state: VirtueSession | dict,
+    current_engine_cycle: int | None = None,
+) -> bool:
+    """
+    Layer 1 — evaluate execution readiness before entry-signal work.
+
+    Uses absolute pipeline_resume_cycle (no wall clock). Returns True when
+    current_engine_cycle >= resume_cycle (or resume unset).
+    """
+    if isinstance(session_state, dict):
+        resume = int(session_state.get("pipeline_resume_cycle", 0) or 0)
+        cur = int(
+            current_engine_cycle
+            if current_engine_cycle is not None
+            else session_state.get("cycle", 0) or 0
+        )
+        pipeline = session_state.setdefault("entry_pipeline", {})
+        if cur < resume:
+            remaining = resume - cur
+            pipeline["layer1_streak_clear"] = False
+            pipeline["pipeline_remaining_cycles"] = remaining
+            session_state["multi_tp_cooldown_active"] = True
+            # Index delta exposed on the legacy remaining_s field for dashboard polls.
+            session_state["multi_tp_cooldown_remaining_s"] = remaining
+            return False
+        pipeline["layer1_streak_clear"] = True
+        pipeline["pipeline_remaining_cycles"] = 0
+        session_state["multi_tp_cooldown_active"] = False
+        session_state["multi_tp_cooldown_remaining_s"] = 0
+        return True
+
+    session = session_state
+    cur = int(
+        current_engine_cycle
+        if current_engine_cycle is not None
+        else getattr(session, "cycle", 0) or 0
+    )
+    resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
+    if resume > 0 and cur < resume:
+        remaining = resume - cur
+        session.layer1_streak_clear = False
+        logger.info(
+            "CYCLE %s LAYER1_pipeline_locked resume_cycle=%s remaining=%s "
+            "last_reason=%s — bypass entry calculations",
+            cur,
+            resume,
+            remaining,
+            getattr(session, "last_reason", "none"),
+        )
+        return False
+
+    session.layer1_streak_clear = True
+    return True
+
+
+def update_outcome_state(
+    session: VirtueSession,
+    trade_pnl: float,
+    exit_reason: str,
+    current_engine_cycle: int | None = None,
+    *,
+    count_trade: bool = True,
+) -> VirtueSession:
+    """
+    Synchronous post-fill state updater (flatten_all → credit → here).
+
+    Updates W/L streaks and locks the entry pipeline until an absolute
+    future engine cycle (no wall-clock dependency).
+    """
+    delta = round(float(trade_pnl or 0.0), 2)
+    tag = _normalize_outcome_reason(exit_reason)
+    cycle = int(
+        session.cycle if current_engine_cycle is None else current_engine_cycle
+    )
+    session.last_trade_pnl = delta
+    session.last_reason = tag
+    if count_trade:
+        session.trades_today = int(session.trades_today) + 1
+
+    cooldown_applied = int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)
+
+    if tag == "take_profit":
+        session.last_result = "WIN"
+        session.consecutive_wins = int(session.consecutive_wins) + 1
+        session.consecutive_losses = 0
+        # Trailing streak penalty uses pre-increment streak: base + streak * bonus.
+        streak = int(session.consecutive_tp_streak)
+        cooldown_applied = int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) + (
+            streak * int(VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES)
+        )
+        session.consecutive_tp_streak = streak + 1
+        session.last_tp_timestamp = float(time.time())
+        if int(session.consecutive_tp_streak) >= int(
+            VIRTUE_POST_TP_STREAK_PULLBACK_AFTER
+        ):
+            session.require_tp_pullback = True
+
+    elif tag == "course_correct":
+        # Thesis broke — always LOSS friction even if exit printed green.
+        session.last_result = "LOSS"
+        session.consecutive_losses = int(session.consecutive_losses) + 1
+        session.consecutive_wins = 0
+        session.consecutive_tp_streak = 0
+        session.last_tp_timestamp = 0.0
+        session.require_tp_pullback = False
+        cooldown_applied = int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES)
+
+    elif tag == "stop":
+        session.last_result = "LOSS"
+        session.consecutive_losses = int(session.consecutive_losses) + 1
+        session.consecutive_wins = 0
+        session.consecutive_tp_streak = 0
+        session.last_tp_timestamp = 0.0
+        session.require_tp_pullback = False
+        cooldown_applied = int(VIRTUE_HARD_STOP_COOLDOWN_CYCLES)
+
+    elif tag == "time_decay":
+        # Stagnant exposure cut — fast cool-off (thesis did not break).
+        cooldown_applied = int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES)
+        if delta > 0:
+            session.last_result = "WIN"
+            session.consecutive_wins = int(session.consecutive_wins) + 1
+            session.consecutive_losses = 0
+        else:
+            session.last_result = "LOSS"
+            session.consecutive_losses = int(session.consecutive_losses) + 1
+            session.consecutive_wins = 0
+            session.consecutive_tp_streak = 0
+            session.last_tp_timestamp = 0.0
+            session.require_tp_pullback = False
+
+    elif tag == "virtue_pnl_lock":
+        # Day shut-down latch already set; cool-off if residual flattened.
+        cooldown_applied = int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES)
+        if delta > 0:
+            session.last_result = "WIN"
+            session.consecutive_wins = int(session.consecutive_wins) + 1
+            session.consecutive_losses = 0
+        else:
+            session.last_result = "LOSS"
+            session.consecutive_losses = int(session.consecutive_losses) + 1
+            session.consecutive_wins = 0
+            session.consecutive_tp_streak = 0
+            session.last_tp_timestamp = 0.0
+            session.require_tp_pullback = False
+        session.virtue_pnl_lock_active = True
+        session.last_regime = "CHOP_NO_TRADE"
+
+    else:
+        # structured_exit / thesis_invalid / unknown — safety rebase cool-off
+        cooldown_applied = int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)
+        if delta > 0:
+            session.last_result = "WIN"
+            session.consecutive_wins = int(session.consecutive_wins) + 1
+            session.consecutive_losses = 0
+        else:
+            session.last_result = "LOSS"
+            session.consecutive_losses = int(session.consecutive_losses) + 1
+            session.consecutive_wins = 0
+            session.consecutive_tp_streak = 0
+            session.last_tp_timestamp = 0.0
+            session.require_tp_pullback = False
+
+    # Any confirmed close clears the exposed-cycle marker.
+    session.entry_cycle_marker = None
+
+    resume_at = cycle + max(0, int(cooldown_applied))
+    session.pipeline_resume_cycle = max(
+        int(session.pipeline_resume_cycle or 0),
+        resume_at,
+    )
+
+    logger.info(
+        "OUTCOME_STATE last_result=%s last_reason=%s pnl=%.2f "
+        "wins=%s losses=%s tp_streak=%s pullback=%s "
+        "cooldown=%s resume_cycle=%s (now=%s)",
+        session.last_result,
+        session.last_reason,
+        session.last_trade_pnl,
+        session.consecutive_wins,
+        session.consecutive_losses,
+        session.consecutive_tp_streak,
+        session.require_tp_pullback,
+        cooldown_applied,
+        session.pipeline_resume_cycle,
+        cycle,
+    )
+    notify_trade_closed(
+        reason=str(session.last_reason or tag),
+        pnl=float(session.last_trade_pnl),
+        cooldown_cycles=int(cooldown_applied),
+        cycle=cycle,
+    )
+    return session
+
+
+def _record_trade_outcome(session: VirtueSession, pnl: float, reason: str) -> None:
+    """Compat wrapper — prefer update_outcome_state."""
+    update_outcome_state(session, pnl, reason, current_engine_cycle=session.cycle)
+
+
 def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
     """
     Bank realized PnL into the day bucket.
@@ -227,6 +1084,9 @@ def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
     """
     delta = float(pnl or 0.0)
     session.realized_pnl_today = round(session.realized_pnl_today + delta, 2)
+    # High-water mark for Virtue Balance trailing lock.
+    if session.realized_pnl_today > float(session.peak_realized_pnl_today or 0.0):
+        session.peak_realized_pnl_today = float(session.realized_pnl_today)
     if abs(delta) >= 1e-12 and _local_paper_book():
         session.broker.update_equity(round(float(session.broker.equity) + delta, 2))
         # Durable ledger — day-roll / weekend / dashboard bootstrap must not erase gains.
@@ -237,7 +1097,273 @@ def _credit_realized_pnl(session: VirtueSession, pnl: float) -> None:
         )
     session.risk.update_nav(session.broker.equity)
     session.risk.peak_nav = max(float(session.risk.peak_nav), float(session.broker.equity))
+    # Evaluate trailing floor after every realized update (may latch day lock).
+    check_virtue_pnl_lock(session)
 
+
+def _tactical_open_pnl(session: VirtueSession, price: float) -> float:
+    """Mark-to-market for the tactical sleeve only (Temperance exits)."""
+    from engine.config import POINT_VALUE
+
+    if not bool(session.tactical_active) or int(session.tactical_size) <= 0:
+        return 0.0
+    entry = float(session.tactical_entry_price or 0.0)
+    if entry <= 0:
+        return 0.0
+    side = str(session.tactical_side or "FLAT").upper()
+    size = int(session.tactical_size)
+    points = (float(price) - entry) if side == "LONG" else (entry - float(price))
+    return round(points * float(POINT_VALUE) * size, 2)
+
+
+def _mark_tactical_open(
+    session: VirtueSession, *, side: str, price: float, size: int, cycle: int
+) -> None:
+    session.tactical_active = True
+    session.tactical_side = str(side or "FLAT").upper()
+    session.tactical_size = max(1, int(size))
+    session.tactical_entry_price = float(price)
+    session.entry_cycle_marker = int(cycle)
+
+
+def _mark_tactical_flat(session: VirtueSession) -> None:
+    session.tactical_active = False
+    session.tactical_side = "FLAT"
+    session.tactical_size = 0
+    session.tactical_entry_price = 0.0
+    session.entry_cycle_marker = None
+
+
+def _mark_core_open(
+    session: VirtueSession, *, side: str, price: float, size: int
+) -> None:
+    session.core_active = True
+    session.core_side = str(side or "FLAT").upper()
+    session.core_size = max(1, int(size))
+    session.core_entry_price = float(price)
+    session.core_realized_pnl_this_cycle = 0.0
+
+
+def _mark_core_flat(session: VirtueSession) -> None:
+    session.core_active = False
+    session.core_side = "FLAT"
+    session.core_size = 0
+    session.core_entry_price = 0.0
+
+
+def _credit_core_pnl(session: VirtueSession, pnl: float) -> None:
+    """Bank core sleeve PnL — never touches tactical temperance streaks."""
+    delta = round(float(pnl or 0.0), 2)
+    session.core_realized_pnl_this_cycle = delta
+    session.core_realized_pnl_today = round(
+        float(session.core_realized_pnl_today or 0.0) + delta, 2
+    )
+    _credit_realized_pnl(session, delta)
+
+
+def _credit_tactical_pnl(session: VirtueSession, pnl: float) -> None:
+    delta = round(float(pnl or 0.0), 2)
+    session.tactical_realized_pnl_today = round(
+        float(session.tactical_realized_pnl_today or 0.0) + delta, 2
+    )
+    _credit_realized_pnl(session, delta)
+
+
+def _on_tactical_router_close(
+    session: VirtueSession, *, pnl: float, reason: str, side: str, **_: Any
+) -> None:
+    _credit_tactical_pnl(session, pnl)
+    update_outcome_state(
+        session, pnl, reason, current_engine_cycle=session.cycle
+    )
+    session.long_streak = 0
+    session.short_streak = 0
+
+
+def _on_core_router_close(
+    session: VirtueSession, *, pnl: float, reason: str, side: str, **_: Any
+) -> None:
+    _credit_core_pnl(session, pnl)
+    logger.warning(
+        "CYCLE %s CORE_SLEEVE_CLOSED reason=%s pnl≈%.2f — temperance untouched "
+        "net_exposure=%s",
+        session.cycle,
+        reason,
+        pnl,
+        calculate_net_account_exposure(session),
+    )
+    # Macro invalidation gets a dedicated portfolio advisory from the escaper.
+    if str(reason or "").startswith("core_invalidation"):
+        return
+    notify_trade_closed(
+        reason=reason, pnl=float(pnl), cooldown_cycles=0, cycle=session.cycle
+    )
+
+
+async def _close_tactical_sleeve(
+    session: VirtueSession,
+    *,
+    price: float,
+    stop_ticks: int,
+    reason: str,
+) -> tuple[bool, float]:
+    """Close tactical only via multi-sleeve router (core never flattened)."""
+    if not bool(session.tactical_active) or int(session.tactical_size) <= 0:
+        return False, 0.0
+    ok, pnl, detail = await execute_tactical_action(
+        session,
+        target_side="FLAT",
+        target_size=0,
+        current_cycle=int(session.cycle),
+        price=price,
+        stop_ticks=stop_ticks,
+        reason=reason,
+        mark_flat=_mark_tactical_flat,
+        on_filled=_on_tactical_router_close,
+    )
+    if not ok:
+        logger.error(
+            "CYCLE %s TACTICAL_ROUTER_CLOSE_FAILED detail=%s", session.cycle, detail
+        )
+    return ok, float(pnl or 0.0)
+
+
+async def _close_core_sleeve(
+    session: VirtueSession,
+    *,
+    price: float,
+    stop_ticks: int,
+    reason: str,
+) -> tuple[bool, float]:
+    """Close core on structural invalidation — no tactical temperance write."""
+    if not bool(session.core_active) or int(session.core_size) <= 0:
+        return False, 0.0
+    ok, pnl, detail = await execute_core_action(
+        session,
+        target_side="FLAT",
+        target_size=0,
+        price=price,
+        stop_ticks=stop_ticks,
+        reason=reason,
+        mark_flat=_mark_core_flat,
+        on_filled=_on_core_router_close,
+    )
+    if not ok:
+        logger.error(
+            "CYCLE %s CORE_ROUTER_CLOSE_FAILED detail=%s", session.cycle, detail
+        )
+    return ok, float(pnl or 0.0)
+
+
+async def _manage_core_sleeve(
+    session: VirtueSession,
+    *,
+    price: float,
+    stop_ticks: int,
+    blend: float,
+    adx: float,
+) -> None:
+    """Update structural regime; Slow Invalidation Core Escaper + core open."""
+    regime, bull_s, bear_s = classify_structural_regime(
+        macro_bias=str(session.macro_bias or "NEUTRAL"),
+        adx=float(adx),
+        confirm_cycles=structural_confirm_cycles(),
+        bull_streak=int(session.structural_bull_streak),
+        bear_streak=int(session.structural_bear_streak),
+    )
+    session.structural_bull_streak = bull_s
+    session.structural_bear_streak = bear_s
+    session.macro_structural_regime = regime
+    session.core_realized_pnl_this_cycle = 0.0
+
+    # Slow Invalidation — sticky through NEUTRAL; exit only hard flip / deep breakdown.
+    inv, inv_reason = evaluate_core_macro_safety(
+        session,
+        int(session.cycle),
+        blend=float(blend),
+        structural_regime=regime,
+    )
+    if inv:
+        prior_side = str(session.core_side or "FLAT")
+        logger.warning(
+            "CYCLE %s MACRO_INVALIDATION_TRIGGERED side=%s regime=%s blend=%.1f "
+            "reason=%s — closing core anchor (temperance untouched)",
+            session.cycle,
+            prior_side,
+            regime,
+            float(blend),
+            inv_reason,
+        )
+        ok, pnl = await _close_core_sleeve(
+            session, price=price, stop_ticks=stop_ticks, reason=inv_reason
+        )
+        if ok:
+            notify_core_macro_invalidation(
+                side=prior_side,
+                reason=inv_reason,
+                blend=float(blend),
+                regime=str(regime),
+                pnl=float(pnl),
+                cycle=int(session.cycle),
+            )
+        return
+
+    open_ok, side = core_should_open(regime, core_active=bool(session.core_active))
+    if not open_ok:
+        return
+    # Room under ceiling for core size.
+    tac = int(session.tactical_size) if bool(session.tactical_active) else 0
+    need = core_size_default()
+    from engine.config import MAX_ACCOUNT_CONTRACT_CEILING
+
+    if tac + need > int(MAX_ACCOUNT_CONTRACT_CEILING):
+        logger.info(
+            "CYCLE %s CORE_OPEN_BLOCKED ceiling tac=%s need=%s cap=%s",
+            session.cycle,
+            tac,
+            need,
+            int(MAX_ACCOUNT_CONTRACT_CEILING),
+        )
+        return
+    # If tactical is opposite, do not open core (alignment / net rule).
+    if tac > 0 and str(session.tactical_side).upper() != side:
+        logger.info(
+            "CYCLE %s CORE_OPEN_BLOCKED opposite_tactical tac=%s core_want=%s",
+            session.cycle,
+            session.tactical_side,
+            side,
+        )
+        return
+
+    ok, _, detail = await execute_core_action(
+        session,
+        target_side=side,
+        target_size=need,
+        price=price,
+        stop_ticks=stop_ticks,
+        reason=f"core_open:{regime}",
+        mark_open=_mark_core_open,
+    )
+    if not ok:
+        logger.info(
+            "CYCLE %s CORE_ROUTER_OPEN_BLOCKED detail=%s", session.cycle, detail
+        )
+        return
+    logger.info(
+        "CYCLE %s CORE_SLEEVE_OPENED side=%s size=%s @ %s regime=%s net_exposure=%s",
+        session.cycle,
+        session.core_side,
+        session.core_size,
+        session.core_entry_price,
+        regime,
+        calculate_net_account_exposure(session),
+    )
+    notify_position_opened(
+        side=session.core_side,
+        client_order_id="",
+        cycle=int(session.cycle),
+        size=int(session.core_size),
+    )
 
 
 def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> None:
@@ -468,8 +1594,16 @@ async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -
     session.strategy.seed(bars)
     session.broker._last_price = float(bars[-1].close)
     decision = session.strategy.evaluate()
+    update_macro_bias(
+        session,
+        regime=decision.regime.value,
+        action=decision.action.value,
+        blend=float(decision.blended_score),
+        adx=float(decision.adx),
+    )
     logger.info(
-        "WISDOM_SEEDED src=%s bars=%s regime=%s action=%s vwap=%.1f twap=%.1f blend=%.1f adx=%.1f",
+        "WISDOM_SEEDED src=%s bars=%s regime=%s action=%s vwap=%.1f twap=%.1f blend=%.1f "
+        "adx=%.1f macro_bias=%s",
         seed_src,
         len(bars),
         decision.regime.value,
@@ -478,6 +1612,7 @@ async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -
         decision.twap_score,
         decision.blended_score,
         decision.adx,
+        session.macro_bias,
     )
     return len(bars)
 
@@ -546,7 +1681,7 @@ async def _flatten_until_flat(
     retry_s = max(0.5, float(VIRTUE_RTH_FLATTEN_RETRY_S))
     for attempt in range(1, attempts + 1):
         net_dir, net_size = session.broker.net_exposure()
-        if net_size <= 0:
+        if net_size <= 0 and absolute_contract_footprint(session) <= 0:
             return True
         price = await _resolve_flatten_price(session)
         if price <= 0:
@@ -562,10 +1697,15 @@ async def _flatten_until_flat(
             await asyncio.sleep(retry_s)
             continue
         try:
-            ok, pnl = await session.broker.flatten_all(
+            # Sleeve-sequential — tactical temperance first, core book second.
+            ok, pnl = await close_all_sleeves_sequential(
+                session,
                 price=price,
                 stop_ticks=stop_ticks,
                 reason=reason,
+                close_tactical=_close_tactical_sleeve,
+                close_core=_close_core_sleeve,
+                credit_residual=_credit_realized_pnl,
             )
         except Exception as exc:
             logger.exception(
@@ -579,16 +1719,16 @@ async def _flatten_until_flat(
             await asyncio.sleep(retry_s)
             continue
         if ok:
-            _credit_realized_pnl(session, pnl)
-            session.trades_today += 1
             logger.info(
-                "CYCLE %s %s attempt=%s closed %s x%s pnl≈%.2f",
+                "CYCLE %s %s attempt=%s sleeves_closed prior=%s x%s pnl≈%.2f "
+                "resume_cycle=%s",
                 session.cycle,
                 reason,
                 attempt,
                 net_dir,
                 net_size,
                 pnl,
+                session.pipeline_resume_cycle,
             )
         else:
             logger.error(
@@ -823,18 +1963,54 @@ async def run_cycle(
     open_pnl = session.broker.unrealized_position_pnl(price=price)
 
     # Dual independent streaks from raw entry bands (build while flat OR holding).
+    # Temperance + velocity: widen bands after losses / course_correct / low ADX.
     # Enables same-cycle flip when opposite streak is already ready (Courage).
+    base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
+    vel_penalty = velocity_blend_penalty(adx=float(decision.adx))
+    update_macro_bias(
+        session,
+        regime=decision.regime.value,
+        action=decision.action.value,
+        blend=float(decision.blended_score),
+        adx=float(decision.adx),
+    )
+    bias_now = str(session.macro_bias or "NEUTRAL")
+    long_buf = effective_temperance_blend_buffer(
+        blend_buffer_raw,
+        side="LONG",
+        adx=float(decision.adx),
+        macro_bias=bias_now,
+    )
+    short_buf = effective_temperance_blend_buffer(
+        blend_buffer_raw,
+        side="SHORT",
+        adx=float(decision.adx),
+        macro_bias=bias_now,
+    )
+    long_enter_thr = (
+        float(VIRTUE_SCORE_LONG_ENTER) + float(long_buf) + float(vel_penalty)
+    )
+    short_enter_thr = (
+        float(VIRTUE_SCORE_SHORT_ENTER) - float(short_buf) - float(vel_penalty)
+    )
     v_score = float(decision.vwap_score)
     t_score = float(decision.twap_score)
-    is_raw_long = v_score >= float(VIRTUE_SCORE_LONG_ENTER) and t_score >= float(VIRTUE_SCORE_LONG_ENTER)
-    is_raw_short = v_score <= float(VIRTUE_SCORE_SHORT_ENTER) and t_score <= float(VIRTUE_SCORE_SHORT_ENTER)
+    is_raw_long = v_score >= long_enter_thr and t_score >= long_enter_thr
+    is_raw_short = v_score <= short_enter_thr and t_score <= short_enter_thr
     session.long_streak = (session.long_streak + 1) if is_raw_long else 0
     session.short_streak = (session.short_streak + 1) if is_raw_short else 0
+    # Cycle log / friction: show side-aware buffer (0 when strong with-trend waived).
+    if decision.action.value == "LONG":
+        blend_buffer = float(long_buf)
+    elif decision.action.value == "SHORT":
+        blend_buffer = float(short_buf)
+    else:
+        blend_buffer = float(max(long_buf, short_buf))
     logger.info(
         "CYCLE %s regime=%s action=%s vwap=%.1f%% twap=%.1f%% blend=%.1f%% "
         "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr=%.2f atr_pct=%.2f "
         "tp=$%.0f (~%st) sl=$%.0f (~%st) open_pnl=%.2f long_streak=%s short_streak=%s "
-        "reason=%s exposure=%s",
+        "macro_bias=%s temperance_buf=%.1f velocity=%.1f reason=%s exposure=%s",
         session.cycle,
         decision.regime.value,
         decision.action.value,
@@ -854,194 +2030,357 @@ async def run_cycle(
         open_pnl,
         session.long_streak,
         session.short_streak,
+        session.macro_bias,
+        float(blend_buffer),
+        float(vel_penalty),
         decision.reason,
         session.broker.net_exposure(),
     )
 
-    # Exit priority (Temperance + Wisdom structure):
-    # 1) dollar stop  2) take-profit  3) opposite-band flatten-to-flat (no same-cycle reverse)
-
-    # Dollar stop (Temperance) — cut ~$75 on the whole position, then cool down.
-    if session.broker.stop_dollars_hit(
-        price=price, stop_dollars=float(VIRTUE_POSITION_STOP_DOLLARS)
-    ):
-        net_dir, net_size = session.broker.net_exposure()
-        try:
-            ok, pnl = await session.broker.flatten_all(
-                price=price,
-                stop_ticks=stop_ticks,
-                reason=f"stop_${float(VIRTUE_POSITION_STOP_DOLLARS):.0f}",
-            )
-        except Exception as exc:
-            logger.exception("stop_flatten_failed err=%s", exc)
-            session.last_action = "FLAT"
-            return
-        if ok:
-            _credit_realized_pnl(session, pnl)
-            session.trades_today += 1
-            session.entry_cooldown_cycles = max(
-                int(session.entry_cooldown_cycles),
-                int(VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES),
-            )
-            session.long_streak = 0
-            session.short_streak = 0
-            logger.info(
-                "CYCLE %s STOP_EXIT closed %s x%s pnl≈%.2f stop=$%.0f "
-                "cooldown=%s realized_today=%.2f",
-                session.cycle,
-                net_dir,
-                net_size,
-                pnl,
-                float(VIRTUE_POSITION_STOP_DOLLARS),
-                session.entry_cooldown_cycles,
-                session.realized_pnl_today,
-            )
-        else:
-            logger.error("CYCLE %s STOP_EXIT_FAILED — exposure may remain", session.cycle)
-        session.last_action = "FLAT"
-        return
-
-    # Take-profit (Temperance): bank ~$100 on the whole position, full flatten, then cooldown.
-    # Not gated on signal side — position geometry / open PnL only.
-    if session.broker.take_profit_dollars_hit(
-        price=price, target_dollars=float(VIRTUE_POSITION_TP_DOLLARS)
-    ):
-        net_dir, net_size = session.broker.net_exposure()
-        try:
-            ok, pnl = await session.broker.flatten_all(
-                price=price,
-                stop_ticks=stop_ticks,
-                reason=f"take_profit_${float(VIRTUE_POSITION_TP_DOLLARS):.0f}",
-            )
-        except Exception as exc:
-            logger.exception("take_profit_full_failed err=%s", exc)
-            session.last_action = net_dir if net_dir != "FLAT" else "FLAT"
-            return
-        if ok:
-            _credit_realized_pnl(session, pnl)
-            session.trades_today += 1
-            session.entry_cooldown_cycles = max(
-                int(session.entry_cooldown_cycles),
-                int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES),
-            )
-            # Seed one streak in the banked direction so re-entry only needs one more confirm.
-            if net_dir == "LONG":
-                session.long_streak = 1
-                session.short_streak = 0
-            elif net_dir == "SHORT":
-                session.short_streak = 1
-                session.long_streak = 0
-            else:
-                session.long_streak = 0
-                session.short_streak = 0
-            logger.info(
-                "CYCLE %s TAKE_PROFIT_FULL closed %s x%s pnl≈%.2f target=$%.0f "
-                "cooldown=%s realized_today=%.2f",
-                session.cycle,
-                net_dir,
-                net_size,
-                pnl,
-                float(VIRTUE_POSITION_TP_DOLLARS),
-                session.entry_cooldown_cycles,
-                session.realized_pnl_today,
-            )
-        else:
-            logger.error("CYCLE %s TAKE_PROFIT_FULL_FAILED — exposure may remain", session.cycle)
-        session.last_action = "FLAT"
-        return
-
-    # Opposite-band exit: flatten to FLAT only. Do NOT reverse same cycle (structure).
-    # Reverse needs a fresh streak from flat on a later cycle (Courage with confirmation).
-    net_dir, net_size = session.broker.net_exposure()
-    wrong_side = (
-        net_size > 0
-        and decision.action in {SignalAction.LONG, SignalAction.SHORT}
-        and net_dir != decision.action.value
+    # Legacy broker exposure without sleeve tags → attribute to tactical satellite.
+    net_sync_dir, net_sync_sz = session.broker.net_exposure()
+    claimed = (
+        (int(session.core_size) if session.core_active else 0)
+        + (int(session.tactical_size) if session.tactical_active else 0)
     )
-    if wrong_side:
-        logger.warning(
-            "CYCLE %s STRUCTURED_EXIT holding=%s scores vwap=%.1f twap=%.1f → signal=%s "
-            "(flatten to flat; no same-cycle reverse)",
-            session.cycle,
-            net_dir,
-            decision.vwap_score,
-            decision.twap_score,
-            decision.action.value,
+    if net_sync_sz > 0 and claimed == 0:
+        entry = float(session.broker._avg_entry(net_sync_dir) or price)
+        _mark_tactical_open(
+            session,
+            side=str(net_sync_dir),
+            price=entry,
+            size=int(net_sync_sz),
+            cycle=int(session.cycle),
         )
-        try:
-            ok, pnl = await session.broker.flatten_all(
-                price=price,
-                stop_ticks=stop_ticks,
-                reason=f"structured_exit:{net_dir}_vs_{decision.action.value}",
-            )
-        except Exception as exc:
-            logger.exception("structured_exit_failed err=%s", exc)
-            session.last_action = "FLAT"
-            return
-        if ok:
-            _credit_realized_pnl(session, pnl)
-            session.trades_today += 1
-            # Cool off briefly so scores must re-confirm before opposite entry.
-            session.entry_cooldown_cycles = max(
-                int(session.entry_cooldown_cycles),
-                int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES),
-            )
-            session.long_streak = 0
-            session.short_streak = 0
-            logger.info(
-                "CYCLE %s STRUCTURED_EXIT_FLAT pnl≈%.2f cooldown=%s — wait for re-confirm",
-                session.cycle,
-                pnl,
-                session.entry_cooldown_cycles,
-            )
-        else:
-            logger.error("CYCLE %s STRUCTURED_EXIT_FAILED — standing aside", session.cycle)
-        session.last_action = "FLAT"
-        return
 
-    # Wisdom stand-aside / chop → close open risk (do not orphan positions)
-    if decision.action == SignalAction.FLAT:
-        net_dir, net_size = session.broker.net_exposure()
-        if net_size > 0:
+    # Dual-sleeve: update structural regime + core open/invalidate (before tactical escapes).
+    await _manage_core_sleeve(
+        session,
+        price=price,
+        stop_ticks=stop_ticks,
+        blend=float(decision.blended_score),
+        adx=float(decision.adx),
+    )
+
+    # ============================================================
+    # PHASE 1 — FINANCIAL PROTECTION (Profit Guard / Virtue Balance)
+    # ============================================================
+    if check_virtue_pnl_lock(session):
+        net_dir_vl, net_size_vl = session.broker.net_exposure()
+        if net_size_vl > 0 or absolute_contract_footprint(session) > 0:
             try:
-                ok, pnl = await session.broker.flatten_all(
+                # Sleeve-sequential close — never blind flatten_all across books.
+                ok, pnl = await close_all_sleeves_sequential(
+                    session,
                     price=price,
                     stop_ticks=stop_ticks,
-                    reason=f"wisdom_flat:{decision.reason}",
+                    reason="virtue_pnl_lock",
+                    close_tactical=_close_tactical_sleeve,
+                    close_core=_close_core_sleeve,
+                    credit_residual=_credit_realized_pnl,
                 )
             except Exception as exc:
-                logger.exception("flat_flatten_failed err=%s", exc)
+                logger.exception("virtue_pnl_lock_flatten_failed err=%s", exc)
                 session.last_action = "FLAT"
                 return
             if ok:
-                _credit_realized_pnl(session, pnl)
-                session.trades_today += 1
-                logger.info(
-                    "CYCLE %s WISDOM_FLAT_EXIT closed %s x%s pnl≈%.2f reason=%s",
+                logger.warning(
+                    "CYCLE %s VIRTUE_PNL_LOCK_FLAT sleeves_closed prior=%s x%s "
+                    "pnl≈%.2f peak=%.2f realized=%.2f",
                     session.cycle,
-                    net_dir,
-                    net_size,
+                    net_dir_vl,
+                    net_size_vl,
                     pnl,
-                    decision.reason,
+                    session.peak_realized_pnl_today,
+                    session.realized_pnl_today,
                 )
             else:
-                logger.error("CYCLE %s WISDOM_FLAT_EXIT_FAILED — exposure may remain", session.cycle)
+                logger.error(
+                    "CYCLE %s VIRTUE_PNL_LOCK_FLAT_FAILED — exposure may remain",
+                    session.cycle,
+                )
+        session.last_action = "FLAT"
+        session.last_regime = "CHOP_NO_TRADE"
+        return
+
+    # ============================================================
+    # PHASE 2 — TACTICAL IN-FLIGHT ESCAPES (core uses structural invalidation)
+    # ============================================================
+    if bool(session.tactical_active) and int(session.tactical_size) > 0:
+        tac_side = str(session.tactical_side or "FLAT").upper()
+        cc_hit, cc_reason = check_course_correct(
+            tac_side, float(decision.blended_score)
+        )
+        if cc_hit:
+            logger.warning(
+                "CYCLE %s COURSE_CORRECT_TRIGGERED holding=%s blend=%.1f — %s",
+                session.cycle,
+                tac_side,
+                float(decision.blended_score),
+                cc_reason,
+            )
+            notify_course_correct(
+                exposure=str(tac_side),
+                blend=float(decision.blended_score),
+                reason=str(cc_reason),
+            )
+            ok, pnl = await _close_tactical_sleeve(
+                session, price=price, stop_ticks=stop_ticks, reason=cc_reason
+            )
+            if ok:
+                logger.info(
+                    "CYCLE %s COURSE_CORRECT_FLAT tactical pnl≈%.2f resume_cycle=%s "
+                    "core_remains=%s",
+                    session.cycle,
+                    pnl,
+                    session.pipeline_resume_cycle,
+                    bool(session.core_active),
+                )
+            else:
+                logger.error(
+                    "CYCLE %s COURSE_CORRECT_FLAT_FAILED — tactical may remain",
+                    session.cycle,
+                )
+            session.last_action = "FLAT"
+            return
+
+    tactical_pnl = _tactical_open_pnl(session, price)
+
+    # Dollar stop — tactical sleeve only (Temperance). Core ignores $ stop.
+    if bool(session.tactical_active) and tactical_pnl <= -float(
+        VIRTUE_POSITION_STOP_DOLLARS
+    ):
+        ok, pnl = await _close_tactical_sleeve(
+            session,
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=f"stop_${float(VIRTUE_POSITION_STOP_DOLLARS):.0f}",
+        )
+        if ok:
+            logger.info(
+                "CYCLE %s STOP_EXIT tactical pnl≈%.2f stop=$%.0f resume_cycle=%s",
+                session.cycle,
+                pnl,
+                float(VIRTUE_POSITION_STOP_DOLLARS),
+                session.pipeline_resume_cycle,
+            )
+        else:
+            logger.error("CYCLE %s STOP_EXIT_FAILED — tactical may remain", session.cycle)
         session.last_action = "FLAT"
         return
 
-    # Already in desired direction — hold (no pyramid every cycle)
-    net_dir, net_size = session.broker.net_exposure()
-    if net_size > 0 and net_dir == decision.action.value:
-        logger.info(
-            "CYCLE %s already_%s x%s — hold (no add)",
+    # Take-profit — tactical sleeve only.
+    if bool(session.tactical_active) and tactical_pnl >= float(
+        VIRTUE_POSITION_TP_DOLLARS
+    ):
+        tac_dir = str(session.tactical_side or "FLAT").upper()
+        ok, pnl = await _close_tactical_sleeve(
+            session,
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=f"take_profit_${float(VIRTUE_POSITION_TP_DOLLARS):.0f}",
+        )
+        if ok:
+            if session.require_tp_pullback or int(session.consecutive_tp_streak) >= int(
+                VIRTUE_MULTI_TP_COOLDOWN_STREAK
+            ):
+                session.long_streak = 0
+                session.short_streak = 0
+            elif tac_dir == "LONG":
+                session.long_streak = 1
+                session.short_streak = 0
+            elif tac_dir == "SHORT":
+                session.short_streak = 1
+                session.long_streak = 0
+            if tac_dir == "LONG":
+                session.long_tps_today = int(session.long_tps_today) + 1
+            elif tac_dir == "SHORT":
+                session.short_tps_today = int(session.short_tps_today) + 1
+            update_macro_bias(session, banked_side=tac_dir)
+            multi_lock = int(session.consecutive_tp_streak) >= int(
+                VIRTUE_MULTI_TP_COOLDOWN_STREAK
+            )
+            _, pipe_rem = pipeline_lock_remaining(session)
+            logger.info(
+                "CYCLE %s TAKE_PROFIT_FULL tactical %s pnl≈%.2f target=$%.0f "
+                "resume_cycle=%s pipe_rem=%s tp_streak=%s core_remains=%s",
+                session.cycle,
+                tac_dir,
+                pnl,
+                float(VIRTUE_POSITION_TP_DOLLARS),
+                session.pipeline_resume_cycle,
+                pipe_rem,
+                session.consecutive_tp_streak,
+                bool(session.core_active),
+            )
+        else:
+            logger.error("CYCLE %s TAKE_PROFIT_FULL_FAILED — tactical may remain", session.cycle)
+        session.last_action = "FLAT"
+        return
+
+    # Time-decay — tactical sleeve only (core is structural, not time-decayed).
+    if bool(session.tactical_active) and int(session.tactical_size) > 0:
+        td_hit, td_reason = check_time_decay_exit(
+            session,
             session.cycle,
-            net_dir,
-            net_size,
+            open_pnl=float(tactical_pnl),
+            exposure=str(session.tactical_side),
+        )
+        if td_hit:
+            ok, pnl = await _close_tactical_sleeve(
+                session, price=price, stop_ticks=stop_ticks, reason=td_reason
+            )
+            if ok:
+                logger.info(
+                    "CYCLE %s TIME_DECAY_FLAT tactical pnl≈%.2f resume_cycle=%s "
+                    "core_remains=%s",
+                    session.cycle,
+                    pnl,
+                    session.pipeline_resume_cycle,
+                    bool(session.core_active),
+                )
+            else:
+                logger.error(
+                    "CYCLE %s TIME_DECAY_FLAT_FAILED — tactical may remain",
+                    session.cycle,
+                )
+            session.last_action = "FLAT"
+            return
+
+    # Opposite-band exit — tactical only. Core waits for structural invalidation.
+    # Do NOT reverse same cycle (structure); reverse needs a fresh flat streak later.
+    if decision.action in {SignalAction.LONG, SignalAction.SHORT}:
+        want = decision.action.value
+        if (
+            bool(session.tactical_active)
+            and int(session.tactical_size) > 0
+            and str(session.tactical_side).upper() != want
+        ):
+            tac_dir = str(session.tactical_side).upper()
+            logger.warning(
+                "CYCLE %s STRUCTURED_EXIT tactical=%s → signal=%s "
+                "(close tactical; core uses structural invalidation)",
+                session.cycle,
+                tac_dir,
+                want,
+            )
+            ok, pnl = await _close_tactical_sleeve(
+                session,
+                price=price,
+                stop_ticks=stop_ticks,
+                reason=f"structured_exit:{tac_dir}_vs_{want}",
+            )
+            if ok:
+                logger.info(
+                    "CYCLE %s STRUCTURED_EXIT_FLAT tactical pnl≈%.2f resume_cycle=%s "
+                    "core_remains=%s",
+                    session.cycle,
+                    pnl,
+                    session.pipeline_resume_cycle,
+                    bool(session.core_active),
+                )
+            else:
+                logger.error(
+                    "CYCLE %s STRUCTURED_EXIT_FAILED — tactical may remain", session.cycle
+                )
+            session.last_action = "FLAT"
+            return
+        if (
+            bool(session.core_active)
+            and int(session.core_size) > 0
+            and str(session.core_side).upper() != want
+            and not bool(session.tactical_active)
+        ):
+            logger.info(
+                "CYCLE %s STAND_ASIDE core=%s signal=%s — wait structural invalidation "
+                "(no opposite tactical scale)",
+                session.cycle,
+                session.core_side,
+                want,
+            )
+            session.last_action = "FLAT"
+            return
+
+    # Wisdom stand-aside / thesis-invalid → close tactical only; core is structural.
+    if decision.action == SignalAction.FLAT:
+        if bool(session.tactical_active) and int(session.tactical_size) > 0:
+            ok, pnl = await _close_tactical_sleeve(
+                session,
+                price=price,
+                stop_ticks=stop_ticks,
+                reason=f"wisdom_flat:{decision.reason}",
+            )
+            if ok:
+                logger.info(
+                    "CYCLE %s THESIS_INVALID_FLAT tactical pnl≈%.2f resume_cycle=%s "
+                    "core_remains=%s reason=%s",
+                    session.cycle,
+                    pnl,
+                    session.pipeline_resume_cycle,
+                    bool(session.core_active),
+                    decision.reason,
+                )
+            else:
+                logger.error(
+                    "CYCLE %s THESIS_INVALID_FLAT_FAILED — tactical may remain",
+                    session.cycle,
+                )
+        session.last_action = "FLAT"
+        return
+
+    # Tactical already in desired direction — hold satellite (core may already be aligned).
+    if (
+        bool(session.tactical_active)
+        and int(session.tactical_size) > 0
+        and str(session.tactical_side).upper() == decision.action.value
+    ):
+        logger.info(
+            "CYCLE %s already_tactical_%s x%s — hold satellite (no add)",
+            session.cycle,
+            session.tactical_side,
+            session.tactical_size,
         )
         session.last_action = decision.action.value
         return
 
-    # Temperance: daily profit lock — day is done; bank the win, no new entries.
+    # ============================================================
+    # PHASE 3 — ENTRY PIPELINE (Layer-1 cycle lock → velocity → temperance → emit)
+    # ============================================================
+
+    # Layer 1 — absolute cycle cooldown from update_outcome_state (no wall clock).
+    if not is_entry_pipeline_clear(session, session.cycle):
+        session.last_action = "FLAT"
+        return
+
+    # Layer 1b — multi-TP wall-clock lock (after absolute cycle clear).
+    clear_to_trade, remaining_s = verify_cooldown_validity(session)
+    if not clear_to_trade:
+        session.layer1_streak_clear = False
+        logger.info(
+            "CYCLE %s LAYER1_multi_tp_cooldown Active streak=%s remaining=%ss — "
+            "bypass entry calculations",
+            session.cycle,
+            session.consecutive_tp_streak,
+            remaining_s,
+        )
+        session.last_action = "FLAT"
+        return
+
+    # Temperance: Virtue Balance trailing lock — preserve green-day floor.
+    if check_virtue_pnl_lock(session):
+        floor = float(session.peak_realized_pnl_today) * float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
+        logger.info(
+            "CYCLE %s virtue_pnl_lock Active peak=%.2f floor=%.2f realized=%.2f — "
+            "no new entries (day shut down)",
+            session.cycle,
+            session.peak_realized_pnl_today,
+            floor,
+            session.realized_pnl_today,
+        )
+        session.last_action = "FLAT"
+        return
+
+    # Temperance: hard daily profit lock — day is done; bank the win, no new entries.
     if session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK):
         logger.info(
             "CYCLE %s daily_profit_lock pnl=%.2f >= %.2f — work done for the day (stand aside)",
@@ -1049,7 +2388,7 @@ async def run_cycle(
             session.realized_pnl_today,
             GRADE_DAILY_PROFIT_LOCK,
         )
-        session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
+        session.last_action = "FLAT"
         return
 
     # Temperance: pre-close / pre-maintenance window — manage/exit only (no new risk).
@@ -1059,7 +2398,7 @@ async def run_cycle(
             "CYCLE %s no_new_entry_cutoff — manage/exit only (pre-close / pre-maintenance)",
             session.cycle,
         )
-        session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
+        session.last_action = "FLAT"
         return
 
     # After anchor rebase, scores sit near 50 — wait before new entries (Temperance).
@@ -1069,29 +2408,77 @@ async def run_cycle(
             session.cycle,
             session.entry_cooldown_cycles,
         )
-        session.last_action = "FLAT" if session.broker.net_exposure()[1] <= 0 else decision.action.value
+        session.last_action = "FLAT"
         return
 
+    # Temperance sizing / blend friction from last_trade_outcome (side-aware waiver).
+    base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
+    side_buf = effective_temperance_blend_buffer(
+        blend_buffer_raw,
+        side=decision.action.value,
+        adx=float(decision.adx),
+        macro_bias=str(session.macro_bias or "NEUTRAL"),
+    )
+    long_enter_thr = float(VIRTUE_SCORE_LONG_ENTER) + effective_temperance_blend_buffer(
+        blend_buffer_raw,
+        side="LONG",
+        adx=float(decision.adx),
+        macro_bias=str(session.macro_bias or "NEUTRAL"),
+    )
+    short_enter_thr = float(VIRTUE_SCORE_SHORT_ENTER) - effective_temperance_blend_buffer(
+        blend_buffer_raw,
+        side="SHORT",
+        adx=float(decision.adx),
+        macro_bias=str(session.macro_bias or "NEUTRAL"),
+    )
+    blend_buffer = float(side_buf)
+    if float(blend_buffer_raw) > 0:
+        logger.info(
+            "CYCLE %s TEMPERANCE_FRICTION losses=%s last_reason=%s "
+            "raw_buf=+%.1f effective_buf=+%.1f long_enter>=%.1f short_enter<=%.1f "
+            "adx=%.1f bias=%s waived=%s base_contracts=%s",
+            session.cycle,
+            session.consecutive_losses,
+            session.last_reason,
+            float(blend_buffer_raw),
+            float(blend_buffer),
+            long_enter_thr,
+            short_enter_thr,
+            float(decision.adx),
+            session.macro_bias,
+            bool(float(blend_buffer) < float(blend_buffer_raw)),
+            base_contracts,
+        )
+
     # Require N consecutive raw entry-band cycles before firing (Temperance).
+    # After a LOSS, add extra confirmation friction from last_trade_outcome.
     need_streak = max(1, int(VIRTUE_REQUIRED_STREAK))
+    if int(session.consecutive_losses) >= 1:
+        need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
     side = decision.action.value
     if side == "LONG":
         if session.long_streak < need_streak:
             logger.info(
-                "CYCLE %s entry_streak LONG %s/%s — wait for confirmation",
+                "CYCLE %s entry_streak LONG %s/%s — wait for confirmation "
+                "(loss_friction=%s temperance_buf=%.1f)",
                 session.cycle,
                 session.long_streak,
                 need_streak,
+                session.consecutive_losses,
+                float(blend_buffer),
             )
             session.last_action = "FLAT"
             return
     elif side == "SHORT":
         if session.short_streak < need_streak:
             logger.info(
-                "CYCLE %s entry_streak SHORT %s/%s — wait for confirmation",
+                "CYCLE %s entry_streak SHORT %s/%s — wait for confirmation "
+                "(loss_friction=%s temperance_buf=%.1f)",
                 session.cycle,
                 session.short_streak,
                 need_streak,
+                session.consecutive_losses,
+                float(blend_buffer),
             )
             session.last_action = "FLAT"
             return
@@ -1101,6 +2488,23 @@ async def run_cycle(
 
     # Wisdom: do not chase a move that already extended (late entry → stop / RTH flatten).
     blend = float(decision.blended_score)
+
+    # Pipeline validation — Temperance + ADX velocity gate + bull-day short asymmetry.
+    pipe_ok, pipe_reason = verify_pipeline_entry(
+        side,
+        pipeline_system_state(
+            session, blend=blend, adx=float(decision.adx)
+        ),
+    )
+    if not pipe_ok:
+        logger.info(
+            "CYCLE %s LAYER2_pipeline_entry_denied %s — stand aside",
+            session.cycle,
+            pipe_reason,
+        )
+        session.last_action = "FLAT"
+        return
+
     if side == "LONG" and blend >= float(VIRTUE_SCORE_LONG_CHASE_MAX):
         logger.info(
             "CYCLE %s chase_filter LONG blend=%.1f >= %.1f — stand aside (move already extended)",
@@ -1120,26 +2524,128 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Mandatory exclusivity check before emitting new LONG/SHORT payload
-    try:
-        exclusive_ok, excl_pnl = await session.broker.flatten_opposite_if_needed(
-            desired_direction=decision.action.value,
-            price=price,
-            stop_ticks=stop_ticks,
+    # Temperance: after multi-TP streak, require blend pullback before re-entering.
+    if session.require_tp_pullback:
+        if side == "LONG" and blend > float(VIRTUE_POST_TP_PULLBACK_BLEND_LONG):
+            logger.info(
+                "CYCLE %s post_tp_pullback LONG blend=%.1f > %.1f — wait for cool-off "
+                "(tp_streak=%s)",
+                session.cycle,
+                blend,
+                float(VIRTUE_POST_TP_PULLBACK_BLEND_LONG),
+                session.consecutive_tp_streak,
+            )
+            session.last_action = "FLAT"
+            return
+        if side == "SHORT" and blend < float(VIRTUE_POST_TP_PULLBACK_BLEND_SHORT):
+            logger.info(
+                "CYCLE %s post_tp_pullback SHORT blend=%.1f < %.1f — wait for cool-off "
+                "(tp_streak=%s)",
+                session.cycle,
+                blend,
+                float(VIRTUE_POST_TP_PULLBACK_BLEND_SHORT),
+                session.consecutive_tp_streak,
+            )
+            session.last_action = "FLAT"
+            return
+        # Pullback satisfied — clear latch. Keep tp_streak for multi-TP wall-clock lock.
+        session.require_tp_pullback = False
+        logger.info(
+            "CYCLE %s post_tp_pullback_cleared side=%s blend=%.1f tp_streak=%s — "
+            "pullback ok (multi-TP lock still applies if streak>=%s)",
+            session.cycle,
+            side,
+            blend,
+            session.consecutive_tp_streak,
+            int(VIRTUE_MULTI_TP_COOLDOWN_STREAK),
         )
-    except Exception as exc:
-        logger.exception("exclusivity_check_failed err=%s", exc)
-        await _survive_outage(session, "exclusivity_exception")
+
+    # Wisdom: shorts need stronger ADX than longs (fewer counter-trend traps).
+    if side == "SHORT" and float(decision.adx) < float(VIRTUE_ADX_SHORT_ENTER_MIN):
+        logger.info(
+            "CYCLE %s short_adx_too_weak adx=%.1f < %.1f — stand aside",
+            session.cycle,
+            float(decision.adx),
+            float(VIRTUE_ADX_SHORT_ENTER_MIN),
+        )
         session.last_action = "FLAT"
         return
 
-    if not exclusive_ok:
-        logger.error("CYCLE %s exclusivity_blocked — opposite flatten not confirmed", session.cycle)
+    # Layer 2b — hard bull-day short extremes (ADX + blend<=35) after pipeline blend gate.
+    update_macro_bias(
+        session,
+        regime=decision.regime.value,
+        action=decision.action.value,
+        blend=blend,
+        adx=float(decision.adx),
+    )
+    gate_ok, gate_reason = evaluate_directional_gate(
+        side,
+        macro_bias=session.macro_bias,
+        blend=blend,
+        adx=float(decision.adx),
+    )
+    if not gate_ok:
+        logger.info(
+            "CYCLE %s LAYER2_directional_gate_denied %s — stand aside",
+            session.cycle,
+            gate_reason,
+        )
         session.last_action = "FLAT"
         return
-    if abs(float(excl_pnl or 0.0)) >= 1e-12:
-        _credit_realized_pnl(session, excl_pnl)
-        session.trades_today += 1
+
+    # Net Exposure Rule — tactical may fire only when aligned with core (or core flat).
+    tac_ok, tac_reason = tactical_entry_allowed(
+        core_active=bool(session.core_active),
+        core_side=str(session.core_side),
+        core_size=int(session.core_size or 0),
+        tactical_side=side,
+        tactical_size=1,
+    )
+    if not tac_ok:
+        logger.info(
+            "CYCLE %s DUAL_SLEEVE_ENTRY_BLOCKED %s — stand aside",
+            session.cycle,
+            tac_reason,
+        )
+        session.last_action = "FLAT"
+        return
+
+    # Exclusivity: never flatten core for an opposite entry (blocked above).
+    # If broker net is opposite with no core book, flatten residual before satellite entry.
+    net_excl_dir, net_excl_sz = session.broker.net_exposure()
+    if (
+        net_excl_sz > 0
+        and net_excl_dir != side
+        and not bool(session.core_active)
+    ):
+        try:
+            exclusive_ok, excl_pnl = await session.broker.flatten_opposite_if_needed(
+                desired_direction=side,
+                price=price,
+                stop_ticks=stop_ticks,
+            )
+        except Exception as exc:
+            logger.exception("exclusivity_check_failed err=%s", exc)
+            await _survive_outage(session, "exclusivity_exception")
+            session.last_action = "FLAT"
+            return
+        if not exclusive_ok:
+            logger.error(
+                "CYCLE %s exclusivity_blocked — opposite flatten not confirmed",
+                session.cycle,
+            )
+            session.last_action = "FLAT"
+            return
+        if abs(float(excl_pnl or 0.0)) >= 1e-12:
+            _credit_tactical_pnl(session, excl_pnl)
+            update_outcome_state(
+                session,
+                excl_pnl,
+                "structured_exit:exclusivity",
+                current_engine_cycle=session.cycle,
+            )
+            _mark_tactical_flat(session)
 
     # Temperance: reject wide spreads before live entry.
     from engine.config import MAX_ALLOWED_SPREAD_TICKS, forward_test_force_paper
@@ -1190,8 +2696,26 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    contracts = int(sized.contracts)
-    # Live exit is dollar stop on the whole book — Manus risk matches that (Temperance).
+    contracts = min(int(sized.contracts), int(base_contracts))
+    from engine.config import MAX_ACCOUNT_CONTRACT_CEILING
+
+    core_occ = int(session.core_size) if bool(session.core_active) else 0
+    room = max(0, int(MAX_ACCOUNT_CONTRACT_CEILING) - core_occ)
+    contracts = min(contracts, room)
+    if contracts < 1:
+        logger.warning(
+            "CYCLE %s temperance_or_ceiling_cap contracts=%s base=%s room=%s "
+            "core=%s ceiling=%s — stand aside",
+            session.cycle,
+            sized.contracts,
+            base_contracts,
+            room,
+            core_occ,
+            int(MAX_ACCOUNT_CONTRACT_CEILING),
+        )
+        session.last_action = "FLAT"
+        return
+    # Live exit is dollar stop on the tactical sleeve — Manus risk matches that (Temperance).
     proposed_risk = float(VIRTUE_POSITION_STOP_DOLLARS)
     open_risk = _open_risk_notional(session, stop_ticks)
 
@@ -1251,38 +2775,64 @@ async def run_cycle(
                 proposed_risk,
             )
 
-    order = Order(
-        symbol=EXECUTION_SYMBOL,
-        direction=decision.action.value,
-        size=contracts,
-        price=price,
-        stop_ticks=stop_ticks,
-        quote_ts=time.time(),
-    )
+    def _on_tactical_entry(
+        sess: VirtueSession,
+        *,
+        pnl: float,
+        reason: str,
+        side: str,
+        result: Any = None,
+        **_: Any,
+    ) -> None:
+        sess.trades_today += 1
+        fill_side = str(
+            getattr(result, "direction", None) or side or decision.action.value
+        )
+        notify_position_opened(
+            side=fill_side,
+            client_order_id=str(getattr(result, "order_id", "") or ""),
+            cycle=int(sess.cycle),
+            size=int(getattr(result, "contracts", None) or contracts),
+        )
 
     try:
-        result = await session.broker.fire_order(order)
+        ok, _, detail = await execute_tactical_action(
+            session,
+            target_side=decision.action.value,
+            target_size=contracts,
+            current_cycle=int(session.cycle),
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=f"tactical_entry:{reason}",
+            mark_open=_mark_tactical_open,
+            on_filled=_on_tactical_entry,
+        )
     except Exception as exc:
         logger.exception("fire_order_failed err=%s", exc)
         await _survive_outage(session, "fire_order_exception")
         session.last_action = "FLAT"
         return
 
-    if result is None:
+    if not ok:
+        logger.info(
+            "CYCLE %s TACTICAL_ROUTER_ENTRY_BLOCKED detail=%s", session.cycle, detail
+        )
         session.last_action = "FLAT"
         return
 
     session.last_action = decision.action.value
-    session.trades_today += 1
     logger.info(
-        "CYCLE %s FILLED/SUBMITTED %s x%s @ %s id=%s status=%s manus=%s",
+        "CYCLE %s FILLED/SUBMITTED tactical %s x%s @ %s manus=%s "
+        "entry_cycle_marker=%s core_active=%s net_exposure=%s footprint=%s",
         session.cycle,
-        result.direction,
-        result.contracts,
-        result.fill_price,
-        result.order_id,
-        result.status,
+        session.tactical_side,
+        session.tactical_size,
+        session.tactical_entry_price,
         reason,
+        session.entry_cycle_marker,
+        bool(session.core_active),
+        calculate_net_account_exposure(session),
+        absolute_contract_footprint(session),
     )
 
 
@@ -1335,21 +2885,63 @@ async def run_loop(
         session.broker.open_positions = []
         logger.info("BOOT live_mode — cleared local positions pending Webull reconcile")
 
+    # Justice: restore dual-sleeve book tags before day-bucket / sync attribution.
+    if restore_dual_sleeve_books(session):
+        logger.info(
+            "BOOT restored_dual_sleeve core=%s/%s tac=%s/%s regime=%s",
+            session.core_side if session.core_active else "FLAT",
+            session.core_size if session.core_active else 0,
+            session.tactical_side if session.tactical_active else "FLAT",
+            session.tactical_size if session.tactical_active else 0,
+            session.macro_structural_regime,
+        )
+
     # Justice: same ET day → restore Closed-today PnL / trade count (deploy must not wipe).
     day_bucket = load_persisted_day_bucket(et_session_date())
     if day_bucket.get("restored"):
         session.session_date_et = str(day_bucket["session_date_et"])
         session.realized_pnl_today = float(day_bucket["realized_pnl_today"])
+        session.peak_realized_pnl_today = float(
+            day_bucket.get("peak_realized_pnl_today")
+            or day_bucket["realized_pnl_today"]
+            or 0.0
+        )
+        session.virtue_pnl_lock_active = bool(
+            day_bucket.get("virtue_pnl_lock_active") or False
+        )
         session.trades_today = int(day_bucket["trades_today"])
+        session.consecutive_tp_streak = int(day_bucket.get("consecutive_tp_streak") or 0)
+        session.last_tp_timestamp = float(day_bucket.get("last_tp_timestamp") or 0.0)
+        session.require_tp_pullback = bool(day_bucket.get("require_tp_pullback") or False)
+        session.macro_bias = str(day_bucket.get("macro_bias") or "NEUTRAL")
+        session.long_tps_today = int(day_bucket.get("long_tps_today") or 0)
+        session.short_tps_today = int(day_bucket.get("short_tps_today") or 0)
+        session.last_result = str(day_bucket.get("last_result") or "FLAT")
+        session.last_reason = str(day_bucket.get("last_reason") or "none")
+        session.consecutive_wins = int(day_bucket.get("consecutive_wins") or 0)
+        session.consecutive_losses = int(day_bucket.get("consecutive_losses") or 0)
+        session.last_trade_pnl = float(day_bucket.get("last_trade_pnl") or 0.0)
         logger.info(
-            "BOOT restored_day_bucket et_date=%s realized_today=%.2f trades_today=%s",
+            "BOOT restored_day_bucket et_date=%s realized_today=%.2f trades_today=%s "
+            "tp_streak=%s last_tp=%.0f pullback=%s macro_bias=%s long_tps=%s short_tps=%s "
+            "outcome=%s wins=%s losses=%s",
             session.session_date_et,
             session.realized_pnl_today,
             session.trades_today,
+            session.consecutive_tp_streak,
+            session.last_tp_timestamp,
+            session.require_tp_pullback,
+            session.macro_bias,
+            session.long_tps_today,
+            session.short_tps_today,
+            session.last_result,
+            session.consecutive_wins,
+            session.consecutive_losses,
         )
     logger.info(
         "VIRTUE LOOP start equity=%.2f symbol=%s session_mode=%s data_source=%s "
-        "position_tp=$%.0f position_sl=$%.0f day_lock=$%.0f exit_cooldown=%s "
+        "position_tp=$%.0f position_sl=$%.0f day_lock=$%.0f "
+        "tp_cool=%s cc_cool=%s stop_cool=%s "
         "long_enter=%.1f short_enter=%.1f long_exit=%.1f short_exit=%.1f "
         "streak=%s anchor_div_atr=%.1f network_timeout=%.1fs | %s",
         session.broker.equity,
@@ -1359,7 +2951,9 @@ async def run_loop(
         float(VIRTUE_POSITION_TP_DOLLARS),
         float(VIRTUE_POSITION_STOP_DOLLARS),
         float(GRADE_DAILY_PROFIT_LOCK),
-        int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES),
+        int(VIRTUE_BASE_TP_COOLDOWN_CYCLES),
+        int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES),
+        int(VIRTUE_HARD_STOP_COOLDOWN_CYCLES),
         float(VIRTUE_SCORE_LONG_ENTER),
         float(VIRTUE_SCORE_SHORT_ENTER),
         float(VIRTUE_SCORE_LONG_EXIT),

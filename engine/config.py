@@ -91,6 +91,15 @@ FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.01
 FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
 PAPER_MAX_MES_CONTRACTS = 2
 PAPER_MAX_OPEN_MES_POSITIONS = 1
+# Dual-sleeve Unified Rules — account-wide ceiling (core + tactical).
+MAX_ACCOUNT_CONTRACT_CEILING = 2
+VIRTUE_CORE_SIZE = 1  # structural anchor sleeve
+VIRTUE_CORE_CONFIRM_CYCLES = 5  # HTF bias+ADX confirm before opening core
+VIRTUE_CORE_STRUCTURAL_ADX_MIN = 22.0
+# Slow Invalidation depth from the long edge (sticky through NEUTRAL).
+# LONG closes at/below this; SHORT closes at/above (100 - depth).
+VIRTUE_CORE_INVALIDATION_BLEND_LONG = 40.0
+VIRTUE_CORE_INVALIDATION_BLEND_SHORT = 60.0  # == 100 - LONG depth (legacy alias)
 
 # Live — aligned to $15k / 2 MES profile
 LIVE_RISK_NAV_CAP = 15_000.0
@@ -145,6 +154,11 @@ GRADE_CONTRACTS = 2  # align with paper max (scale-out runner profile)
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
 GRADE_DAILY_PROFIT_LOCK = 500.0  # ~3.3% of $15k — day done; no new entries (Temperance)
+# Virtue Balance / Profit Guard trailing lock (Temperance).
+PROFIT_GUARD_THRESHOLD = 150.0  # start locking gains at this peak realized PnL
+PROFIT_GUARD_RETAIN_PCT = 0.60  # retain 60% of peak; breach → day shut down
+VIRTUE_PNL_LOCK_ARM_PEAK = PROFIT_GUARD_THRESHOLD
+VIRTUE_PNL_LOCK_FLOOR_FRAC = PROFIT_GUARD_RETAIN_PCT
 # 0 = stand aside after lock (do not keep trading smaller)
 PROFIT_LOCK_MAX_CONTRACTS = 0
 GRADE_DAILY_LOSS_HALT = 300.0  # 2% of $15k
@@ -185,16 +199,24 @@ VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
 # Databento quote staleness ceiling (seconds)
 DATABENTO_MAX_QUOTE_AGE_S = 5.0
-# Hysteresis bands — timely entry (55/45) with wide exits so holds survive mid-band noise.
-# 60/40 was missing clear bulls at blend≈59; user directed back to 55 enter (Wisdom + Courage).
-VIRTUE_SCORE_LONG_ENTER = 55.0   # both VWAP+TWAP >= this to ENTER long from flat
-VIRTUE_SCORE_SHORT_ENTER = 45.0  # both VWAP+TWAP <= this to ENTER short from flat
-VIRTUE_SCORE_LONG_EXIT = 40.0    # while LONG, exit only when both <= this
-VIRTUE_SCORE_SHORT_EXIT = 60.0   # while SHORT, exit only when both >= this
-VIRTUE_REQUIRED_STREAK = 2       # need 2 clear cycles — blocks random short↔long whip-saws
+# Nimble pivot bands (Aug 2026): sticky 40/60 exits held wrong-side shorts to the $75 stop
+# while blend was already 53–56 bullish. Thesis invalidates at mid; enter only on clear edge.
+VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
+VIRTUE_SCORE_LONG_EXIT = 50.0    # while LONG: flatten when both <= mid (thesis broken)
+VIRTUE_SCORE_SHORT_EXIT = 50.0   # while SHORT: flatten when both >= mid (thesis broken)
+VIRTUE_REQUIRED_STREAK = 3       # 3 clear cycles — fewer wrong-side entries
+VIRTUE_ADX_ENTER_MIN = 18.0      # flat long entries need trend strength (Wisdom)
+VIRTUE_ADX_SHORT_ENTER_MIN = 22.0  # shorts need stronger trend (fewer counter-trend traps)
+# Bull-day asymmetric short filter — counter-trend shorts need extreme confirmation.
+VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
+VIRTUE_BULL_DAY_SHORT_ADX_MIN = 25.0    # structural reversal ADX floor on BULL days
+# Hard loop COURSE_CORRECT (every cycle while holding) — mid-band thesis dead → instant flatten.
+VIRTUE_COURSE_CORRECT_SHORT_BLEND = 50.0  # SHORT + blend >= mid → force flatten
+VIRTUE_COURSE_CORRECT_LONG_BLEND = 50.0   # LONG + blend <= mid → force flatten
 # Chase: block only extreme late entries. 72 was freezing re-entry after $100 TP in bulls.
-VIRTUE_SCORE_LONG_CHASE_MAX = 90.0
-VIRTUE_SCORE_SHORT_CHASE_MIN = 10.0
+VIRTUE_SCORE_LONG_CHASE_MAX = 85.0
+VIRTUE_SCORE_SHORT_CHASE_MIN = 15.0
 # Score scale: ±score_price_pct of price maps to 0–100 (smaller → more sensitive to extensions)
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
@@ -204,10 +226,49 @@ VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
 VIRTUE_POSITION_TP_DOLLARS = 100.0
 # Cut losers at ~$75 on the whole position (full flatten) — ~1.33:1 vs $100 TP.
 VIRTUE_POSITION_STOP_DOLLARS = 75.0
-# After $100 TP: short pause then rejoin if signal still valid (Courage — don't miss the next leg).
-VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = 3
-# After a stop: longer cool-down before the next attempt (Temperance).
-VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES = 8
+# --- MACROMATHICS ENGINE PERFORMANCE CONFIGURATION ---
+# TP: short pause so winners can rejoin momentum (Courage).
+VIRTUE_BASE_TP_COOLDOWN_CYCLES = 3
+# Added per extra TP in a streak (anti-giveback after multi-TP runs).
+VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES = 5
+# Thesis broke / wrong side — match hard stop so we do not re-chop immediately.
+VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES = 8
+# Hard dollar stop cool-down (Temperance).
+VIRTUE_HARD_STOP_COOLDOWN_CYCLES = 8
+# Time-decay: fast reset — stagnation cut, thesis did not break.
+VIRTUE_TIME_DECAY_COOLDOWN_CYCLES = 3
+# Compat aliases (older call sites / tests).
+VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = VIRTUE_BASE_TP_COOLDOWN_CYCLES
+VIRTUE_POST_TP_STREAK_COOLDOWN_EXTRA = VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES
+VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES = VIRTUE_HARD_STOP_COOLDOWN_CYCLES
+VIRTUE_POST_TIME_DECAY_COOLDOWN_CYCLES = VIRTUE_TIME_DECAY_COOLDOWN_CYCLES
+VIRTUE_POST_TP_STREAK_PULLBACK_AFTER = 2  # after this many TPs, require blend pullback to re-enter
+VIRTUE_POST_TP_PULLBACK_BLEND_LONG = 62.0   # long re-entry allowed only if blend <= this
+VIRTUE_POST_TP_PULLBACK_BLEND_SHORT = 38.0  # short re-entry allowed only if blend >= this
+# After 3+ consecutive TPs: wall-clock lock (anti-overtrading after a fully captured leg).
+VIRTUE_MULTI_TP_COOLDOWN_STREAK = 3
+VIRTUE_MULTI_TP_COOLDOWN_S = 900  # 15 minutes
+# After a realized LOSS: extra entry-streak friction (Temperance sizing/confirmation).
+VIRTUE_POST_LOSS_EXTRA_STREAK = 1
+# Temperance sizing / blend friction from last_trade_outcome (MES irreducible lot = 1).
+VIRTUE_TEMPERANCE_BASE_CONTRACTS = 1
+VIRTUE_TEMPERANCE_LOSS_STREAK_MIN = 2  # losses >= this → widen entry band
+VIRTUE_TEMPERANCE_LOSS_BLEND_BUFFER = 5.0  # +/− points on enter thresholds
+VIRTUE_TEMPERANCE_COURSE_CORRECT_BLEND_BUFFER = 3.0  # post course_correct cooling
+# Strong aligned trend: Temperance via extra confirmation streak, not unreachable blend.
+# Prevents "signal LONG @58 / ADX 40" while live enter is stuck at 63 after loss friction.
+VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE = 25.0
+# verify_pipeline_entry bases (temperance buffer widens these; bull shorts get extra penalty).
+VIRTUE_PIPELINE_LONG_BLEND_BASE = 55.0
+VIRTUE_PIPELINE_SHORT_BLEND_BASE = 45.0
+VIRTUE_PIPELINE_BULL_SHORT_PENALTY = 5.0
+# Velocity gate: widen blend bands when ADX is weak (blocks slow-drift traps).
+VIRTUE_VELOCITY_ADX_FLOOR = 22.0  # ADX below this → widen entry gates
+VIRTUE_VELOCITY_PENALTY_PER_ADX = 0.5  # points added/subtracted per ADX unit below floor
+# Time-decay exit: flatten stagnant holds that never progress toward TP.
+MAX_STAGNATION_CYCLES = 15  # cut stale trades after N engine loops
+VIRTUE_TIME_DECAY_MAX_CYCLES = MAX_STAGNATION_CYCLES
+VIRTUE_TIME_DECAY_MIN_OPEN_PNL = 25.0  # must be making progress (> this) to keep holding
 # Legacy ATR TP helpers (Virtue exits use VIRTUE_POSITION_TP_DOLLARS; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS

@@ -2,16 +2,170 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from engine.config import (
     HANDSHAKE_EQUITY_BASE,
     STARTING_NAV,
+    VIRTUE_MULTI_TP_COOLDOWN_S,
+    VIRTUE_MULTI_TP_COOLDOWN_STREAK,
+    VIRTUE_PIPELINE_BULL_SHORT_PENALTY,
+    VIRTUE_PIPELINE_LONG_BLEND_BASE,
+    VIRTUE_PIPELINE_SHORT_BLEND_BASE,
+    VIRTUE_PNL_LOCK_ARM_PEAK,
+    VIRTUE_PNL_LOCK_FLOOR_FRAC,
+    VIRTUE_SCORE_LONG_ENTER,
+    VIRTUE_SCORE_SHORT_ENTER,
+    VIRTUE_TEMPERANCE_BASE_CONTRACTS,
+    VIRTUE_TEMPERANCE_COURSE_CORRECT_BLEND_BUFFER,
+    VIRTUE_TEMPERANCE_LOSS_BLEND_BUFFER,
+    VIRTUE_TEMPERANCE_LOSS_STREAK_MIN,
+    VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE,
+    VIRTUE_TIME_DECAY_MAX_CYCLES,
+    VIRTUE_VELOCITY_ADX_FLOOR,
+    VIRTUE_VELOCITY_PENALTY_PER_ADX,
     concurrent_risk_cap,
     max_daily_loss_cap,
 )
 from manus.capital_protection import RiskVerdict
+
+
+def _pipeline_remaining(session: Any) -> int:
+    resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
+    cur = int(getattr(session, "cycle", 0) or 0)
+    if resume <= 0 or cur >= resume:
+        return 0
+    return max(0, resume - cur)
+
+
+def _pipeline_locked(session: Any) -> bool:
+    return _pipeline_remaining(session) > 0
+
+
+def _layer1_cooldown_fields(session: Any) -> dict[str, Any]:
+    """
+    Layer-1 dashboard fields: absolute cycle lock takes priority over multi-TP seconds.
+    remaining_s carries cycle delta while the absolute lock is active (poll contract).
+    """
+    pipe_rem = _pipeline_remaining(session)
+    wall_rem = _multi_tp_cooldown_remaining_s(session)
+    if pipe_rem > 0:
+        return {
+            "multi_tp_cooldown_active": True,
+            "multi_tp_cooldown_remaining_s": pipe_rem,
+        }
+    return {
+        "multi_tp_cooldown_active": wall_rem > 0,
+        "multi_tp_cooldown_remaining_s": wall_rem,
+    }
+
+
+def _entry_pipeline_layer1_fields(session: Any) -> dict[str, Any]:
+    pipe_rem = _pipeline_remaining(session)
+    wall_active = _multi_tp_cooldown_active(session)
+    clear = pipe_rem <= 0 and not wall_active
+    return {
+        "layer1_streak_clear": clear,
+        "pipeline_resume_cycle": int(getattr(session, "pipeline_resume_cycle", 0) or 0),
+        "pipeline_locked": pipe_rem > 0,
+        "pipeline_remaining_cycles": pipe_rem,
+    }
+
+
+def _time_decay_pipeline_fields(session: Any) -> dict[str, Any]:
+    marker = getattr(session, "entry_cycle_marker", None)
+    cur = int(getattr(session, "cycle", 0) or 0)
+    max_c = int(VIRTUE_TIME_DECAY_MAX_CYCLES)
+    if marker is None:
+        return {
+            "entry_cycle_marker": None,
+            "time_decay_elapsed_cycles": 0,
+            "time_decay_max_cycles": max_c,
+        }
+    elapsed = max(0, cur - int(marker))
+    return {
+        "entry_cycle_marker": int(marker),
+        "time_decay_elapsed_cycles": elapsed,
+        "time_decay_max_cycles": max_c,
+    }
+
+
+def _velocity_penalty(session: Any) -> float:
+    try:
+        adx = float(getattr(session, "last_adx", 14.0) or 14.0)
+    except (TypeError, ValueError):
+        adx = 14.0
+    if adx <= 0:
+        adx = 14.0
+    floor = float(VIRTUE_VELOCITY_ADX_FLOOR)
+    if adx >= floor:
+        return 0.0
+    return (floor - adx) * float(VIRTUE_VELOCITY_PENALTY_PER_ADX)
+
+
+def _temperance_pipeline_fields(session: Any) -> dict[str, Any]:
+    """Mirror temperance + velocity gates for system_state.json (no main import)."""
+    losses = int(getattr(session, "consecutive_losses", 0) or 0)
+    reason = str(getattr(session, "last_reason", "") or "").strip().lower()
+    raw_buf = 0.0
+    if losses >= int(VIRTUE_TEMPERANCE_LOSS_STREAK_MIN):
+        raw_buf = max(raw_buf, float(VIRTUE_TEMPERANCE_LOSS_BLEND_BUFFER))
+    if reason == "course_correct":
+        raw_buf = max(raw_buf, float(VIRTUE_TEMPERANCE_COURSE_CORRECT_BLEND_BUFFER))
+    base = max(1, int(VIRTUE_TEMPERANCE_BASE_CONTRACTS))
+    bias = str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL").upper()
+    vel = _velocity_penalty(session)
+    try:
+        adx = float(getattr(session, "last_adx", 14.0) or 14.0)
+    except (TypeError, ValueError):
+        adx = 14.0
+    # Strong with-trend: waive blend widen (matches main.effective_temperance_blend_buffer).
+    long_buf = 0.0 if (
+        adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE) and bias == "BULL"
+    ) else raw_buf
+    short_buf = 0.0 if (
+        adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE) and bias == "BEAR"
+    ) else raw_buf
+    pipe_long = float(VIRTUE_PIPELINE_LONG_BLEND_BASE) + vel + long_buf
+    pipe_short = float(VIRTUE_PIPELINE_SHORT_BLEND_BASE) - vel - short_buf
+    if bias == "BULL":
+        pipe_short -= float(VIRTUE_PIPELINE_BULL_SHORT_PENALTY)
+    return {
+        "temperance_base_contracts": base,
+        "temperance_blend_buffer": raw_buf,
+        "temperance_effective_long_buffer": long_buf,
+        "temperance_effective_short_buffer": short_buf,
+        "temperance_strong_trend_waive": bool(
+            adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE)
+            and bias in {"BULL", "BEAR"}
+        ),
+        "temperance_course_correct_friction": reason == "course_correct",
+        "temperance_long_enter": float(VIRTUE_SCORE_LONG_ENTER) + long_buf + vel,
+        "temperance_short_enter": float(VIRTUE_SCORE_SHORT_ENTER) - short_buf - vel,
+        "velocity_adx_penalty": round(vel, 2),
+        "pipeline_long_blend_required": pipe_long,
+        "pipeline_short_blend_required": pipe_short,
+        "pipeline_bull_short_penalty": bias == "BULL",
+    }
+
+
+def _multi_tp_cooldown_remaining_s(session: Any) -> int:
+    """Mirror Layer-1 streak lock for system_state.json poll (no import of main)."""
+    streak = int(getattr(session, "consecutive_tp_streak", 0) or 0)
+    if streak < int(VIRTUE_MULTI_TP_COOLDOWN_STREAK):
+        return 0
+    last_tp = float(getattr(session, "last_tp_timestamp", 0.0) or 0.0)
+    if last_tp <= 0:
+        return 0
+    elapsed = float(time.time()) - last_tp
+    remaining = float(VIRTUE_MULTI_TP_COOLDOWN_S) - elapsed
+    return max(0, int(remaining))
+
+
+def _multi_tp_cooldown_active(session: Any) -> bool:
+    return _multi_tp_cooldown_remaining_s(session) > 0
 
 
 def _unrealized_pnl(positions: list[dict[str, Any]], last_price: float | None) -> float:
@@ -314,6 +468,28 @@ def build_virtue_system_state(
     mode = "PAPER" if forward_test_force_paper() else "LIVE"
     now = datetime.now(timezone.utc).isoformat()
 
+    try:
+        from engine.dual_sleeve import build_dual_sleeve_state
+
+        dual_sleeve = build_dual_sleeve_state(session, account_nav=nav)
+    except Exception:
+        dual_sleeve = {
+            "account_nav": nav,
+            "max_account_contract_ceiling": 2,
+            "regime_engine": {
+                "macro_structural_regime": str(
+                    getattr(session, "macro_structural_regime", "STRUCTURAL_NEUTRAL")
+                    or "STRUCTURAL_NEUTRAL"
+                ),
+                "micro_tactical_regime": str(regime or "CHOP_NO_TRADE"),
+            },
+            "core_anchor_sleeve": {"active": False, "side": "FLAT", "size": 0},
+            "tactical_satellite_sleeve": {
+                "engine_exposure": "FLAT",
+                "size": 0,
+            },
+        }
+
     return {
         "version": 1,
         "updated_at": now,
@@ -325,9 +501,46 @@ def build_virtue_system_state(
         "last_price": last_price,
         "unrealized_pnl": unrealized,
         "account_nav": nav,
+        "dual_sleeve": dual_sleeve,
         "book_equity": round(broker_equity, 2) if broker_equity > 0 else round(starting, 2),
+        "consecutive_tp_streak": int(getattr(session, "consecutive_tp_streak", 0) or 0),
+        "last_tp_timestamp": float(getattr(session, "last_tp_timestamp", 0.0) or 0.0),
+        "macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
+        **_layer1_cooldown_fields(session),
+        "last_trade_outcome": {
+            "last_result": str(getattr(session, "last_result", "") or "FLAT"),
+            "last_reason": str(getattr(session, "last_reason", "") or "none"),
+            "consecutive_wins": int(getattr(session, "consecutive_wins", 0) or 0),
+            "consecutive_losses": int(getattr(session, "consecutive_losses", 0) or 0),
+            "last_trade_pnl": round(float(getattr(session, "last_trade_pnl", 0.0) or 0.0), 2),
+        },
+        "entry_pipeline": {
+            **_entry_pipeline_layer1_fields(session),
+            "layer2_macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
+            "layer3_course_correct": "check_every_hold_cycle",
+            "temperance_loss_friction": int(getattr(session, "consecutive_losses", 0) or 0) >= 1,
+            "virtue_pnl_lock_active": bool(
+                getattr(session, "virtue_pnl_lock_active", False)
+            ),
+            **_time_decay_pipeline_fields(session),
+            **_temperance_pipeline_fields(session),
+        },
         "session": {
             "realized_pnl_today": daily_pnl,
+            "peak_realized_pnl_today": round(
+                float(getattr(session, "peak_realized_pnl_today", 0.0) or 0.0), 2
+            ),
+            "virtue_pnl_lock_active": bool(
+                getattr(session, "virtue_pnl_lock_active", False)
+            ),
+            "virtue_pnl_lock_floor": round(
+                float(getattr(session, "peak_realized_pnl_today", 0.0) or 0.0)
+                * float(VIRTUE_PNL_LOCK_FLOOR_FRAC),
+                2,
+            )
+            if float(getattr(session, "peak_realized_pnl_today", 0.0) or 0.0)
+            >= float(VIRTUE_PNL_LOCK_ARM_PEAK)
+            else None,
             "session_date_et": str(getattr(session, "session_date_et", "") or ""),
             "open_risk_notional": open_risk,
             "trades_today": int(getattr(session, "trades_today", 0) or 0),
@@ -336,6 +549,18 @@ def build_virtue_system_state(
             "last_risk_verdict": last_risk_verdict,
             "last_risk_reason": last_risk_reason,
             "last_action": str(getattr(session, "last_action", "") or action),
+            "consecutive_tp_streak": int(getattr(session, "consecutive_tp_streak", 0) or 0),
+            "last_tp_timestamp": float(getattr(session, "last_tp_timestamp", 0.0) or 0.0),
+            "require_tp_pullback": bool(getattr(session, "require_tp_pullback", False)),
+            "macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
+            "long_tps_today": int(getattr(session, "long_tps_today", 0) or 0),
+            "short_tps_today": int(getattr(session, "short_tps_today", 0) or 0),
+            "entry_cycle_marker": getattr(session, "entry_cycle_marker", None),
+            "last_result": str(getattr(session, "last_result", "") or "FLAT"),
+            "last_reason": str(getattr(session, "last_reason", "") or "none"),
+            "consecutive_wins": int(getattr(session, "consecutive_wins", 0) or 0),
+            "consecutive_losses": int(getattr(session, "consecutive_losses", 0) or 0),
+            "last_trade_pnl": round(float(getattr(session, "last_trade_pnl", 0.0) or 0.0), 2),
         },
         "open_positions": positions,
         "virtue": {
@@ -532,7 +757,20 @@ def load_persisted_day_bucket(
     empty = {
         "session_date_et": "",
         "realized_pnl_today": 0.0,
+        "peak_realized_pnl_today": 0.0,
+        "virtue_pnl_lock_active": False,
         "trades_today": 0,
+        "consecutive_tp_streak": 0,
+        "last_tp_timestamp": 0.0,
+        "require_tp_pullback": False,
+        "macro_bias": "NEUTRAL",
+        "long_tps_today": 0,
+        "short_tps_today": 0,
+        "last_result": "FLAT",
+        "last_reason": "none",
+        "consecutive_wins": 0,
+        "consecutive_losses": 0,
+        "last_trade_pnl": 0.0,
         "restored": False,
     }
     path = (
@@ -547,7 +785,60 @@ def load_persisted_day_bucket(
         sess = raw.get("session") or {}
         persisted_date = str(sess.get("session_date_et") or "").strip()
         pnl = float(sess.get("realized_pnl_today") or 0.0)
+        peak_pnl = float(
+            sess.get("peak_realized_pnl_today")
+            if sess.get("peak_realized_pnl_today") is not None
+            else pnl
+        )
+        virtue_lock = bool(sess.get("virtue_pnl_lock_active") or False)
         trades = int(sess.get("trades_today") or 0)
+        tp_streak = int(
+            sess.get("consecutive_tp_streak")
+            if sess.get("consecutive_tp_streak") is not None
+            else raw.get("consecutive_tp_streak")
+            or 0
+        )
+        last_tp = float(
+            sess.get("last_tp_timestamp")
+            if sess.get("last_tp_timestamp") is not None
+            else raw.get("last_tp_timestamp")
+            or 0.0
+        )
+        require_pullback = bool(sess.get("require_tp_pullback") or False)
+        macro_bias = str(
+            sess.get("macro_bias")
+            or raw.get("macro_bias")
+            or "NEUTRAL"
+        ).upper()
+        if macro_bias not in {"BULL", "BEAR", "NEUTRAL"}:
+            macro_bias = "NEUTRAL"
+        long_tps = int(sess.get("long_tps_today") or 0)
+        short_tps = int(sess.get("short_tps_today") or 0)
+        outcome = raw.get("last_trade_outcome") or {}
+        last_result = str(
+            outcome.get("last_result") or sess.get("last_result") or "FLAT"
+        )
+        last_reason = str(
+            outcome.get("last_reason") or sess.get("last_reason") or "none"
+        )
+        consecutive_wins = int(
+            outcome.get("consecutive_wins")
+            if outcome.get("consecutive_wins") is not None
+            else sess.get("consecutive_wins")
+            or 0
+        )
+        consecutive_losses = int(
+            outcome.get("consecutive_losses")
+            if outcome.get("consecutive_losses") is not None
+            else sess.get("consecutive_losses")
+            or 0
+        )
+        last_trade_pnl = float(
+            outcome.get("last_trade_pnl")
+            if outcome.get("last_trade_pnl") is not None
+            else sess.get("last_trade_pnl")
+            or 0.0
+        )
         # Legacy payloads: no session_date_et — use updated_at ET date if present.
         if not persisted_date:
             updated = str(raw.get("updated_at") or "")
@@ -565,12 +856,100 @@ def load_persisted_day_bucket(
         return {
             "session_date_et": persisted_date,
             "realized_pnl_today": round(pnl, 2),
+            "peak_realized_pnl_today": round(max(peak_pnl, pnl), 2),
+            "virtue_pnl_lock_active": virtue_lock,
             "trades_today": max(0, trades),
+            "consecutive_tp_streak": max(0, tp_streak),
+            "last_tp_timestamp": max(0.0, last_tp),
+            "require_tp_pullback": require_pullback,
+            "macro_bias": macro_bias,
+            "long_tps_today": max(0, long_tps),
+            "short_tps_today": max(0, short_tps),
+            "last_result": last_result,
+            "last_reason": last_reason,
+            "consecutive_wins": max(0, consecutive_wins),
+            "consecutive_losses": max(0, consecutive_losses),
+            "last_trade_pnl": round(last_trade_pnl, 2),
             "restored": True,
         }
     except Exception as exc:
         log.exception("load_persisted_day_bucket_failed err=%s", exc)
         return empty
+
+
+def restore_dual_sleeve_books(session: Any, *, state_path: Any | None = None) -> bool:
+    """
+    Restore core/tactical sleeve tags from system_state.json (Justice).
+
+    Prevents restart from attributing a structural core runner to the tactical book
+    (which would wrongly feed Temperance).
+    """
+    from pathlib import Path
+    import json
+    import logging
+
+    log = logging.getLogger("virtue.ui_state")
+    path = (
+        Path(state_path)
+        if state_path is not None
+        else Path(__file__).resolve().parent.parent / "data" / "system_state.json"
+    )
+    try:
+        if not path.is_file():
+            return False
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        ds = raw.get("dual_sleeve") or {}
+        if not isinstance(ds, dict) or not ds:
+            return False
+        core = ds.get("core_anchor_sleeve") or {}
+        tac = ds.get("tactical_satellite_sleeve") or {}
+        regime = (ds.get("regime_engine") or {}).get("macro_structural_regime")
+        if regime:
+            session.macro_structural_regime = str(regime)
+
+        if bool(core.get("active")) and str(core.get("side") or "").upper() in {
+            "LONG",
+            "SHORT",
+        }:
+            session.core_active = True
+            session.core_side = str(core.get("side") or "FLAT").upper()
+            session.core_size = max(1, int(core.get("size") or 1))
+            session.core_entry_price = float(core.get("entry_price") or 0.0)
+            session.core_realized_pnl_today = float(
+                core.get("realized_pnl_today") or 0.0
+            )
+        else:
+            session.core_active = False
+            session.core_side = "FLAT"
+            session.core_size = 0
+            session.core_entry_price = 0.0
+
+        eng = str(tac.get("engine_exposure") or "FLAT").upper()
+        tac_sz = int(tac.get("size") or 0)
+        if bool(tac.get("active", tac_sz > 0)) and eng in {"LONG", "SHORT"} and tac_sz > 0:
+            session.tactical_active = True
+            session.tactical_side = eng
+            session.tactical_size = max(1, tac_sz)
+            session.tactical_entry_price = float(tac.get("entry_price") or 0.0)
+            marker = tac.get("entry_cycle_marker")
+            session.entry_cycle_marker = (
+                int(marker) if marker is not None else session.entry_cycle_marker
+            )
+            session.tactical_realized_pnl_today = float(
+                tac.get("realized_pnl_today") or 0.0
+            )
+        else:
+            session.tactical_active = False
+            session.tactical_side = "FLAT"
+            session.tactical_size = 0
+            session.tactical_entry_price = 0.0
+
+        if tac.get("pipeline_resume_cycle") is not None:
+            session.pipeline_resume_cycle = int(tac.get("pipeline_resume_cycle") or 0)
+        return True
+    except Exception as exc:
+        log.exception("restore_dual_sleeve_books_failed err=%s", exc)
+        return False
 
 
 __all__ = [
@@ -583,5 +962,6 @@ __all__ = [
     "load_persisted_open_positions",
     "paper_book_path",
     "persist_virtue_system_state",
+    "restore_dual_sleeve_books",
     "save_paper_book",
 ]

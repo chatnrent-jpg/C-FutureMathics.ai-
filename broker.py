@@ -625,7 +625,8 @@ class VirtueBroker:
         return OrderExecutionResult(
             routing_mode=RoutingMode.PAPER_ROUTE,
             status="FILLED",
-            order_id=f"FM-WB-{uuid.uuid4().hex[:8].upper()}",
+            # Match live Webull ClOrdID shape (fm + hex, ≤32) for Discord / CloudWatch.
+            order_id=f"fm{uuid.uuid4().hex}"[:32],
             fill_price=round(float(fill or 0.0), 2),
             contracts=contracts,
             direction=d,
@@ -889,6 +890,34 @@ class VirtueBroker:
             return None
         return notional / qty
 
+    async def close_contracts(
+        self,
+        *,
+        contracts: int,
+        price: float,
+        stop_ticks: int,
+        reason: str = "sleeve_close",
+    ) -> tuple[bool, float]:
+        """
+        Close exactly `contracts` of net exposure; leave any remainder untouched.
+
+        Multi-sleeve router primitive — never a whole-account wipe. Prefer this
+        over flatten_all for tactical/core exits so a satellite close cannot
+        clear a structural runner.
+        """
+        exposure_dir, exposure_size = self.net_exposure()
+        qty = max(0, int(contracts))
+        if exposure_dir == "FLAT" or exposure_size <= 0 or qty < 1:
+            return True, 0.0
+        leave = max(0, int(exposure_size) - qty)
+        return await self.partial_close(
+            contracts=qty,
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=reason,
+            leave=leave,
+        )
+
     async def flatten_all(
         self,
         *,
@@ -898,7 +927,10 @@ class VirtueBroker:
     ) -> tuple[bool, float]:
         """
         Close entire net exposure. Returns (ok, approx_realized_pnl).
-        Used when Wisdom goes FLAT / stop hit (Temperance + Courage exit).
+
+        Legacy / last-resort only. Routine tactical and core exits must use
+        close_contracts / the multi-sleeve order router so structural size
+        cannot be wiped by a satellite exit.
         """
         from engine.config import POINT_VALUE
 

@@ -63,6 +63,10 @@ scp @ssh `
     "$Root\engine\webull_openapi.py" `
     "$Root\engine\webull_futures.py" `
     "$Root\engine\config.py" `
+    "$Root\engine\dual_sleeve.py" `
+    "$Root\engine\sleeve_order_router.py" `
+    "$Root\engine\macromathics_core.py" `
+    "$Root\engine\observability.py" `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `
     "$Root\engine\ui_state_bridge.py" `

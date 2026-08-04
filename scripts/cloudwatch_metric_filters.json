@@ -1,0 +1,49 @@
+{
+  "namespace": "MacroMathics/Virtue",
+  "log_group_hint": "/futuremathics/virtue (or your journald→CloudWatch agent log group)",
+  "metric_filters": [
+    {
+      "name": "VelocityGatePreventions",
+      "filter_pattern": "[log, prefix=\"METRIC:EntryPreventedVelocityGate=1\", ...]",
+      "metric_name": "EntryPreventedVelocityGate",
+      "metric_value": "1",
+      "default_value": 0
+    },
+    {
+      "name": "CourseCorrectTriggered",
+      "filter_pattern": "[log, prefix=\"METRIC:CourseCorrectTriggered=1\", ...]",
+      "metric_name": "CourseCorrectTriggered",
+      "metric_value": "1",
+      "default_value": 0
+    },
+    {
+      "name": "TimeDecayTriggered",
+      "filter_pattern": "[log, prefix=\"METRIC:TimeDecayTriggered=1\", ...]",
+      "metric_name": "TimeDecayTriggered",
+      "metric_value": "1",
+      "default_value": 0
+    },
+    {
+      "name": "ProfitGuardTriggered",
+      "filter_pattern": "[log, prefix=\"METRIC:ProfitGuardTriggered=1\", ...]",
+      "metric_name": "ProfitGuardTriggered",
+      "metric_value": "1",
+      "default_value": 0
+    },
+    {
+      "name": "TradeClosed",
+      "filter_pattern": "[log, prefix=\"METRIC:TradeClosed=1\", ...]",
+      "metric_name": "TradeClosed",
+      "metric_value": "1",
+      "default_value": 0
+    },
+    {
+      "name": "PositionOpened",
+      "filter_pattern": "[log, prefix=\"METRIC:PositionOpened=1\", ...]",
+      "metric_name": "PositionOpened",
+      "metric_value": "1",
+      "default_value": 0
+    }
+  ],
+  "webhook_env": "FM_CHAT_WEBHOOK_URL"
+}

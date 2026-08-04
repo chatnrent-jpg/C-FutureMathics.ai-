@@ -79,22 +79,24 @@ class WisdomStrategy:
 
     Direction: VWAP score + TWAP score (both must agree vs 50%).
     Volatility structure: ATR% for chaos / unstable vol stand-aside.
-    EMA/ADX retained for telemetry (not hard directional gates).
+    Entries: ADX + EMA alignment gates (fewer wrong-side starts).
+    Holds: invalidate at mid-band and flatten (nimble course-correct).
     """
 
     ema_fast_period: int = 20
     ema_slow_period: int = 50
     adx_period: int = 14
     atr_period: int = 14
-    adx_trend_min: float = 0.0  # unused as hard gate; kept for compat/tests
+    adx_trend_min: float = 18.0  # flat long entries require ADX >= this (Wisdom)
+    adx_short_min: float = 22.0  # shorts need stronger ADX (Temperance)
     atr_pct_chaos_max: float = 2.5  # ATR as % of price; above → stand aside
     score_atr_mult: float = 2.0  # ATR component of score scale
     score_price_pct: float = 0.004  # ±0.4% of price spans 0–100 (trend extensions register)
     max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
-    long_enter: float = 55.0  # ENTER long from flat (both scores >=)
-    short_enter: float = 45.0  # ENTER short from flat (both scores <=)
-    long_exit: float = 40.0  # while LONG: flip/exit when both scores <=
-    short_exit: float = 60.0  # while SHORT: flip/exit when both scores >=
+    long_enter: float = 58.0  # ENTER long from flat (both scores >=)
+    short_enter: float = 42.0  # ENTER short from flat (both scores <=)
+    long_exit: float = 50.0  # while LONG: flatten when both scores <= mid
+    short_exit: float = 50.0  # while SHORT: flatten when both scores >= mid
     anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)
     min_anchor_samples: int = 20
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
@@ -371,7 +373,10 @@ class WisdomStrategy:
             return self._empty(
                 regime=Regime.CHOP_NO_TRADE,
                 action=SignalAction.FLAT,
-                reason=f"atr_chaos atr_pct={atr_pct:.2f}>={self.atr_pct_chaos_max}",
+                reason=(
+                    f"STAND ASIDE | CHAOS VOLATILITY — "
+                    f"ATR% {atr_pct:.2f} is at/above chaos ceiling {self.atr_pct_chaos_max:.2f}"
+                ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,
@@ -383,21 +388,24 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Entry bands (from flat) vs exit bands (while holding) — asymmetric hysteresis
+        # Entry bands (from flat) vs invalidate bands (while holding) — nimble hysteresis
         enter_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
         enter_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
+        # Thesis broken at mid: do not ride wrong-side into the dollar stop.
         exit_long = vwap_score <= self.long_exit and twap_score <= self.long_exit
         exit_short = vwap_score >= self.short_exit and twap_score >= self.short_exit
 
-        # Hysteresis: while in a trade, stay until the opposite EXIT band is clear
+        # While in a trade: hold only while thesis remains valid; else flatten (course-correct).
+        # Return FLAT (not reverse) — reverse needs a fresh entry streak from cash (Courage+Temperance).
         if hold == "LONG":
             if exit_long:
                 return self._empty(
-                    regime=Regime.TREND_BEAR,
-                    action=SignalAction.SHORT,
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
                     reason=(
-                        f"vwap_twap_flip_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                        f"blend={blended:.1f} exit<={self.long_exit}"
+                        f"FLATTEN SIGNAL | LONG THESIS BROKEN — "
+                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                        f"dropped to exit band ≤{self.long_exit:.0f}"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -413,8 +421,9 @@ class WisdomStrategy:
                 regime=Regime.TREND_BULL,
                 action=SignalAction.LONG,
                 reason=(
-                    f"vwap_twap_hold_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                    f"blend={blended:.1f} hold_until_exit<={self.long_exit}"
+                    f"HOLDING LONG | THESIS STILL VALID — "
+                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                    f"(exit if both ≤{self.long_exit:.0f})"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -430,11 +439,12 @@ class WisdomStrategy:
         if hold == "SHORT":
             if exit_short:
                 return self._empty(
-                    regime=Regime.TREND_BULL,
-                    action=SignalAction.LONG,
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
                     reason=(
-                        f"vwap_twap_flip_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                        f"blend={blended:.1f} exit>={self.short_exit}"
+                        f"FLATTEN SIGNAL | SHORT THESIS BROKEN — "
+                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                        f"rose to exit band ≥{self.short_exit:.0f}"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -450,8 +460,9 @@ class WisdomStrategy:
                 regime=Regime.TREND_BEAR,
                 action=SignalAction.SHORT,
                 reason=(
-                    f"vwap_twap_hold_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                    f"blend={blended:.1f} hold_until_exit>={self.short_exit}"
+                    f"HOLDING SHORT | THESIS STILL VALID — "
+                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                    f"(exit if both ≥{self.short_exit:.0f})"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -464,14 +475,35 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Flat: only enter on a clear ENTRY band (not every tick around 50)
-        if enter_long:
+        # Flat: clear ENTRY band + ADX strength + EMA alignment (fewer wrong starts)
+        if adx < float(self.adx_trend_min):
+            return self._empty(
+                regime=Regime.CHOP_NO_TRADE,
+                action=SignalAction.FLAT,
+                reason=(
+                    f"STAND ASIDE | ADX TOO WEAK — "
+                    f"trend strength ADX {adx:.1f} is below floor {self.adx_trend_min:.1f} "
+                    f"(need stronger trend to enter) · blend {blended:.1f}"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        if enter_long and ema_fast >= ema_slow:
             return self._empty(
                 regime=Regime.TREND_BULL,
                 action=SignalAction.LONG,
                 reason=(
-                    f"vwap_twap_long vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                    f"blend={blended:.1f} enter>={self.long_enter}"
+                    f"LONG SETUP | ENTRY BAND CLEARED — "
+                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                    f"≥ enter {self.long_enter:.0f} · ADX {adx:.1f}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -484,13 +516,71 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        if enter_short:
+        if enter_short and ema_fast <= ema_slow:
+            if adx < float(self.adx_short_min):
+                return self._empty(
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
+                    reason=(
+                        f"STAND ASIDE | SHORT ADX TOO WEAK — "
+                        f"ADX {adx:.1f} is below short floor {self.adx_short_min:.1f} "
+                        f"(shorts need stronger trend) · blend {blended:.1f}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
             return self._empty(
                 regime=Regime.TREND_BEAR,
                 action=SignalAction.SHORT,
                 reason=(
-                    f"vwap_twap_short vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                    f"blend={blended:.1f} enter<={self.short_enter}"
+                    f"SHORT SETUP | ENTRY BAND CLEARED — "
+                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                    f"≤ enter {self.short_enter:.0f} · ADX {adx:.1f}"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        if enter_long and ema_fast < ema_slow:
+            return self._empty(
+                regime=Regime.CHOP_NO_TRADE,
+                action=SignalAction.FLAT,
+                reason=(
+                    f"STAND ASIDE | EMA DISAGREES WITH LONG — "
+                    f"blend {blended:.1f} but fast EMA {ema_fast:.2f} < slow EMA {ema_slow:.2f}"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        if enter_short and ema_fast > ema_slow:
+            return self._empty(
+                regime=Regime.CHOP_NO_TRADE,
+                action=SignalAction.FLAT,
+                reason=(
+                    f"STAND ASIDE | EMA DISAGREES WITH SHORT — "
+                    f"blend {blended:.1f} but fast EMA {ema_fast:.2f} > slow EMA {ema_slow:.2f}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -507,8 +597,10 @@ class WisdomStrategy:
             regime=Regime.CHOP_NO_TRADE,
             action=SignalAction.FLAT,
             reason=(
-                f"vwap_twap_neutral_band vwap={vwap_score:.1f} twap={twap_score:.1f} "
-                f"blend={blended:.1f} need>={self.long_enter}or<={self.short_enter}"
+                f"STAND ASIDE | NEUTRAL BAND — "
+                f"blend {blended:.1f} is between long enter ≥{self.long_enter:.0f} "
+                f"and short enter ≤{self.short_enter:.0f} "
+                f"(VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}) — no clear edge"
             ),
             ema_fast=ema_fast,
             ema_slow=ema_slow,
