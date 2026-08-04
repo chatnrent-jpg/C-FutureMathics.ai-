@@ -199,21 +199,24 @@ VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
 # Databento quote staleness ceiling (seconds)
 DATABENTO_MAX_QUOTE_AGE_S = 5.0
-# Nimble pivot bands (Aug 2026): sticky 40/60 exits held wrong-side shorts to the $75 stop
-# while blend was already 53–56 bullish. Thesis invalidates at mid; enter only on clear edge.
+# Enter on clear edge; exit with hysteresis so mid-band chop cannot scalp every dip.
 VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
 VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
-VIRTUE_SCORE_LONG_EXIT = 50.0    # while LONG: flatten when both <= mid (thesis broken)
-VIRTUE_SCORE_SHORT_EXIT = 50.0   # while SHORT: flatten when both >= mid (thesis broken)
+VIRTUE_SCORE_LONG_EXIT = 45.0    # while LONG: flatten when both <= 45 (not mid-50)
+VIRTUE_SCORE_SHORT_EXIT = 55.0   # while SHORT: flatten when both >= 55 (not mid-50)
 VIRTUE_REQUIRED_STREAK = 3       # 3 clear cycles — fewer wrong-side entries
 VIRTUE_ADX_ENTER_MIN = 18.0      # flat long entries need trend strength (Wisdom)
 VIRTUE_ADX_SHORT_ENTER_MIN = 22.0  # shorts need stronger trend (fewer counter-trend traps)
+# Satellite (tactical) needs structural ADX — no chop scalps beside a core runner.
+VIRTUE_TACTICAL_ADX_MIN = 22.0
+# Hard daily round-trip cap for tactical sleeve (Temperance).
+VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 12
 # Bull-day asymmetric short filter — counter-trend shorts need extreme confirmation.
 VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
 VIRTUE_BULL_DAY_SHORT_ADX_MIN = 25.0    # structural reversal ADX floor on BULL days
-# Hard loop COURSE_CORRECT (every cycle while holding) — mid-band thesis dead → instant flatten.
-VIRTUE_COURSE_CORRECT_SHORT_BLEND = 50.0  # SHORT + blend >= mid → force flatten
-VIRTUE_COURSE_CORRECT_LONG_BLEND = 50.0   # LONG + blend <= mid → force flatten
+# COURSE_CORRECT hysteresis — aligned with strategy exits (not mid-50 scalp).
+VIRTUE_COURSE_CORRECT_SHORT_BLEND = 55.0  # SHORT + blend >= 55 → force flatten
+VIRTUE_COURSE_CORRECT_LONG_BLEND = 45.0   # LONG + blend <= 45 → force flatten
 # Chase: block only extreme late entries. 72 was freezing re-entry after $100 TP in bulls.
 VIRTUE_SCORE_LONG_CHASE_MAX = 85.0
 VIRTUE_SCORE_SHORT_CHASE_MIN = 15.0
@@ -227,16 +230,16 @@ VIRTUE_POSITION_TP_DOLLARS = 100.0
 # Cut losers at ~$75 on the whole position (full flatten) — ~1.33:1 vs $100 TP.
 VIRTUE_POSITION_STOP_DOLLARS = 75.0
 # --- MACROMATHICS ENGINE PERFORMANCE CONFIGURATION ---
-# TP: short pause so winners can rejoin momentum (Courage).
-VIRTUE_BASE_TP_COOLDOWN_CYCLES = 3
+# Post-exit cool-offs must outlast mid-band noise (Temperance > scalp Courage).
+VIRTUE_BASE_TP_COOLDOWN_CYCLES = 8
 # Added per extra TP in a streak (anti-giveback after multi-TP runs).
 VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES = 5
 # Thesis broke / wrong side — match hard stop so we do not re-chop immediately.
-VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES = 8
+VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES = 12
 # Hard dollar stop cool-down (Temperance).
-VIRTUE_HARD_STOP_COOLDOWN_CYCLES = 8
-# Time-decay: fast reset — stagnation cut, thesis did not break.
-VIRTUE_TIME_DECAY_COOLDOWN_CYCLES = 3
+VIRTUE_HARD_STOP_COOLDOWN_CYCLES = 12
+# Time-decay: stagnation cut still needs a real cool-off (not instant re-fire).
+VIRTUE_TIME_DECAY_COOLDOWN_CYCLES = 8
 # Compat aliases (older call sites / tests).
 VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES = VIRTUE_BASE_TP_COOLDOWN_CYCLES
 VIRTUE_POST_TP_STREAK_COOLDOWN_EXTRA = VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES

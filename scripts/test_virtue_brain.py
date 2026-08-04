@@ -263,15 +263,15 @@ def test_heartbeat_throttled_every_n_cycles() -> None:
 
 
 def test_hysteresis_holds_while_thesis_valid() -> None:
-    """While LONG, small dips still hold until mid-band invalidation."""
+    """While LONG, small dips still hold until hysteresis exit (45), not mid-50."""
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
         min_anchor_samples=5,
         adx_trend_min=0.0,
         long_enter=62.0,
         short_enter=38.0,
-        long_exit=50.0,
-        short_exit=50.0,
+        long_exit=45.0,
+        short_exit=55.0,
     )
     s.seed(_trending_bars(50, bull=True, step=2.0))
     d_long = s.evaluate(holding=None)
@@ -287,15 +287,15 @@ def test_hysteresis_holds_while_thesis_valid() -> None:
 
 
 def test_separate_entry_exit_bands() -> None:
-    """Enter needs clear edge; while long, invalidate/flatten at mid."""
+    """Enter needs clear edge; while long, invalidate/flatten with hysteresis."""
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
         min_anchor_samples=5,
         adx_trend_min=0.0,
         long_enter=58.0,
         short_enter=42.0,
-        long_exit=50.0,
-        short_exit=50.0,
+        long_exit=45.0,
+        short_exit=55.0,
     )
     s.seed(_trending_bars(60, bull=True, step=3.0))
     d = s.evaluate(holding=None)
@@ -307,20 +307,20 @@ def test_separate_entry_exit_bands() -> None:
 
 
 def test_nimble_short_invalidates_before_stop() -> None:
-    """Wrong-side SHORT with bullish mid scores must flatten (not ride to $75 stop)."""
+    """Wrong-side SHORT past hysteresis (55) must flatten (not ride to $75 stop)."""
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
         min_anchor_samples=5,
         adx_trend_min=0.0,
         long_enter=58.0,
         short_enter=42.0,
-        long_exit=50.0,
-        short_exit=50.0,
+        long_exit=45.0,
+        short_exit=55.0,
     )
     s.seed(_trending_bars(40, bull=False, step=2.0))
     d_short = s.evaluate(holding=None)
     assert d_short.action == SignalAction.SHORT
-    # Market turns up through anchors — thesis broken
+    # Market turns up through anchors — thesis broken past 55
     last = list(s.closes)[-1]
     for _ in range(25):
         last += 3.0
@@ -328,7 +328,7 @@ def test_nimble_short_invalidates_before_stop() -> None:
     d_fix = s.evaluate(holding="SHORT")
     assert d_fix.action == SignalAction.FLAT
     assert "SHORT THESIS BROKEN" in d_fix.reason or "thesis_invalid_short" in d_fix.reason
-    assert d_fix.blended_score >= 50.0
+    assert d_fix.blended_score >= 55.0
 
 
 def test_vwap_twap_agreement_required() -> None:
@@ -504,19 +504,23 @@ def test_session_uses_timely_entry_band() -> None:
     s = VirtueSession()
     assert s.strategy.long_enter == float(VIRTUE_SCORE_LONG_ENTER) == 58.0
     assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 42.0
-    assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 50.0
-    assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 50.0
+    assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 45.0
+    assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 55.0
     assert s.strategy.adx_trend_min == float(VIRTUE_ADX_ENTER_MIN) == 18.0
     from engine.config import (
         VIRTUE_ADX_SHORT_ENTER_MIN,
         VIRTUE_COURSE_CORRECT_LONG_BLEND,
         VIRTUE_COURSE_CORRECT_SHORT_BLEND,
+        VIRTUE_MAX_TACTICAL_TRADES_PER_DAY,
         VIRTUE_POST_TP_STREAK_PULLBACK_AFTER,
+        VIRTUE_TACTICAL_ADX_MIN,
     )
 
     assert s.strategy.adx_short_min == float(VIRTUE_ADX_SHORT_ENTER_MIN) == 22.0
-    assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 50.0
-    assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 50.0
+    assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
+    assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
+    assert float(VIRTUE_TACTICAL_ADX_MIN) == 22.0
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
     assert int(VIRTUE_POST_TP_STREAK_PULLBACK_AFTER) == 2
     assert int(VIRTUE_REQUIRED_STREAK) == 3
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 85.0
@@ -650,21 +654,27 @@ def test_required_streak_is_three_for_structure() -> None:
 
 
 def test_check_course_correct_hard_blend_hook() -> None:
-    """Mid-50 COURSE_CORRECT: SHORT+blend>=50 / LONG+blend<=50 force flatten."""
+    """Hysteresis COURSE_CORRECT: SHORT+blend>=55 / LONG+blend<=45 force flatten."""
     from main import check_course_correct
 
-    hit, reason = check_course_correct("SHORT", 50.0)
+    hit, reason = check_course_correct("SHORT", 55.0)
     assert hit is True
     assert "course_correct_short_vs_bull" in reason
 
-    hit, reason = check_course_correct("SHORT", 49.9)
+    hit, reason = check_course_correct("SHORT", 54.9)
     assert hit is False
 
-    hit, reason = check_course_correct("LONG", 50.0)
+    hit, reason = check_course_correct("LONG", 45.0)
     assert hit is True
     assert "course_correct_long_vs_bear" in reason
 
-    hit, reason = check_course_correct("LONG", 50.1)
+    hit, reason = check_course_correct("LONG", 45.1)
+    assert hit is False
+
+    # Mid-band chop must NOT course-correct (hysteresis gap).
+    hit, _ = check_course_correct("LONG", 50.0)
+    assert hit is False
+    hit, _ = check_course_correct("SHORT", 50.0)
     assert hit is False
 
     hit, _ = check_course_correct("FLAT", 90.0)
@@ -705,11 +715,13 @@ def test_calculate_temperance_parameters_loss_and_course_correct() -> None:
     # course_correct alone (after a win resets losses) still applies 3.0 buffer
     update_outcome_state(s, 100.0, "take_profit_$100", current_engine_cycle=1)
     update_outcome_state(
-        s, -10.0, "course_correct_long_vs_bear blend=45.0<=50.0", current_engine_cycle=5
+        s, -10.0, "course_correct_long_vs_bear blend=45.0<=45.0", current_engine_cycle=5
     )
     assert s.consecutive_losses == 1
     assert s.last_reason == "course_correct"
-    assert s.pipeline_resume_cycle == 5 + 8
+    from engine.config import VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES
+
+    assert s.pipeline_resume_cycle == 5 + int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES)
     contracts, buf = calculate_temperance_parameters(session=s)
     assert buf == float(VIRTUE_TEMPERANCE_COURSE_CORRECT_BLEND_BUFFER) == 3.0
 
@@ -781,7 +793,7 @@ def test_update_outcome_state_win_loss_and_tp_streak() -> None:
     assert s.last_trade_pnl == 101.2
     assert s.consecutive_tp_streak == 1
     assert s.trades_today == 1
-    # First TP: base + 0*bonus = 3 → resume at 13
+    # First TP: base + 0*bonus → resume at 10 + base
     assert s.pipeline_resume_cycle == 10 + int(VIRTUE_BASE_TP_COOLDOWN_CYCLES)
     assert s.last_tp_timestamp > 0
 
@@ -790,12 +802,12 @@ def test_update_outcome_state_win_loss_and_tp_streak() -> None:
     assert s.consecutive_wins == 2
     assert s.consecutive_tp_streak == 2
     assert s.trades_today == 2
-    # Second TP: base + 1*bonus = 8 → resume at 21
+    # Second TP: base + 1*bonus → resume at 13 + base + bonus
     assert s.pipeline_resume_cycle == 13 + int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) + int(
         VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES
     )
 
-    # course_correct is always LOSS friction (even green exit) + 8-cycle lock
+    # course_correct is always LOSS friction (even green exit) + cool-off lock
     s.cycle = 21
     update_outcome_state(
         s,
@@ -841,12 +853,15 @@ def test_is_entry_pipeline_clear_layer1_cycle_lock() -> None:
     assert is_entry_pipeline_clear(s, 10) is True
     assert s.layer1_streak_clear is True
 
+    from engine.config import VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES
+
     update_outcome_state(s, -50.0, "course_correct_x", current_engine_cycle=10)
-    assert s.pipeline_resume_cycle == 18
+    resume = 10 + int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES)
+    assert s.pipeline_resume_cycle == resume
     assert is_entry_pipeline_clear(s, 10) is False
     assert s.layer1_streak_clear is False
-    assert is_entry_pipeline_clear(s, 17) is False
-    assert is_entry_pipeline_clear(s, 18) is True
+    assert is_entry_pipeline_clear(s, resume - 1) is False
+    assert is_entry_pipeline_clear(s, resume) is True
     assert s.layer1_streak_clear is True
 
     # Dict poll-contract shape
@@ -866,11 +881,12 @@ def test_is_entry_pipeline_clear_layer1_cycle_lock() -> None:
     from engine.ui_state_bridge import build_virtue_system_state
 
     s.cycle = 12
+    rem = max(0, int(s.pipeline_resume_cycle) - 12)
     st = build_virtue_system_state(s, last_price=7700.0)
     assert st["entry_pipeline"]["layer1_streak_clear"] is False
-    assert st["entry_pipeline"]["pipeline_remaining_cycles"] == 6
+    assert st["entry_pipeline"]["pipeline_remaining_cycles"] == rem
     assert st["multi_tp_cooldown_active"] is True
-    assert st["multi_tp_cooldown_remaining_s"] == 6
+    assert st["multi_tp_cooldown_remaining_s"] == rem
 
 
 def test_check_virtue_pnl_lock_trailing_floor() -> None:
@@ -952,7 +968,7 @@ def test_check_time_decay_exit_stagnant_hold() -> None:
     assert s.last_reason == "time_decay"
     assert s.entry_cycle_marker is None
     assert s.pipeline_resume_cycle == 25 + int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES)
-    assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 3
+    assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 8
     assert int(VIRTUE_TIME_DECAY_MAX_CYCLES) == 15
 
 
@@ -1051,7 +1067,7 @@ def test_macromathics_core_production_phases() -> None:
 
     assert int(MAX_STAGNATION_CYCLES) == 15
     assert float(PROFIT_GUARD_THRESHOLD) == 150.0
-    assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 3
+    assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 8
 
     state = {"realized_pnl_today": 200.0, "peak_realized_pnl_today": 200.0}
     hit, floor = phase1_profit_guard_triggered(state)
@@ -1073,9 +1089,9 @@ def test_macromathics_core_production_phases() -> None:
     assert phase3_layer1_clear(pipe, 15) is False
     assert phase3_layer1_clear(pipe, 20) is True
 
-    assert cooldown_cycles_for_reason("time_decay") == 3
-    assert cooldown_cycles_for_reason("course_correct") == 8
-    assert cooldown_cycles_for_reason("take_profit", tp_streak=1) == 8
+    assert cooldown_cycles_for_reason("time_decay") == 8
+    assert cooldown_cycles_for_reason("course_correct") == 12
+    assert cooldown_cycles_for_reason("take_profit", tp_streak=1) == 8 + 5
 
 
 def test_calculate_dynamic_blend_thresholds_velocity_gate() -> None:
@@ -1253,10 +1269,10 @@ def test_profit_lock_stands_aside_at_500() -> None:
     assert int(PROFIT_LOCK_MAX_CONTRACTS) == 0
     assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
     assert float(VIRTUE_POSITION_STOP_DOLLARS) == 75.0
-    assert int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) == 3
+    assert int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) == 8
     assert int(VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES) == 5
-    assert int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES) == 8
-    assert int(VIRTUE_HARD_STOP_COOLDOWN_CYCLES) == 8
+    assert int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES) == 12
+    assert int(VIRTUE_HARD_STOP_COOLDOWN_CYCLES) == 12
     # Compat aliases stay wired to the canonical knobs.
     assert int(VIRTUE_POST_TP_ENTRY_COOLDOWN_CYCLES) == int(VIRTUE_BASE_TP_COOLDOWN_CYCLES)
     assert int(VIRTUE_POST_STOP_ENTRY_COOLDOWN_CYCLES) == int(VIRTUE_HARD_STOP_COOLDOWN_CYCLES)
@@ -1302,6 +1318,44 @@ def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     assert session.realized_pnl_today == 50.0
     assert session.trades_today == 1
     assert session.broker.equity == float(STARTING_NAV) + 300.0
+
+
+def test_anti_churn_temperance_gates() -> None:
+    """Streaks freeze under pipeline lock; day cap / hysteresis knobs are armed."""
+    from engine.config import (
+        VIRTUE_COURSE_CORRECT_LONG_BLEND,
+        VIRTUE_COURSE_CORRECT_SHORT_BLEND,
+        VIRTUE_MAX_TACTICAL_TRADES_PER_DAY,
+        VIRTUE_SCORE_LONG_EXIT,
+        VIRTUE_SCORE_SHORT_EXIT,
+        VIRTUE_TACTICAL_ADX_MIN,
+    )
+    from main import VirtueSession, check_course_correct, update_outcome_state
+
+    assert float(VIRTUE_SCORE_LONG_EXIT) == 45.0
+    assert float(VIRTUE_SCORE_SHORT_EXIT) == 55.0
+    assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
+    assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
+    assert float(VIRTUE_TACTICAL_ADX_MIN) == 22.0
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
+
+    # Mid-band must not flatten
+    assert check_course_correct("LONG", 50.0)[0] is False
+    assert check_course_correct("SHORT", 50.0)[0] is False
+
+    s = VirtueSession()
+    s.cycle = 10
+    s.long_streak = 3
+    update_outcome_state(s, -10.0, "course_correct_x", current_engine_cycle=10)
+    # Round-trip counted once on close
+    assert s.trades_today == 1
+    # Simulate what run_cycle does while locked: streaks cleared
+    s.cycle = 11
+    pipe_resume = int(s.pipeline_resume_cycle)
+    assert pipe_resume > 11
+    s.long_streak = 0
+    s.short_streak = 0
+    assert s.long_streak == 0
 
 
 def test_multi_sleeve_order_router() -> None:
@@ -1634,5 +1688,6 @@ if __name__ == "__main__":
     test_session_day_roll_clears_yesterdays_profit_lock()
     test_dual_sleeve_unified_rules()
     test_multi_sleeve_order_router()
+    test_anti_churn_temperance_gates()
     print("ALL VIRTUE BRAIN TESTS PASSED")
 

@@ -95,8 +95,8 @@ class WisdomStrategy:
     max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
     long_enter: float = 58.0  # ENTER long from flat (both scores >=)
     short_enter: float = 42.0  # ENTER short from flat (both scores <=)
-    long_exit: float = 50.0  # while LONG: flatten when both scores <= mid
-    short_exit: float = 50.0  # while SHORT: flatten when both scores >= mid
+    long_exit: float = 45.0  # while LONG: flatten when both scores <= hysteresis
+    short_exit: float = 55.0  # while SHORT: flatten when both scores >= hysteresis
     anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)
     min_anchor_samples: int = 20
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
@@ -388,10 +388,10 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Entry bands (from flat) vs invalidate bands (while holding) — nimble hysteresis
+        # Entry bands (from flat) vs invalidate bands (while holding) — real hysteresis.
         enter_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
         enter_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
-        # Thesis broken at mid: do not ride wrong-side into the dollar stop.
+        # Thesis broken past hysteresis band (default 45/55) — not every mid-50 dip.
         exit_long = vwap_score <= self.long_exit and twap_score <= self.long_exit
         exit_short = vwap_score >= self.short_exit and twap_score >= self.short_exit
 

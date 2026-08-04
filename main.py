@@ -102,6 +102,8 @@ from engine.config import (
     VIRTUE_PIPELINE_SHORT_BLEND_BASE,
     VIRTUE_VELOCITY_ADX_FLOOR,
     VIRTUE_VELOCITY_PENALTY_PER_ADX,
+    VIRTUE_TACTICAL_ADX_MIN,
+    VIRTUE_MAX_TACTICAL_TRADES_PER_DAY,
     VIRTUE_POST_TIME_DECAY_COOLDOWN_CYCLES,
     VIRTUE_TIME_DECAY_COOLDOWN_CYCLES,
     VIRTUE_TIME_DECAY_MAX_CYCLES,
@@ -347,11 +349,10 @@ def check_time_decay_exit(
 
 def check_course_correct(current_position: str, blend: float) -> tuple[bool, str]:
     """
-    Layer 3 — Execution State (every loop iteration while holding).
+    Layer 3 — Execution State (every loop iteration while holding tactical).
 
-    Drop a position immediately on mid-band thesis flip. Independent of strategy
-    hold hysteresis — cannot freeze into the dollar stop.
-    SHORT + blend >= 50 or LONG + blend <= 50 → flatten.
+    Hysteresis exits (default 45/55) — mid-band chop must not scalp every dip,
+    but a true thesis break still flattens before the dollar stop.
     """
     pos = (current_position or "").upper()
     b = float(blend)
@@ -1946,8 +1947,11 @@ async def run_cycle(
     # Use true bid/ask (or mid) — do not pad ±1 tick (that inflated ATR on proxy quotes).
     session.strategy.update_price(price, high=high, low=low)
 
-    net_dir_pre, net_size_pre = session.broker.net_exposure()
-    holding = net_dir_pre if net_size_pre > 0 else None
+    # Strategy hold path is tactical-only — core must not skip flat ADX gates.
+    if bool(session.tactical_active) and int(session.tactical_size) > 0:
+        holding = str(session.tactical_side or "").upper() or None
+    else:
+        holding = None
     decision = session.strategy.evaluate(holding=holding)
     session.last_regime = decision.regime.value
     session.last_signal_reason = decision.reason
@@ -1997,8 +2001,16 @@ async def run_cycle(
     t_score = float(decision.twap_score)
     is_raw_long = v_score >= long_enter_thr and t_score >= long_enter_thr
     is_raw_short = v_score <= short_enter_thr and t_score <= short_enter_thr
-    session.long_streak = (session.long_streak + 1) if is_raw_long else 0
-    session.short_streak = (session.short_streak + 1) if is_raw_short else 0
+    # Temperance: do not build confirmation streaks during pipeline lock
+    # (prevents instant re-fire the moment cool-off ends).
+    pipe_resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
+    pipeline_locked = pipe_resume > 0 and int(session.cycle) < pipe_resume
+    if pipeline_locked:
+        session.long_streak = 0
+        session.short_streak = 0
+    else:
+        session.long_streak = (session.long_streak + 1) if is_raw_long else 0
+        session.short_streak = (session.short_streak + 1) if is_raw_short else 0
     # Cycle log / friction: show side-aware buffer (0 when strong with-trend waived).
     if decision.action.value == "LONG":
         blend_buffer = float(long_buf)
@@ -2349,6 +2361,8 @@ async def run_cycle(
 
     # Layer 1 — absolute cycle cooldown from update_outcome_state (no wall clock).
     if not is_entry_pipeline_clear(session, session.cycle):
+        session.long_streak = 0
+        session.short_streak = 0
         session.last_action = "FLAT"
         return
 
@@ -2356,12 +2370,38 @@ async def run_cycle(
     clear_to_trade, remaining_s = verify_cooldown_validity(session)
     if not clear_to_trade:
         session.layer1_streak_clear = False
+        session.long_streak = 0
+        session.short_streak = 0
         logger.info(
             "CYCLE %s LAYER1_multi_tp_cooldown Active streak=%s remaining=%ss — "
             "bypass entry calculations",
             session.cycle,
             session.consecutive_tp_streak,
             remaining_s,
+        )
+        session.last_action = "FLAT"
+        return
+
+    # Temperance: hard daily tactical round-trip cap (counted on close).
+    if int(session.trades_today) >= int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY):
+        logger.info(
+            "CYCLE %s tactical_day_cap trades_today=%s >= %s — stand aside "
+            "(Temperance; no more satellite entries today)",
+            session.cycle,
+            session.trades_today,
+            int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
+        )
+        session.last_action = "FLAT"
+        return
+
+    # Wisdom: freeze tactical satellite in weak ADX (core uses its own structural gate).
+    if float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN):
+        logger.info(
+            "CYCLE %s tactical_adx_freeze adx=%.1f < %.1f — no satellite entry "
+            "(stand aside micro; core may still manage structurally)",
+            session.cycle,
+            float(decision.adx),
+            float(VIRTUE_TACTICAL_ADX_MIN),
         )
         session.last_action = "FLAT"
         return
@@ -2784,7 +2824,7 @@ async def run_cycle(
         result: Any = None,
         **_: Any,
     ) -> None:
-        sess.trades_today += 1
+        # trades_today counted only on close (one round-trip = one trade).
         fill_side = str(
             getattr(result, "direction", None) or side or decision.action.value
         )
