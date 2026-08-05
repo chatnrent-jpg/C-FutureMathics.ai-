@@ -175,20 +175,25 @@ def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     )
 
     tz = ZoneInfo("America/New_York")
-    # Sunday evening CME open — session open, entries allowed
+    # Sunday evening CME open — session open, but entries only in RTH windows
     sun = datetime(2026, 7, 26, 20, 0, tzinfo=tz)
     assert in_market_hours(sun) is True
     assert virtue_session_open(sun) is True
-    assert virtue_entries_allowed(sun) is True
+    assert virtue_entries_allowed(sun) is False
 
     # Sunday just before Globex open — closed
     sun_pre = datetime(2026, 7, 26, 17, 59, tzinfo=tz)
     assert virtue_session_open(sun_pre) is False
 
-    # Monday 16:30 — session open, entries still allowed
+    # Monday morning window — entries allowed
+    mon_am = datetime(2026, 7, 27, 10, 30, tzinfo=tz)
+    assert virtue_session_open(mon_am) is True
+    assert virtue_entries_allowed(mon_am) is True
+
+    # Monday 16:30 — session open, outside entry windows
     mon_ok = datetime(2026, 7, 27, 16, 30, tzinfo=tz)
     assert virtue_session_open(mon_ok) is True
-    assert virtue_entries_allowed(mon_ok) is True
+    assert virtue_entries_allowed(mon_ok) is False
 
     # Monday 16:45 — pre-maintenance cutoff (manage/exit only)
     mon_cut = datetime(2026, 7, 27, 16, 45, tzinfo=tz)
@@ -200,16 +205,21 @@ def test_cme_entry_cutoff_when_databento(monkeypatch) -> None:
     assert virtue_session_open(mon_maint) is False
     assert virtue_entries_allowed(mon_maint) is False
 
-    # After maintenance reopen — overnight session
+    # After maintenance reopen — overnight session manage-only
     mon_overnight = datetime(2026, 7, 27, 18, 5, tzinfo=tz)
     assert virtue_session_open(mon_overnight) is True
-    assert virtue_entries_allowed(mon_overnight) is True
+    assert virtue_entries_allowed(mon_overnight) is False
     assert "CME_GLOBEX" in virtue_session_label()
 
-    # Tuesday 02:00 ET overnight — still in CME session
+    # Tuesday 02:00 ET overnight — still in CME session, no new entries
     tue_ow = datetime(2026, 7, 28, 2, 0, tzinfo=tz)
     assert virtue_session_open(tue_ow) is True
-    assert virtue_entries_allowed(tue_ow) is True
+    assert virtue_entries_allowed(tue_ow) is False
+
+    # Friday afternoon window — entries allowed
+    fri_pm = datetime(2026, 7, 24, 14, 30, tzinfo=tz)
+    assert virtue_session_open(fri_pm) is True
+    assert virtue_entries_allowed(fri_pm) is True
 
     # Friday 16:50 — pre-weekend close cutoff
     fri_cut = datetime(2026, 7, 24, 16, 50, tzinfo=tz)
@@ -234,9 +244,15 @@ def test_rth_mode_still_blocks_overnight(monkeypatch) -> None:
     assert virtue_entries_allowed(sun) is False
     mon_open = datetime(2026, 7, 27, 9, 30, tzinfo=tz)
     assert virtue_session_open(mon_open) is True
-    assert virtue_entries_allowed(mon_open) is True
+    assert virtue_entries_allowed(mon_open) is False  # before 09:45 entry window
+    mon_1000 = datetime(2026, 7, 27, 10, 0, tzinfo=tz)
+    assert virtue_entries_allowed(mon_1000) is True  # morning window
+    mon_1200 = datetime(2026, 7, 27, 12, 0, tzinfo=tz)
+    assert virtue_entries_allowed(mon_1200) is False  # lunch blackout
     mon_1500 = datetime(2026, 7, 27, 15, 0, tzinfo=tz)
-    assert virtue_entries_allowed(mon_1500) is True  # afternoon trend still allowed
+    assert virtue_entries_allowed(mon_1500) is True  # afternoon window
+    mon_1530 = datetime(2026, 7, 27, 15, 30, tzinfo=tz)
+    assert virtue_entries_allowed(mon_1530) is False  # window closed
     mon_1545 = datetime(2026, 7, 27, 15, 45, tzinfo=tz)
     assert virtue_entries_allowed(mon_1545) is False
 

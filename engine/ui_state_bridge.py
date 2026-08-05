@@ -93,13 +93,14 @@ def _time_decay_pipeline_fields(session: Any) -> dict[str, Any]:
 
 
 def _velocity_penalty(session: Any) -> float:
+    """Unknown/zero ADX → full floor penalty (Justice: do not invent strength)."""
     try:
-        adx = float(getattr(session, "last_adx", 14.0) or 14.0)
+        adx = float(getattr(session, "last_adx", 0.0) or 0.0)
     except (TypeError, ValueError):
-        adx = 14.0
-    if adx <= 0:
-        adx = 14.0
+        adx = 0.0
     floor = float(VIRTUE_VELOCITY_ADX_FLOOR)
+    if adx <= 0:
+        return floor * float(VIRTUE_VELOCITY_PENALTY_PER_ADX)
     if adx >= floor:
         return 0.0
     return (floor - adx) * float(VIRTUE_VELOCITY_PENALTY_PER_ADX)
@@ -118,15 +119,19 @@ def _temperance_pipeline_fields(session: Any) -> dict[str, Any]:
     bias = str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL").upper()
     vel = _velocity_penalty(session)
     try:
-        adx = float(getattr(session, "last_adx", 14.0) or 14.0)
+        adx = float(getattr(session, "last_adx", 0.0) or 0.0)
     except (TypeError, ValueError):
-        adx = 14.0
+        adx = 0.0
     # Strong with-trend: waive blend widen (matches main.effective_temperance_blend_buffer).
     long_buf = 0.0 if (
-        adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE) and bias == "BULL"
+        adx > 0
+        and adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE)
+        and bias == "BULL"
     ) else raw_buf
     short_buf = 0.0 if (
-        adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE) and bias == "BEAR"
+        adx > 0
+        and adx >= float(VIRTUE_TEMPERANCE_STRONG_ADX_WAIVE)
+        and bias == "BEAR"
     ) else raw_buf
     pipe_long = float(VIRTUE_PIPELINE_LONG_BLEND_BASE) + vel + long_buf
     pipe_short = float(VIRTUE_PIPELINE_SHORT_BLEND_BASE) - vel - short_buf
@@ -445,11 +450,13 @@ def build_virtue_system_state(
         except Exception:
             continue
     if not positions and net_size > 0:
+        # Justice: do not invent entry=last_price (that forces 0 unrealized).
         positions = [
             {
                 "direction": net_dir,
                 "contracts": int(net_size),
-                "entry_price": float(last_price or 0.0),
+                "entry_price": 0.0,
+                "entry_unknown": True,
                 "symbol": EXECUTION_SYMBOL,
             }
         ]
@@ -462,7 +469,11 @@ def build_virtue_system_state(
         nav = round(broker_equity + unrealized, 2)
     else:
         nav = round(starting + daily_pnl + unrealized, 2)
-    open_risk = float(VIRTUE_POSITION_STOP_DOLLARS) if abs(net_size) > 0 else 0.0
+    open_risk = (
+        float(VIRTUE_POSITION_STOP_DOLLARS) * abs(int(net_size))
+        if abs(net_size) > 0
+        else 0.0
+    )
     max_conc = concurrent_risk_cap(risk_nav)
     hard_stop = max_daily_loss_cap(risk_nav)
     mode = "PAPER" if forward_test_force_paper() else "LIVE"
@@ -518,6 +529,16 @@ def build_virtue_system_state(
             **_entry_pipeline_layer1_fields(session),
             "layer2_macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
             "layer3_course_correct": "check_every_hold_cycle",
+            "allow_new_entries": bool(getattr(session, "allow_new_entries", False)),
+            "entry_windows_et": "09:45-11:30&13:45-15:55+extreme",
+            "entry_structure_ok": bool(getattr(session, "last_structure_ok", False)),
+            "entry_structure_reason": str(
+                getattr(session, "last_structure_reason", "") or ""
+            ),
+            "sleeve_reconcile_ok": bool(getattr(session, "sleeve_reconcile_ok", True)),
+            "sleeve_reconcile_detail": str(
+                getattr(session, "sleeve_reconcile_detail", "") or ""
+            ),
             "temperance_loss_friction": int(getattr(session, "consecutive_losses", 0) or 0) >= 1,
             "virtue_pnl_lock_active": bool(
                 getattr(session, "virtue_pnl_lock_active", False)

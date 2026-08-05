@@ -57,10 +57,14 @@ def test_live_no_overnight_day_window(monkeypatch) -> None:
     # Sunday Globex open — blocked for live cash daytime-only
     sun = datetime(2026, 7, 26, 20, 0, tzinfo=tz)
     assert virtue_session_open(sun) is False
-    # Monday midday — allowed
+    # Monday inside morning entry window — allowed
     mon = datetime(2026, 7, 27, 11, 0, tzinfo=tz)
     assert virtue_session_open(mon) is True
     assert virtue_entries_allowed(mon) is True
+    # Monday lunch — session open but no new entries
+    lunch = datetime(2026, 7, 27, 12, 30, tzinfo=tz)
+    assert virtue_session_open(lunch) is True
+    assert virtue_entries_allowed(lunch) is False
     # Monday evening Globex — blocked without overnight
     eve = datetime(2026, 7, 27, 20, 0, tzinfo=tz)
     assert virtue_session_open(eve) is False

@@ -43,8 +43,16 @@ from engine.dual_sleeve import (
     core_should_open,
     core_size_default,
     evaluate_core_macro_safety,
+    reconcile_sleeves_to_broker,
     structural_confirm_cycles,
     tactical_entry_allowed,
+)
+from engine.macromathics_core import (
+    cooldown_cycles_for_reason,
+    phase1_profit_guard_triggered,
+    phase2_time_decay_triggered,
+    phase3_layer1_clear,
+    phase3_velocity_gates,
 )
 from engine.sleeve_order_router import (
     absolute_contract_footprint,
@@ -52,6 +60,10 @@ from engine.sleeve_order_router import (
     close_all_sleeves_sequential,
     execute_core_action,
     execute_tactical_action,
+)
+from engine.entry_structure import (
+    commit_entry_structure_memory,
+    evaluate_entry_structure_gates,
 )
 from engine.observability import (
     notify_core_macro_invalidation,
@@ -145,6 +157,7 @@ from engine.ui_state_bridge import (
     save_paper_book,
 )
 from scripts.run_daily_session import (
+    allow_new_entries,
     virtue_entries_allowed,
     virtue_session_label,
     virtue_session_open,
@@ -177,6 +190,13 @@ class VirtueSession:
     last_vwap_score: float = 50.0
     last_twap_score: float = 50.0
     last_blended_score: float = 50.0
+    # Prior-cycle structure memory (ATR expand / ADX rise / VWAP-TWAP spread widen)
+    prev_atr: float = 0.0
+    prev_adx: float = 0.0
+    prev_anchor_spread_pct: float = 0.0
+    last_structure_ok: bool = False
+    last_structure_reason: str = "entry_structure:none"
+    allow_new_entries: bool = False
     last_data_source: str = "alpaca_spy_mes_proxy"
     anchors_aligned: bool = False
     entry_cooldown_cycles: int = 0  # skip new entries after anchor rebase (non-trade)
@@ -205,8 +225,12 @@ class VirtueSession:
     core_side: str = "FLAT"
     core_size: int = 0
     core_entry_price: float = 0.0
+    core_entry_cycle: int | None = None
+    last_price: float = 0.0  # last accepted quote (core adverse failsafe)
     core_realized_pnl_today: float = 0.0
     core_realized_pnl_this_cycle: float = 0.0
+    sleeve_reconcile_ok: bool = True
+    sleeve_reconcile_detail: str = "sleeve_reconcile:pending"
     tactical_active: bool = False
     tactical_side: str = "FLAT"
     tactical_size: int = 0
@@ -243,61 +267,53 @@ def check_virtue_pnl_lock(
     """
     Virtue Balance — trailing daily profit lock (Temperance).
 
-    Once peak realized PnL today >= arm threshold, protect floor_frac of that peak.
-    If realized drops to/below the floor, lock the engine for the rest of the ET day.
+    Delegates Phase 1 math to engine.macromathics_core (single contract).
     """
     if isinstance(session, dict):
-        realized = float(session.get("realized_pnl_today", 0.0) or 0.0)
-        peak = float(session.get("peak_realized_pnl_today", 0.0) or 0.0)
-        if realized > peak:
-            session["peak_realized_pnl_today"] = realized
-            peak = realized
-        arm = float(VIRTUE_PNL_LOCK_ARM_PEAK)
-        frac = float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
-        if peak >= arm:
-            floor_lock = peak * frac
-            if realized <= floor_lock:
-                was_active = bool(session.get("virtue_pnl_lock_active"))
-                session["virtue_pnl_lock_active"] = True
-                session["Regime"] = "CHOP_NO_TRADE"
-                session["regime"] = "CHOP_NO_TRADE"
-                if not was_active:
-                    notify_profit_guard(
-                        realized=realized, floor=floor_lock, peak=peak
-                    )
-                return True
-        return bool(session.get("virtue_pnl_lock_active"))
+        was_active = bool(session.get("virtue_pnl_lock_active"))
+        hit, floor_lock = phase1_profit_guard_triggered(session)
+        if hit and not was_active:
+            peak = float(session.get("peak_realized_pnl_today", 0.0) or 0.0)
+            notify_profit_guard(
+                realized=float(session.get("realized_pnl_today", 0.0) or 0.0),
+                floor=floor_lock,
+                peak=peak,
+            )
+        return hit
 
     # Already latched for the day — stay locked (Justice: no silent unlock).
     if bool(session.virtue_pnl_lock_active):
         return True
 
-    realized = float(session.realized_pnl_today or 0.0)
-    peak = float(session.peak_realized_pnl_today or 0.0)
-    if realized > peak:
-        session.peak_realized_pnl_today = realized
-        peak = realized
-
-    arm = float(VIRTUE_PNL_LOCK_ARM_PEAK)
-    frac = float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
-    if peak >= arm:
-        floor_lock = peak * frac
-        if realized <= floor_lock + 1e-9:
-            session.virtue_pnl_lock_active = True
-            session.last_regime = "CHOP_NO_TRADE"
-            session.last_signal_reason = (
-                f"virtue_pnl_lock peak={peak:.2f} floor={floor_lock:.2f} "
-                f"realized={realized:.2f}"
-            )
-            logger.error(
-                "VIRTUE_PNL_LOCK triggered peak=%.2f floor=%.2f realized=%.2f — "
-                "day shut down (Temperance)",
-                peak,
-                floor_lock,
-                realized,
-            )
-            notify_profit_guard(realized=realized, floor=floor_lock, peak=peak)
-            return True
+    state = {
+        "realized_pnl_today": float(session.realized_pnl_today or 0.0),
+        "peak_realized_pnl_today": float(session.peak_realized_pnl_today or 0.0),
+        "virtue_pnl_lock_active": bool(session.virtue_pnl_lock_active),
+    }
+    hit, floor_lock = phase1_profit_guard_triggered(state)
+    session.peak_realized_pnl_today = float(
+        state.get("peak_realized_pnl_today", session.peak_realized_pnl_today) or 0.0
+    )
+    if hit:
+        session.virtue_pnl_lock_active = True
+        session.last_regime = "CHOP_NO_TRADE"
+        session.last_signal_reason = (
+            f"virtue_pnl_lock peak={session.peak_realized_pnl_today:.2f} "
+            f"floor={floor_lock:.2f} realized={session.realized_pnl_today:.2f}"
+        )
+        logger.error(
+            "VIRTUE_PNL_LOCK triggered peak=%.2f floor=%.2f realized=%.2f — "
+            "day shut down (Temperance)",
+            session.peak_realized_pnl_today,
+            floor_lock,
+            session.realized_pnl_today,
+        )
+        notify_profit_guard(
+            realized=float(session.realized_pnl_today),
+            floor=floor_lock,
+            peak=float(session.peak_realized_pnl_today),
+        )
+        return True
     return False
 
 
@@ -311,8 +327,7 @@ def check_time_decay_exit(
     """
     Failsafe: flatten stagnant holds that never produce momentum toward TP.
 
-    Marks entry_cycle_marker on first observed exposure. Triggers when
-    elapsed >= VIRTUE_TIME_DECAY_MAX_CYCLES and open_pnl <= MIN threshold.
+    Phase 2 contract via macromathics_core; broker net size still gates FLAT.
     """
     net_dir, net_size = session.broker.net_exposure()
     exp = (exposure or net_dir or "FLAT").upper()
@@ -320,31 +335,32 @@ def check_time_decay_exit(
         session.entry_cycle_marker = None
         return False, ""
 
-    if session.entry_cycle_marker is None:
-        session.entry_cycle_marker = int(current_engine_cycle)
+    state = {
+        "engine_exposure": exp,
+        "entry_cycle_marker": session.entry_cycle_marker,
+        "open_pnl": float(open_pnl),
+    }
+    hit = phase2_time_decay_triggered(state, int(current_engine_cycle))
+    session.entry_cycle_marker = state.get("entry_cycle_marker")
+    if not hit:
         return False, ""
-
-    elapsed = int(current_engine_cycle) - int(session.entry_cycle_marker)
+    elapsed = int(current_engine_cycle) - int(session.entry_cycle_marker or current_engine_cycle)
     max_cycles = int(VIRTUE_TIME_DECAY_MAX_CYCLES)
     min_pnl = float(VIRTUE_TIME_DECAY_MIN_OPEN_PNL)
-    if elapsed >= max_cycles and float(open_pnl) <= min_pnl:
-        reason = (
-            f"time_decay elapsed={elapsed}>={max_cycles} "
-            f"open_pnl={float(open_pnl):.2f}<={min_pnl:.2f}"
-        )
-        logger.warning(
-            "CYCLE %s TIME_DECAY_TRIGGERED holding=%s elapsed=%s open_pnl=%.2f — %s",
-            current_engine_cycle,
-            exp,
-            elapsed,
-            float(open_pnl),
-            reason,
-        )
-        notify_time_decay(
-            elapsed=elapsed, open_pnl=float(open_pnl), exposure=exp
-        )
-        return True, reason
-    return False, ""
+    reason = (
+        f"time_decay elapsed={elapsed}>={max_cycles} "
+        f"open_pnl={float(open_pnl):.2f}<={min_pnl:.2f}"
+    )
+    logger.warning(
+        "CYCLE %s TIME_DECAY_TRIGGERED holding=%s elapsed=%s open_pnl=%.2f — %s",
+        current_engine_cycle,
+        exp,
+        elapsed,
+        float(open_pnl),
+        reason,
+    )
+    notify_time_decay(elapsed=elapsed, open_pnl=float(open_pnl), exposure=exp)
+    return True, reason
 
 
 def check_course_correct(current_position: str, blend: float) -> tuple[bool, str]:
@@ -412,12 +428,7 @@ def update_macro_bias(
     elif "BEAR" in reg and bias == "NEUTRAL":
         bias = "BEAR"
 
-    # Day win skew overrides soft structure (realized truth).
-    if int(session.long_tps_today) > int(session.short_tps_today):
-        bias = "BULL"
-    elif int(session.short_tps_today) > int(session.long_tps_today):
-        bias = "BEAR"
-
+    # Tape-only latch — do not override with TP day skew (Wisdom: market conditions).
     session.macro_bias = bias
     return bias
 
@@ -533,29 +544,21 @@ def calculate_dynamic_blend_thresholds(
     """
     Velocity gate: widen entry thresholds when ADX is low to block slow drifts.
 
-    If ADX < VIRTUE_VELOCITY_ADX_FLOOR, add (floor - adx) * penalty_per_adx
-    to the long gate and subtract the same from the short gate.
+    Phase 3 contract via macromathics_core (single decision surface).
     """
     state = system_state if isinstance(system_state, dict) else {}
+    long_threshold, short_threshold = phase3_velocity_gates(state, adx=adx)
     try:
         adx_val = float(
             adx
             if adx is not None
-            else state.get("ADX", state.get("adx", 14.0)) or 14.0
+            else state.get("ADX", state.get("adx", 0.0)) or 0.0
         )
     except (TypeError, ValueError):
-        adx_val = 14.0
-    # Missing/zero ADX → treat as weak (Justice: do not pretend trend strength).
-    if adx_val <= 0:
-        adx_val = 14.0
-
-    long_threshold = float(VIRTUE_PIPELINE_LONG_BLEND_BASE)
-    short_threshold = float(VIRTUE_PIPELINE_SHORT_BLEND_BASE)
+        adx_val = 0.0
     floor = float(VIRTUE_VELOCITY_ADX_FLOOR)
-    if adx_val < floor:
-        volatility_penalty = (floor - adx_val) * float(VIRTUE_VELOCITY_PENALTY_PER_ADX)
-        long_threshold += volatility_penalty
-        short_threshold -= volatility_penalty
+    if adx_val > 0 and adx_val < floor:
+        volatility_penalty = float(long_threshold) - float(VIRTUE_PIPELINE_LONG_BLEND_BASE)
         logger.info(
             "VELOCITY_GATE low_adx=%.1f penalty=+%.1f → long>=%.1f short<=%.1f",
             adx_val,
@@ -885,26 +888,16 @@ def is_entry_pipeline_clear(
     current_engine_cycle >= resume_cycle (or resume unset).
     """
     if isinstance(session_state, dict):
-        resume = int(session_state.get("pipeline_resume_cycle", 0) or 0)
         cur = int(
             current_engine_cycle
             if current_engine_cycle is not None
             else session_state.get("cycle", 0) or 0
         )
+        clear = phase3_layer1_clear(session_state, cur)
         pipeline = session_state.setdefault("entry_pipeline", {})
-        if cur < resume:
-            remaining = resume - cur
-            pipeline["layer1_streak_clear"] = False
-            pipeline["pipeline_remaining_cycles"] = remaining
-            session_state["multi_tp_cooldown_active"] = True
-            # Index delta exposed on the legacy remaining_s field for dashboard polls.
-            session_state["multi_tp_cooldown_remaining_s"] = remaining
-            return False
-        pipeline["layer1_streak_clear"] = True
-        pipeline["pipeline_remaining_cycles"] = 0
-        session_state["multi_tp_cooldown_active"] = False
-        session_state["multi_tp_cooldown_remaining_s"] = 0
-        return True
+        remaining = int(session_state.get("multi_tp_cooldown_remaining_s", 0) or 0)
+        pipeline["pipeline_remaining_cycles"] = remaining
+        return clear
 
     session = session_state
     cur = int(
@@ -954,7 +947,7 @@ def update_outcome_state(
     if count_trade:
         session.trades_today = int(session.trades_today) + 1
 
-    cooldown_applied = int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)
+    tp_streak_for_cd = int(session.consecutive_tp_streak)
 
     if tag == "take_profit":
         session.last_result = "WIN"
@@ -962,9 +955,7 @@ def update_outcome_state(
         session.consecutive_losses = 0
         # Trailing streak penalty uses pre-increment streak: base + streak * bonus.
         streak = int(session.consecutive_tp_streak)
-        cooldown_applied = int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) + (
-            streak * int(VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES)
-        )
+        tp_streak_for_cd = streak
         session.consecutive_tp_streak = streak + 1
         session.last_tp_timestamp = float(time.time())
         if int(session.consecutive_tp_streak) >= int(
@@ -980,7 +971,6 @@ def update_outcome_state(
         session.consecutive_tp_streak = 0
         session.last_tp_timestamp = 0.0
         session.require_tp_pullback = False
-        cooldown_applied = int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES)
 
     elif tag == "stop":
         session.last_result = "LOSS"
@@ -989,11 +979,9 @@ def update_outcome_state(
         session.consecutive_tp_streak = 0
         session.last_tp_timestamp = 0.0
         session.require_tp_pullback = False
-        cooldown_applied = int(VIRTUE_HARD_STOP_COOLDOWN_CYCLES)
 
     elif tag == "time_decay":
         # Stagnant exposure cut — fast cool-off (thesis did not break).
-        cooldown_applied = int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES)
         if delta > 0:
             session.last_result = "WIN"
             session.consecutive_wins = int(session.consecutive_wins) + 1
@@ -1008,7 +996,6 @@ def update_outcome_state(
 
     elif tag == "virtue_pnl_lock":
         # Day shut-down latch already set; cool-off if residual flattened.
-        cooldown_applied = int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES)
         if delta > 0:
             session.last_result = "WIN"
             session.consecutive_wins = int(session.consecutive_wins) + 1
@@ -1025,7 +1012,6 @@ def update_outcome_state(
 
     else:
         # structured_exit / thesis_invalid / unknown — safety rebase cool-off
-        cooldown_applied = int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)
         if delta > 0:
             session.last_result = "WIN"
             session.consecutive_wins = int(session.consecutive_wins) + 1
@@ -1037,6 +1023,20 @@ def update_outcome_state(
             session.consecutive_tp_streak = 0
             session.last_tp_timestamp = 0.0
             session.require_tp_pullback = False
+
+    # Single cooldown map (macromathics_core Phase contract).
+    cooldown_applied = int(
+        cooldown_cycles_for_reason(tag, tp_streak=tp_streak_for_cd)
+    )
+    if tag not in {
+        "take_profit",
+        "course_correct",
+        "stop",
+        "time_decay",
+        "virtue_pnl_lock",
+        "profit_guard",
+    }:
+        cooldown_applied = int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)
 
     # Any confirmed close clears the exposed-cycle marker.
     session.entry_cycle_marker = None
@@ -1142,6 +1142,7 @@ def _mark_core_open(
     session.core_side = str(side or "FLAT").upper()
     session.core_size = max(1, int(size))
     session.core_entry_price = float(price)
+    session.core_entry_cycle = int(getattr(session, "cycle", 0) or 0)
     session.core_realized_pnl_this_cycle = 0.0
 
 
@@ -1150,6 +1151,7 @@ def _mark_core_flat(session: VirtueSession) -> None:
     session.core_side = "FLAT"
     session.core_size = 0
     session.core_entry_price = 0.0
+    session.core_entry_cycle = None
 
 
 def _credit_core_pnl(session: VirtueSession, pnl: float) -> None:
@@ -1263,6 +1265,7 @@ async def _manage_core_sleeve(
     stop_ticks: int,
     blend: float,
     adx: float,
+    ignore_hours: bool = False,
 ) -> None:
     """Update structural regime; Slow Invalidation Core Escaper + core open."""
     regime, bull_s, bear_s = classify_structural_regime(
@@ -1271,6 +1274,7 @@ async def _manage_core_sleeve(
         confirm_cycles=structural_confirm_cycles(),
         bull_streak=int(session.structural_bull_streak),
         bear_streak=int(session.structural_bear_streak),
+        blend=float(blend),
     )
     session.structural_bull_streak = bull_s
     session.structural_bear_streak = bear_s
@@ -1311,6 +1315,22 @@ async def _manage_core_sleeve(
 
     open_ok, side = core_should_open(regime, core_active=bool(session.core_active))
     if not open_ok:
+        return
+    # Same RTH entry windows + extreme override as tactical (Temperance/Courage).
+    if not ignore_hours and not virtue_entries_allowed(
+        adx=float(adx), blend=float(blend)
+    ):
+        logger.info(
+            "CYCLE %s CORE_OPEN_BLOCKED outside_entry_window — manage/invalidation only",
+            session.cycle,
+        )
+        return
+    if not bool(session.last_structure_ok):
+        logger.info(
+            "CYCLE %s CORE_OPEN_BLOCKED %s",
+            session.cycle,
+            session.last_structure_reason,
+        )
         return
     # Room under ceiling for core size.
     tac = int(session.tactical_size) if bool(session.tactical_active) else 0
@@ -1565,7 +1585,12 @@ async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -
             raw = await mes_data.fetch_ohlcv_bars(timeframe="1m", limit=limit, lookback_hours=36)
             ohlc = mes_data.bars_as_strategy_ohlc(raw)
             bars = [
-                Bar(high=float(b["high"]), low=float(b["low"]), close=float(b["close"]))
+                Bar(
+                    high=float(b["high"]),
+                    low=float(b["low"]),
+                    close=float(b["close"]),
+                    volume=max(1.0, float(b.get("volume") or 1.0)),
+                )
                 for b in ohlc
             ]
             if bars:
@@ -1579,7 +1604,12 @@ async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -
             spy_bars = await session.broker.data.fetch_spy_bars(timeframe="5Min", limit=limit)
             mes_bars = session.broker.data.mes_proxy_bars_from_spy(spy_bars)
             bars = [
-                Bar(high=float(b["high"]), low=float(b["low"]), close=float(b["close"]))
+                Bar(
+                    high=float(b["high"]),
+                    low=float(b["low"]),
+                    close=float(b["close"]),
+                    volume=max(1.0, float(b.get("volume") or 1.0)),
+                )
                 for b in mes_bars
             ]
             if bars:
@@ -1821,6 +1851,18 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
+    # Justice: sleeve books must match broker net before any risk work.
+    try:
+        ok_sl, sl_detail = reconcile_sleeves_to_broker(session, session.broker)
+        session.sleeve_reconcile_ok = bool(ok_sl)
+        session.sleeve_reconcile_detail = str(sl_detail)
+        if not ok_sl:
+            logger.warning("CYCLE %s %s", session.cycle, sl_detail)
+    except Exception as exc:
+        session.sleeve_reconcile_ok = False
+        session.sleeve_reconcile_detail = f"sleeve_reconcile:error:{exc}"
+        logger.exception("sleeve_reconcile_failed err=%s", exc)
+
     if session.broker.has_pending_live_order():
         logger.warning(
             "CYCLE %s pending_live_order id=%s — stand aside new risk",
@@ -1905,6 +1947,7 @@ async def run_cycle(
         logger.error("CYCLE %s invalid_price — Justice stand aside", session.cycle)
         session.last_action = "FLAT"
         return
+    session.last_price = price
 
     # Re-check RTH after market context (cycle may have started in RTH then crossed close).
     if not await _rth_gate_or_flatten(session, stop_ticks=stop_ticks, ignore_hours=ignore_hours):
@@ -1913,6 +1956,11 @@ async def run_cycle(
     low = float(tick.get("bid") or price)
     if high < low:
         high, low = low, high
+    try:
+        tick_vol = float(tick.get("size") or tick.get("volume") or 1.0)
+    except (TypeError, ValueError):
+        tick_vol = 1.0
+    tick_vol = max(1.0, tick_vol)
 
     # Align rolling VWAP/TWAP to live print (seed bars can sit far from quote).
     # Also rebase when VWAP↔TWAP diverge beyond ATR×N (sketch: anchor disagreement).
@@ -1945,7 +1993,8 @@ async def run_cycle(
         return
 
     # Use true bid/ask (or mid) — do not pad ±1 tick (that inflated ATR on proxy quotes).
-    session.strategy.update_price(price, high=high, low=low)
+    # Pass quote/trade size so VWAP is volume-weighted (TWAP stays equal-weight).
+    session.strategy.update_price(price, high=high, low=low, volume=tick_vol)
 
     # Strategy hold path is tactical-only — core must not skip flat ADX gates.
     if bool(session.tactical_active) and int(session.tactical_size) > 0:
@@ -1960,6 +2009,27 @@ async def run_cycle(
     session.last_vwap_score = float(decision.vwap_score)
     session.last_twap_score = float(decision.twap_score)
     session.last_blended_score = float(decision.blended_score)
+    # RTH windows (ET) + structure memory — compute before commit for this cycle's gates.
+    session.allow_new_entries = bool(ignore_hours) or allow_new_entries()
+    # allow_new_entries flag is window-only; extreme override applied at fire time.
+    structure_ok, structure_reason = evaluate_entry_structure_gates(
+        session,
+        atr=float(decision.atr),
+        adx=float(decision.adx),
+        vwap=float(decision.vwap),
+        twap=float(decision.twap),
+        price=float(price),
+    )
+    session.last_structure_ok = bool(structure_ok)
+    session.last_structure_reason = str(structure_reason)
+    commit_entry_structure_memory(
+        session,
+        atr=float(decision.atr),
+        adx=float(decision.adx),
+        vwap=float(decision.vwap),
+        twap=float(decision.twap),
+        price=float(price),
+    )
     _, size_for_tp = session.broker.net_exposure()
     size_ref = size_for_tp if size_for_tp > 0 else 2
     tp_ticks = position_tp_ticks(size_ref)
@@ -2072,6 +2142,7 @@ async def run_cycle(
         stop_ticks=stop_ticks,
         blend=float(decision.blended_score),
         adx=float(decision.adx),
+        ignore_hours=ignore_hours,
     )
 
     # ============================================================
@@ -2431,12 +2502,46 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Temperance: pre-close / pre-maintenance window — manage/exit only (no new risk).
-    # CME (Databento): 16:45–17:00 ET only; overnight after 18:00 remains open.
-    if not ignore_hours and not virtue_entries_allowed():
-        logger.info(
-            "CYCLE %s no_new_entry_cutoff — manage/exit only (pre-close / pre-maintenance)",
+    # Justice: refuse new risk while sleeve books disagree with broker.
+    if not bool(session.sleeve_reconcile_ok):
+        logger.warning(
+            "CYCLE %s entry_blocked %s — stand aside new entries",
             session.cycle,
+            session.sleeve_reconcile_detail,
+        )
+        session.last_action = "FLAT"
+        return
+
+    # Temperance windows + Courage extreme override (session still open).
+    entries_ok = bool(ignore_hours) or virtue_entries_allowed(
+        adx=float(decision.adx),
+        blend=float(decision.blended_score),
+    )
+    if not entries_ok:
+        logger.info(
+            "CYCLE %s no_new_entry_window allow_new_entries=%s adx=%.1f blend=%.1f — "
+            "manage/exit only (entries=09:45-11:30&13:45-15:55ET+extreme)",
+            session.cycle,
+            bool(session.allow_new_entries),
+            float(decision.adx),
+            float(decision.blended_score),
+        )
+        session.last_action = "FLAT"
+        return
+    if not bool(session.allow_new_entries) and not bool(ignore_hours):
+        logger.info(
+            "CYCLE %s extreme_trend_time_override adx=%.1f blend=%.1f — allow entry",
+            session.cycle,
+            float(decision.adx),
+            float(decision.blended_score),
+        )
+
+    # Wisdom: structure (extreme ADX may waive ATR/spread noise).
+    if not bool(session.last_structure_ok):
+        logger.info(
+            "CYCLE %s entry_structure_blocked %s — stand aside",
+            session.cycle,
+            session.last_structure_reason,
         )
         session.last_action = "FLAT"
         return
@@ -2491,10 +2596,14 @@ async def run_cycle(
         )
 
     # Require N consecutive raw entry-band cycles before firing (Temperance).
-    # After a LOSS, add extra confirmation friction from last_trade_outcome.
+    # Extreme ADX: streak = 1 (Courage — do not miss a finished trend).
+    from engine.config import VIRTUE_EXTREME_ADX_OVERRIDE
+
     need_streak = max(1, int(VIRTUE_REQUIRED_STREAK))
     if int(session.consecutive_losses) >= 1:
         need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
+    if float(decision.adx) >= float(VIRTUE_EXTREME_ADX_OVERRIDE):
+        need_streak = 1
     side = decision.action.value
     if side == "LONG":
         if session.long_streak < need_streak:

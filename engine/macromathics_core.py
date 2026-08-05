@@ -111,12 +111,13 @@ def phase3_velocity_gates(
     state = session_state if isinstance(session_state, dict) else {}
     try:
         adx_val = float(
-            adx if adx is not None else state.get("ADX", state.get("adx", 14.0)) or 14.0
+            adx if adx is not None else state.get("ADX", state.get("adx", 0.0)) or 0.0
         )
     except (TypeError, ValueError):
-        adx_val = 14.0
+        adx_val = 0.0
+    # Unknown/zero ADX → treat as maximally weak (Justice: do not invent 14).
     if adx_val <= 0:
-        adx_val = 14.0
+        adx_val = 0.01
     long_gate = float(VIRTUE_PIPELINE_LONG_BLEND_BASE)
     short_gate = float(VIRTUE_PIPELINE_SHORT_BLEND_BASE)
     floor = float(VIRTUE_VELOCITY_ADX_FLOOR)

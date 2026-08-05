@@ -18,8 +18,9 @@ if (-not (Test-Path $Key)) {
 
 $ssh = @("-i", $Key, "-o", "StrictHostKeyChecking=no")
 
-# Ensure AWS .env.local has Databento primary + CME session mode. Key via scp temp file only.
-Write-Host "Syncing Databento / CME env flags on $Remote ..."
+# Paper/default: Alpaca SPY->MES + cash RTH. Keep Databento key on box as standby only.
+# Flip back later with FM_DATA_SOURCE=databento + VIRTUE_SESSION_MODE=cme if needed.
+Write-Host "Syncing Alpaca/RTH primary (+ Databento standby key) on $Remote ..."
 $localEnv = Join-Path $Root ".env.local"
 $dbKey = ""
 if (Test-Path $localEnv) {
@@ -29,23 +30,24 @@ if (Test-Path $localEnv) {
         }
     }
 }
-if (-not $dbKey) {
-    Write-Warning "DATABENTO_API_KEY missing in local .env.local - AWS may stay on Alpaca/RTH hours"
-} else {
-    $tmpEnv = Join-Path $env:TEMP ("fm_databento_env_{0}.txt" -f [guid]::NewGuid().ToString("n"))
-    try {
-        [System.IO.File]::WriteAllLines($tmpEnv, @(
-            "DATABENTO_API_KEY=$dbKey"
-            "FM_DATA_SOURCE=databento"
-            "VIRTUE_SESSION_MODE=cme"
-        ))
-        scp @ssh $tmpEnv "${Remote}:/tmp/fm_databento_env.txt"
-        scp @ssh "$Root\scripts\merge_remote_env_keys.py" "${Remote}:/tmp/merge_remote_env_keys.py"
-        $mergeCmd = 'python3 /tmp/merge_remote_env_keys.py --src /tmp/fm_databento_env.txt --envf /home/ubuntu/FutureMathics.ai/.env.local; rm -f /tmp/merge_remote_env_keys.py /tmp/fm_databento_env.txt'
-        ssh @ssh $Remote $mergeCmd
-    } finally {
-        Remove-Item -Force $tmpEnv -ErrorAction SilentlyContinue
+$tmpEnv = Join-Path $env:TEMP ("fm_market_data_env_{0}.txt" -f [guid]::NewGuid().ToString("n"))
+try {
+    $envLines = @(
+        "FM_DATA_SOURCE=alpaca",
+        "VIRTUE_SESSION_MODE=rth"
+    )
+    if ($dbKey) {
+        $envLines += "DATABENTO_API_KEY=$dbKey"
+    } else {
+        Write-Warning "DATABENTO_API_KEY missing locally - standby key not synced (Alpaca/RTH still applied)"
     }
+    [System.IO.File]::WriteAllLines($tmpEnv, $envLines)
+    scp @ssh $tmpEnv "${Remote}:/tmp/fm_market_data_env.txt"
+    scp @ssh "$Root\scripts\merge_remote_env_keys.py" "${Remote}:/tmp/merge_remote_env_keys.py"
+    $mergeCmd = "python3 /tmp/merge_remote_env_keys.py --src /tmp/fm_market_data_env.txt --envf /home/ubuntu/FutureMathics.ai/.env.local; rm -f /tmp/merge_remote_env_keys.py /tmp/fm_market_data_env.txt"
+    ssh @ssh $Remote $mergeCmd
+} finally {
+    Remove-Item -Force $tmpEnv -ErrorAction SilentlyContinue
 }
 
 Write-Host "Uploading virtue files to $Remote ..."
@@ -65,6 +67,7 @@ scp @ssh `
     "$Root\engine\config.py" `
     "$Root\engine\dual_sleeve.py" `
     "$Root\engine\sleeve_order_router.py" `
+    "$Root\engine\entry_structure.py" `
     "$Root\engine\macromathics_core.py" `
     "$Root\engine\observability.py" `
     "$Root\engine\futures_broker_adapter.py" `

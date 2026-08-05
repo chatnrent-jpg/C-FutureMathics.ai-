@@ -89,7 +89,7 @@ class WisdomStrategy:
     atr_period: int = 14
     adx_trend_min: float = 18.0  # flat long entries require ADX >= this (Wisdom)
     adx_short_min: float = 22.0  # shorts need stronger ADX (Temperance)
-    atr_pct_chaos_max: float = 2.5  # ATR as % of price; above → stand aside
+    atr_pct_chaos_max: float = 0.15  # ATR% of price; MES/proxy chaos stand-aside
     score_atr_mult: float = 2.0  # ATR component of score scale
     score_price_pct: float = 0.004  # ±0.4% of price spans 0–100 (trend extensions register)
     max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
@@ -102,6 +102,7 @@ class WisdomStrategy:
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     highs: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     lows: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    volumes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     vwap_tracker: LiveVwapTracker | None = None
     twap_tracker: LiveTwapTracker | None = None
 
@@ -115,22 +116,38 @@ class WisdomStrategy:
         high = float(bar.high)
         low = float(bar.low)
         close = float(bar.close)
+        vol = max(1.0, float(bar.volume or 1.0))
+        # Proxy quotes often have bid≈ask≈mid — preserve close-to-close range for ATR.
+        if self.closes:
+            prev = float(self.closes[-1])
+            high = max(high, close, prev)
+            low = min(low, close, prev)
+        if high < low:
+            high, low = low, high
         self.highs.append(high)
         self.lows.append(low)
         self.closes.append(close)
-        # Equal-weight close for both anchors (SPY proxy has no reliable tape size)
+        self.volumes.append(vol)
+        # VWAP uses trade/quote size; TWAP stays equal-weight time average.
         assert self.vwap_tracker is not None and self.twap_tracker is not None
-        self.vwap_tracker.update_trade(price=close, size=1.0)
+        self.vwap_tracker.update_trade(price=close, size=vol)
         self.twap_tracker.update(close)
 
-    def update_price(self, price: float, *, high: float | None = None, low: float | None = None) -> None:
+    def update_price(
+        self,
+        price: float,
+        *,
+        high: float | None = None,
+        low: float | None = None,
+        volume: float | None = None,
+    ) -> None:
         p = float(price)
         self.update(
             Bar(
                 high=high if high is not None else p,
                 low=low if low is not None else p,
                 close=p,
-                volume=1.0,
+                volume=max(1.0, float(volume or 1.0)),
             )
         )
 
@@ -154,6 +171,7 @@ class WisdomStrategy:
         closes = list(self.closes)
         highs = list(self.highs)
         lows = list(self.lows)
+        vols = list(self.volumes)
         if closes:
             shift = px - float(closes[-1])
             if abs(shift) > 1e-12:
@@ -161,24 +179,25 @@ class WisdomStrategy:
                 self.highs = deque((float(h) + shift for h in highs), maxlen=self.highs.maxlen)
                 self.lows = deque((float(lo) + shift for lo in lows), maxlen=self.lows.maxlen)
             window = list(self.closes)[-self.anchor_window :]
+            vols = list(self.volumes)[-self.anchor_window :]
         else:
             window = [px]
+            vols = [1.0]
+        while len(vols) < len(window):
+            vols.insert(0, 1.0)
         self.vwap_tracker.reset()
         self.twap_tracker.reset()
-        for c in window:
+        for c, v in zip(window, vols[-len(window) :]):
             p = float(c)
-            self.vwap_tracker.update_trade(price=p, size=1.0)
+            self.vwap_tracker.update_trade(price=p, size=max(1.0, float(v)))
             self.twap_tracker.update(p)
         vwap = float(self.vwap_tracker.vwap or 0.0)
         if vwap > 0 and abs(px - vwap) / px >= 0.01:
-            # Ghost mean survived the close-align — pin anchors and collapse OHLC
-            # so ATR/ADX are not haunted by a cliff in the seed window.
-            n_ohlc = len(self.closes) if self.closes else max(int(self.min_anchor_samples), 20)
-            self.closes = deque([px] * n_ohlc, maxlen=self.closes.maxlen)
-            self.highs = deque([px] * n_ohlc, maxlen=self.highs.maxlen)
-            self.lows = deque([px] * n_ohlc, maxlen=self.lows.maxlen)
+            # Ghost mean survived close-align — pin VWAP/TWAP at live only.
+            # Keep shifted OHLC path so ATR/ADX memory is not zeroed (Wisdom).
             self.vwap_tracker.reset()
             self.twap_tracker.reset()
+            n_ohlc = len(self.closes) if self.closes else max(int(self.min_anchor_samples), 20)
             n = max(int(self.min_anchor_samples), min(int(self.anchor_window), n_ohlc))
             for _ in range(n):
                 self.vwap_tracker.update_trade(price=px, size=1.0)

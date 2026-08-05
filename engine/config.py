@@ -100,6 +100,9 @@ VIRTUE_CORE_STRUCTURAL_ADX_MIN = 22.0
 # LONG closes at/below this; SHORT closes at/above (100 - depth).
 VIRTUE_CORE_INVALIDATION_BLEND_LONG = 40.0
 VIRTUE_CORE_INVALIDATION_BLEND_SHORT = 60.0  # == 100 - LONG depth (legacy alias)
+# Core adverse failsafe (Temperance) — sticky does not mean suicidal.
+VIRTUE_CORE_MAX_ADVERSE_DOLLARS = 150.0
+VIRTUE_CORE_MAX_HOLD_CYCLES = 90  # ~7.5 min at 5s poll
 
 # Live — aligned to $15k / 2 MES profile
 LIVE_RISK_NAV_CAP = 15_000.0
@@ -139,7 +142,7 @@ SWING_CONTRACTS = 2  # $15k / 2 MES scale-out profile
 # Rising (from down): cash 0–65 → LONG ≥65 → EXIT ≥85 → SHORT ≥90
 # Falling (from up): EXIT SHORT ≤50 → cash below 50
 # ---------------------------------------------------------------------------
-GRADE_MODE = True
+GRADE_MODE = False  # VolumeWatch grade path quarantined — virtue brain is primary
 GRADE_LONG_ENTRY = 50.0  # recovery gate (was 55; enter as soon as washout recovers above 50)
 GRADE_LONG_EXIT = 85.0
 GRADE_SHORT_ENTRY = 90.0
@@ -188,9 +191,21 @@ VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
 VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET (RTH mode)
 VIRTUE_RTH_CLOSE_MINUTE = 0
-# RTH mode: allow trend continuation into the afternoon; cut new entries 15m before 4:00 flatten.
+# Legacy single cutoff (superseded by dual RTH entry windows).
 VIRTUE_NO_NEW_ENTRY_HOUR = 15
-VIRTUE_NO_NEW_ENTRY_MINUTE = 45
+VIRTUE_NO_NEW_ENTRY_MINUTE = 55
+# RTH new-entry windows (America/New_York) — start inclusive / end exclusive.
+# Widened after paper evidence: rigid 15:30 cut blocked a clean late short.
+VIRTUE_ENTRY_WINDOW_1_START = (9, 45)
+VIRTUE_ENTRY_WINDOW_1_END = (11, 30)
+VIRTUE_ENTRY_WINDOW_2_START = (13, 45)
+VIRTUE_ENTRY_WINDOW_2_END = (15, 55)
+# Extreme trend may enter outside windows while session still open (Courage).
+VIRTUE_EXTREME_ADX_OVERRIDE = 40.0
+VIRTUE_EXTREME_BLEND_LONG = 65.0
+VIRTUE_EXTREME_BLEND_SHORT = 35.0
+# Structure: at this ADX, waive ATR-expand + spread-widen if ADX still rising.
+VIRTUE_STRUCTURE_EXTREME_ADX = 40.0
 # CME Globex: no new entries in last 15 minutes before 5:00 PM ET daily maintenance.
 VIRTUE_CME_NO_NEW_ENTRY_HOUR = 16
 VIRTUE_CME_NO_NEW_ENTRY_MINUTE = 45
@@ -199,16 +214,18 @@ VIRTUE_RTH_FLATTEN_MAX_ATTEMPTS = 10
 VIRTUE_RTH_FLATTEN_RETRY_S = 3.0
 # Databento quote staleness ceiling (seconds)
 DATABENTO_MAX_QUOTE_AGE_S = 5.0
+# Canonical ADX ladder (one floor for flat tactical / structure / velocity).
+VIRTUE_ENTRY_ADX_MIN = 20.0
+VIRTUE_ADX_ENTER_MIN = 20.0      # flat long entries need trend strength (Wisdom)
+VIRTUE_ADX_SHORT_ENTER_MIN = 20.0  # aligned floor; shorts still use blend asymmetry
+VIRTUE_TACTICAL_ADX_MIN = 20.0
+VIRTUE_VELOCITY_ADX_FLOOR = 20.0
 # Enter on clear edge; exit with hysteresis so mid-band chop cannot scalp every dip.
 VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
 VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
 VIRTUE_SCORE_LONG_EXIT = 45.0    # while LONG: flatten when both <= 45 (not mid-50)
 VIRTUE_SCORE_SHORT_EXIT = 55.0   # while SHORT: flatten when both >= 55 (not mid-50)
-VIRTUE_REQUIRED_STREAK = 3       # 3 clear cycles — fewer wrong-side entries
-VIRTUE_ADX_ENTER_MIN = 18.0      # flat long entries need trend strength (Wisdom)
-VIRTUE_ADX_SHORT_ENTER_MIN = 22.0  # shorts need stronger trend (fewer counter-trend traps)
-# Satellite (tactical) needs structural ADX — no chop scalps beside a core runner.
-VIRTUE_TACTICAL_ADX_MIN = 22.0
+VIRTUE_REQUIRED_STREAK = 2       # 2 clear cycles — faster Courage on clean tape
 # Hard daily round-trip cap for tactical sleeve (Temperance).
 VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 12
 # Bull-day asymmetric short filter — counter-trend shorts need extreme confirmation.
@@ -266,7 +283,7 @@ VIRTUE_PIPELINE_LONG_BLEND_BASE = 55.0
 VIRTUE_PIPELINE_SHORT_BLEND_BASE = 45.0
 VIRTUE_PIPELINE_BULL_SHORT_PENALTY = 5.0
 # Velocity gate: widen blend bands when ADX is weak (blocks slow-drift traps).
-VIRTUE_VELOCITY_ADX_FLOOR = 22.0  # ADX below this → widen entry gates
+# VIRTUE_VELOCITY_ADX_FLOOR set above with canonical ADX ladder (= 20.0)
 VIRTUE_VELOCITY_PENALTY_PER_ADX = 0.5  # points added/subtracted per ADX unit below floor
 # Time-decay exit: flatten stagnant holds that never progress toward TP.
 MAX_STAGNATION_CYCLES = 15  # cut stale trades after N engine loops

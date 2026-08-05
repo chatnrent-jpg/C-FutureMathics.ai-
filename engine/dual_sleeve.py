@@ -17,10 +17,16 @@ from typing import Any
 
 from engine.config import (
     MAX_ACCOUNT_CONTRACT_CEILING,
+    TICK_SIZE,
+    TICK_VALUE,
     VIRTUE_CORE_CONFIRM_CYCLES,
     VIRTUE_CORE_INVALIDATION_BLEND_LONG,
+    VIRTUE_CORE_MAX_ADVERSE_DOLLARS,
+    VIRTUE_CORE_MAX_HOLD_CYCLES,
     VIRTUE_CORE_STRUCTURAL_ADX_MIN,
     VIRTUE_CORE_SIZE,
+    VIRTUE_SCORE_LONG_ENTER,
+    VIRTUE_SCORE_SHORT_ENTER,
 )
 
 
@@ -40,9 +46,12 @@ def classify_structural_regime(
     confirm_cycles: int,
     bull_streak: int,
     bear_streak: int,
+    blend: float | None = None,
 ) -> tuple[str, int, int]:
     """
     Update structural confirm streaks and return (regime, new_bull_streak, new_bear_streak).
+
+    Prefer live blend+ADX (tape) over sticky macro_bias when blend is provided.
     """
     bias = (macro_bias or "NEUTRAL").strip().upper()
     try:
@@ -52,10 +61,21 @@ def classify_structural_regime(
     need = max(1, int(confirm_cycles))
     adx_ok = adx_val >= float(VIRTUE_CORE_STRUCTURAL_ADX_MIN)
 
-    if bias == "BULL" and adx_ok:
+    tape_side = ""
+    if blend is not None:
+        try:
+            b = float(blend)
+            if adx_ok and b >= float(VIRTUE_SCORE_LONG_ENTER):
+                tape_side = "BULL"
+            elif adx_ok and b <= float(VIRTUE_SCORE_SHORT_ENTER):
+                tape_side = "BEAR"
+        except (TypeError, ValueError):
+            tape_side = ""
+
+    if tape_side == "BULL" or (not tape_side and bias == "BULL" and adx_ok):
         bull = int(bull_streak) + 1
         bear = 0
-    elif bias == "BEAR" and adx_ok:
+    elif tape_side == "BEAR" or (not tape_side and bias == "BEAR" and adx_ok):
         bear = int(bear_streak) + 1
         bull = 0
     else:
@@ -188,13 +208,106 @@ def evaluate_core_macro_safety(
         or getattr(session, "macro_structural_regime", STRUCTURAL_NEUTRAL)
         or STRUCTURAL_NEUTRAL
     )
+    side = str(getattr(session, "core_side", "FLAT") or "FLAT")
+    # Adverse $ / max-hold failsafes (Temperance) — before slow invalidation.
+    fail = _core_adverse_or_stale_failsafe(session, current_cycle=current_cycle, side=side)
+    if fail[0]:
+        return fail
     return core_should_invalidate(
         core_active=True,
-        core_side=str(getattr(session, "core_side", "FLAT") or "FLAT"),
+        core_side=side,
         structural_regime=regime,
         blend=b,
         invalidation_depth=float(VIRTUE_CORE_INVALIDATION_BLEND_LONG),
     )
+
+
+def _core_adverse_or_stale_failsafe(
+    session: Any,
+    *,
+    current_cycle: int | None,
+    side: str,
+) -> tuple[bool, str]:
+    """Close core on hard adverse dollars or max hold cycles."""
+    try:
+        entry = float(getattr(session, "core_entry_price", 0.0) or 0.0)
+        px = float(getattr(session, "last_price", 0.0) or 0.0)
+        size = int(getattr(session, "core_size", 0) or 0)
+    except (TypeError, ValueError):
+        entry, px, size = 0.0, 0.0, 0
+    if entry > 0 and px > 0 and size > 0 and side in {"LONG", "SHORT"}:
+        points = (px - entry) if side == "LONG" else (entry - px)
+        # MES: $5 per point (= TICK_VALUE / TICK_SIZE when tick=0.25, $1.25)
+        dollars_per_point = float(TICK_VALUE) / max(float(TICK_SIZE), 1e-9)
+        pnl = points * dollars_per_point * size
+        if pnl <= -abs(float(VIRTUE_CORE_MAX_ADVERSE_DOLLARS)):
+            return (
+                True,
+                f"core_failsafe:adverse_dollars pnl={pnl:.2f}"
+                f"<=-{float(VIRTUE_CORE_MAX_ADVERSE_DOLLARS):.0f}",
+            )
+    marker = getattr(session, "core_entry_cycle", None)
+    if marker is not None and current_cycle is not None:
+        elapsed = int(current_cycle) - int(marker)
+        if elapsed >= int(VIRTUE_CORE_MAX_HOLD_CYCLES):
+            return (
+                True,
+                f"core_failsafe:max_hold elapsed={elapsed}>={int(VIRTUE_CORE_MAX_HOLD_CYCLES)}",
+            )
+    return False, ""
+
+
+def reconcile_sleeves_to_broker(session: Any, broker: Any) -> tuple[bool, str]:
+    """
+    Justice: logical sleeve sizes must match broker net exposure (same side).
+
+    On mismatch, repair books toward broker truth and block new risk until stable.
+    Returns (ok, detail).
+    """
+    try:
+        net_dir, net_size = broker.net_exposure()
+    except Exception as exc:
+        return False, f"sleeve_reconcile:broker_error:{exc}"
+    net_dir = str(net_dir or "FLAT").upper()
+    net_size = int(net_size or 0)
+    core_sz, tac_sz = sleeve_sizes_from_session(session)
+    book = core_sz + tac_sz
+    core_side = str(getattr(session, "core_side", "FLAT") or "FLAT").upper()
+    tac_side = str(getattr(session, "tactical_side", "FLAT") or "FLAT").upper()
+
+    if net_size <= 0:
+        if book != 0:
+            session.core_active = False
+            session.core_side = "FLAT"
+            session.core_size = 0
+            session.core_entry_price = 0.0
+            session.core_entry_cycle = None
+            session.tactical_active = False
+            session.tactical_side = "FLAT"
+            session.tactical_size = 0
+            session.tactical_entry_price = 0.0
+            return False, "sleeve_reconcile:repaired_flat_broker_nonzero_books"
+        return True, "sleeve_reconcile:ok_flat"
+
+    # Broker has exposure — books must sum to net and agree on side.
+    sides = {s for s in (core_side, tac_side) if s in {"LONG", "SHORT"}}
+    if book != net_size or (sides and net_dir not in sides) or (
+        core_sz > 0 and tac_sz > 0 and core_side != tac_side
+    ):
+        # Repair: assign all broker size to tactical; clear phantom core.
+        session.core_active = False
+        session.core_side = "FLAT"
+        session.core_size = 0
+        session.core_entry_price = 0.0
+        session.core_entry_cycle = None
+        session.tactical_active = True
+        session.tactical_side = net_dir if net_dir in {"LONG", "SHORT"} else "FLAT"
+        session.tactical_size = net_size
+        return False, (
+            f"sleeve_reconcile:repaired book={book} broker={net_dir}/{net_size} "
+            f"→ tac={net_dir}/{net_size}"
+        )
+    return True, f"sleeve_reconcile:ok book={book} broker={net_dir}/{net_size}"
 
 
 def tactical_entry_allowed(

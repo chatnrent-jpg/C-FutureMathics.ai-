@@ -506,7 +506,7 @@ def test_session_uses_timely_entry_band() -> None:
     assert s.strategy.short_enter == float(VIRTUE_SCORE_SHORT_ENTER) == 42.0
     assert s.strategy.long_exit == float(VIRTUE_SCORE_LONG_EXIT) == 45.0
     assert s.strategy.short_exit == float(VIRTUE_SCORE_SHORT_EXIT) == 55.0
-    assert s.strategy.adx_trend_min == float(VIRTUE_ADX_ENTER_MIN) == 18.0
+    assert s.strategy.adx_trend_min == float(VIRTUE_ADX_ENTER_MIN) == 20.0
     from engine.config import (
         VIRTUE_ADX_SHORT_ENTER_MIN,
         VIRTUE_COURSE_CORRECT_LONG_BLEND,
@@ -514,19 +514,21 @@ def test_session_uses_timely_entry_band() -> None:
         VIRTUE_MAX_TACTICAL_TRADES_PER_DAY,
         VIRTUE_POST_TP_STREAK_PULLBACK_AFTER,
         VIRTUE_TACTICAL_ADX_MIN,
+        GRADE_MODE,
     )
 
-    assert s.strategy.adx_short_min == float(VIRTUE_ADX_SHORT_ENTER_MIN) == 22.0
+    assert s.strategy.adx_short_min == float(VIRTUE_ADX_SHORT_ENTER_MIN) == 20.0
+    assert GRADE_MODE is False
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
-    assert float(VIRTUE_TACTICAL_ADX_MIN) == 22.0
+    assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
     assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
     assert int(VIRTUE_POST_TP_STREAK_PULLBACK_AFTER) == 2
-    assert int(VIRTUE_REQUIRED_STREAK) == 3
+    assert int(VIRTUE_REQUIRED_STREAK) == 2
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 85.0
     assert float(VIRTUE_SCORE_SHORT_CHASE_MIN) == 15.0
     assert int(VIRTUE_NO_NEW_ENTRY_HOUR) == 15
-    assert int(VIRTUE_NO_NEW_ENTRY_MINUTE) == 45
+    assert int(VIRTUE_NO_NEW_ENTRY_MINUTE) == 55  # afternoon window end
 
 
 def test_weighted_avg_entry() -> None:
@@ -650,7 +652,7 @@ def test_take_profit_independent_of_signal_side() -> None:
 def test_required_streak_is_three_for_structure() -> None:
     from engine.config import VIRTUE_REQUIRED_STREAK
 
-    assert int(VIRTUE_REQUIRED_STREAK) == 3
+    assert int(VIRTUE_REQUIRED_STREAK) == 2
 
 
 def test_check_course_correct_hard_blend_hook() -> None:
@@ -1081,9 +1083,10 @@ def test_macromathics_core_production_phases() -> None:
     assert phase2_time_decay_triggered(td, 16) is True
     assert phase2_time_decay_triggered(td, 10) is False
 
+    # Floor 20: ADX 14 → penalty 3 → 58 / 42
     long_g, short_g = phase3_velocity_gates({"ADX": 14.0})
-    assert abs(long_g - 59.0) < 1e-9
-    assert abs(short_g - 41.0) < 1e-9
+    assert abs(long_g - 58.0) < 1e-9
+    assert abs(short_g - 42.0) < 1e-9
 
     pipe = {"pipeline_resume_cycle": 20, "entry_pipeline": {}}
     assert phase3_layer1_clear(pipe, 15) is False
@@ -1093,19 +1096,25 @@ def test_macromathics_core_production_phases() -> None:
     assert cooldown_cycles_for_reason("course_correct") == 12
     assert cooldown_cycles_for_reason("take_profit", tp_streak=1) == 8 + 5
 
+    # Live wire: main must import the phase contract (no shadow module).
+    import main as virtue_main
+
+    assert hasattr(virtue_main, "phase1_profit_guard_triggered")
+    assert hasattr(virtue_main, "phase3_velocity_gates")
+
 
 def test_calculate_dynamic_blend_thresholds_velocity_gate() -> None:
-    """Low ADX widens blend gates; ADX>=22 keeps base 55/45."""
+    """Low ADX widens blend gates; ADX>=20 keeps base 55/45."""
     from main import calculate_dynamic_blend_thresholds, verify_pipeline_entry
 
     long_thr, short_thr = calculate_dynamic_blend_thresholds({"ADX": 25.0})
     assert long_thr == 55.0
     assert short_thr == 45.0
 
-    # ADX 14 → penalty (22-14)*0.5 = 4.0 → 59 / 41
+    # ADX 14 → penalty (20-14)*0.5 = 3.0 → 58 / 42
     long_thr, short_thr = calculate_dynamic_blend_thresholds({"ADX": 14.0})
-    assert abs(long_thr - 59.0) < 1e-9
-    assert abs(short_thr - 41.0) < 1e-9
+    assert abs(long_thr - 58.0) < 1e-9
+    assert abs(short_thr - 42.0) < 1e-9
 
     ok, reason = verify_pipeline_entry(
         "LONG",
@@ -1113,7 +1122,7 @@ def test_calculate_dynamic_blend_thresholds_velocity_gate() -> None:
          "last_trade_outcome": {}},
     )
     assert ok is False
-    assert "vel=4.0" in reason
+    assert "vel=3.0" in reason
 
     ok, _ = verify_pipeline_entry(
         "LONG",
@@ -1320,6 +1329,92 @@ def test_session_day_roll_clears_yesterdays_profit_lock() -> None:
     assert session.broker.equity == float(STARTING_NAV) + 300.0
 
 
+def test_entry_structure_atr_adx_spread_gates() -> None:
+    """ATR expanding + ADX>20 rising + VWAP/TWAP % spread widening required."""
+    from engine.entry_structure import (
+        commit_entry_structure_memory,
+        evaluate_entry_structure_gates,
+    )
+    from main import VirtueSession
+
+    s = VirtueSession()
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=1.0, adx=25.0, vwap=100.0, twap=99.0, price=100.0
+    )
+    assert ok is False
+    assert "warmup" in reason
+
+    commit_entry_structure_memory(
+        s, atr=1.0, adx=22.0, vwap=100.0, twap=99.5, price=100.0
+    )
+    # ATR not expanding
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=0.9, adx=25.0, vwap=100.0, twap=99.0, price=100.0
+    )
+    assert ok is False and "atr_not_expanding" in reason
+
+    # ADX not rising
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=1.2, adx=21.0, vwap=100.0, twap=99.0, price=100.0
+    )
+    assert ok is False and "adx_not_rising" in reason
+
+    # ADX weak
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=1.2, adx=19.0, vwap=100.0, twap=99.0, price=100.0
+    )
+    assert ok is False and "adx_weak" in reason
+
+    # Spread not widening (prior |100-99.5|/100 = 0.5%)
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=1.2, adx=25.0, vwap=100.0, twap=99.6, price=100.0
+    )
+    assert ok is False and "spread_not_widening" in reason
+
+    # All clear: ATR up, ADX up through 20, spread widens
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=1.2, adx=25.0, vwap=100.0, twap=99.0, price=100.0
+    )
+    assert ok is True, reason
+    assert "entry_structure:ok" in reason
+
+    # Extreme ADX rising waives ATR/spread noise
+    commit_entry_structure_memory(
+        s, atr=2.0, adx=50.0, vwap=100.0, twap=100.0, price=100.0
+    )
+    ok, reason = evaluate_entry_structure_gates(
+        s, atr=1.5, adx=55.0, vwap=100.0, twap=100.0, price=100.0
+    )
+    assert ok is True and "extreme" in reason, reason
+
+    # Twin anchors (VWAP=TWAP): price displacement still counts as structure width.
+    from engine.entry_structure import anchor_spread_pct
+
+    twin = anchor_spread_pct(vwap=100.0, twap=100.0, price=100.5)
+    assert twin > 0.0
+
+
+def test_sleeve_reconcile_repairs_desync() -> None:
+    """Broker net wins over phantom sleeve books (Justice)."""
+    from engine.dual_sleeve import reconcile_sleeves_to_broker
+    from main import VirtueSession
+
+    s = VirtueSession()
+    s.core_active = True
+    s.core_side = "LONG"
+    s.core_size = 1
+    s.core_entry_price = 100.0
+    s.tactical_active = True
+    s.tactical_side = "LONG"
+    s.tactical_size = 1
+    # Broker flat — books must clear
+    ok, detail = reconcile_sleeves_to_broker(s, s.broker)
+    assert ok is False
+    assert "repaired_flat" in detail
+    assert s.core_active is False
+    assert s.tactical_active is False
+
+
 def test_anti_churn_temperance_gates() -> None:
     """Streaks freeze under pipeline lock; day cap / hysteresis knobs are armed."""
     from engine.config import (
@@ -1336,7 +1431,7 @@ def test_anti_churn_temperance_gates() -> None:
     assert float(VIRTUE_SCORE_SHORT_EXIT) == 55.0
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
-    assert float(VIRTUE_TACTICAL_ADX_MIN) == 22.0
+    assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
     assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
 
     # Mid-band must not flatten
@@ -1689,5 +1784,7 @@ if __name__ == "__main__":
     test_dual_sleeve_unified_rules()
     test_multi_sleeve_order_router()
     test_anti_churn_temperance_gates()
+    test_entry_structure_atr_adx_spread_gates()
+    test_sleeve_reconcile_repairs_desync()
     print("ALL VIRTUE BRAIN TESTS PASSED")
 
