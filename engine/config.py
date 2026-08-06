@@ -85,15 +85,19 @@ MAX_CONCURRENT_RISK_PCT = 0.05
 PER_TRADE_RISK_MIN = 60.0
 PER_TRADE_RISK_MAX = 160.0  # headroom for 2×$75 stop
 
-# Paper forward-test — 2 MES (enter 2, TP scale-out leave 1 runner)
+# Paper forward-test — simplify to 1 MES tactical-only (pre-dual-sleeve path).
 FORWARD_TEST_MAX_CONCURRENT_RISK_PCT = 0.05
 FORWARD_TEST_FIXED_FRACTIONAL_RISK_PCT = 0.01
 FORWARD_TEST_MAX_DAILY_LOSS_PCT = 0.02
-PAPER_MAX_MES_CONTRACTS = 2
+PAPER_MAX_MES_CONTRACTS = 1
 PAPER_MAX_OPEN_MES_POSITIONS = 1
 # Dual-sleeve Unified Rules — account-wide ceiling (core + tactical).
-MAX_ACCOUNT_CONTRACT_CEILING = 2
-VIRTUE_CORE_SIZE = 1  # structural anchor sleeve
+# 1 = single-book simplify mode (tactical-only when core disabled).
+MAX_ACCOUNT_CONTRACT_CEILING = 1
+# Core anchor sleeve master switch. False = tactical-only (recommended until edge proves).
+# Override at runtime: FM_VIRTUE_CORE_ENABLED=1|0
+VIRTUE_CORE_ENABLED = False
+VIRTUE_CORE_SIZE = 1  # structural anchor sleeve (ignored when core disabled)
 VIRTUE_CORE_CONFIRM_CYCLES = 5  # HTF bias+ADX confirm before opening core
 VIRTUE_CORE_STRUCTURAL_ADX_MIN = 22.0
 # Slow Invalidation depth from the long edge (sticky through NEUTRAL).
@@ -117,7 +121,7 @@ LIVE_RISK_NAV_CAP = 15_000.0
 LIVE_MAX_DAILY_LOSS = 300.0
 LIVE_MAX_CONCURRENT_RISK_PCT = 0.05
 LIVE_FIXED_FRACTIONAL_RISK_PCT = 0.01
-LIVE_MAX_MES_CONTRACTS = 2  # hard Temperance cap for cash MES
+LIVE_MAX_MES_CONTRACTS = 1  # hard Temperance cap — raise only after 1 MES proves clean
 
 DRAWDOWN_BRAKE_PCT = 0.10
 CAPITAL_DRAG_MULTIPLIER = 0.5
@@ -509,6 +513,31 @@ def max_mes_contracts() -> int:
     if risk_mode_paper():
         return paper_max_mes_contracts()
     return live_max_mes_contracts()
+
+
+def virtue_core_enabled() -> bool:
+    """
+    Core anchor sleeve master switch (Temperance simplify mode).
+
+    Default False — tactical-only 1 MES. Override: FM_VIRTUE_CORE_ENABLED=1|0.
+    """
+    raw = os.getenv("FM_VIRTUE_CORE_ENABLED", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(VIRTUE_CORE_ENABLED)
+
+
+def account_contract_ceiling_limit() -> int:
+    """Account-wide core+tactical ceiling. Override: FM_MAX_ACCOUNT_CONTRACT_CEILING."""
+    raw = os.getenv("FM_MAX_ACCOUNT_CONTRACT_CEILING", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(1, int(MAX_ACCOUNT_CONTRACT_CEILING))
 
 
 def live_cash_arming_status() -> tuple[bool, str]:

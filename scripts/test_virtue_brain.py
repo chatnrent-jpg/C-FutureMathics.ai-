@@ -427,13 +427,17 @@ def test_size_respects_fixed_fractional() -> None:
     stop_ticks = 60
     sized = calculate_max_contracts(equity=equity, stop_ticks=stop_ticks, hard_cap=1000)
     assert not sized.rejected
-    # $15k × 1% = $150 → 2 MES @ $75
+    # $15k × 1% = $150 → risk math allows 2 MES @ $75 (hard_cap=1000 in this unit test)
     assert sized.contracts == 2
     assert sized.risk_pct <= FIXED_FRACTIONAL_RISK_PCT + 1e-12
-    assert int(PAPER_MAX_MES_CONTRACTS) >= 2
+    # Production paper default is 1 MES simplify mode.
+    assert int(PAPER_MAX_MES_CONTRACTS) == 1
     one = calculate_max_contracts(equity=10_000.0, stop_ticks=stop_ticks, hard_cap=1000)
     assert not one.rejected
     assert one.contracts == 1
+    capped = calculate_max_contracts(equity=equity, stop_ticks=stop_ticks, hard_cap=1)
+    assert not capped.rejected
+    assert capped.contracts == 1
     # Over-size must reject
     too_many = sized.contracts + 50
     gate = reject_if_over_risk(equity=equity, contracts=too_many, stop_ticks=stop_ticks)
@@ -509,7 +513,8 @@ def test_forward_test_paper_nav_allows_sizing() -> None:
 
     sized = calculate_max_contracts(equity=STARTING_NAV, stop_ticks=60)
     assert not sized.rejected
-    assert sized.contracts == 2
+    # Paper hard cap is 1 MES in simplify mode.
+    assert sized.contracts == 1
 
 
 def test_stop_hit_and_flat_exit_helpers() -> None:
@@ -1825,7 +1830,9 @@ def test_dual_sleeve_unified_rules() -> None:
     s.last_result = "WIN"
     s.last_reason = "take_profit"
     payload = build_dual_sleeve_state(s, account_nav=16065.80)
-    assert payload["max_account_contract_ceiling"] == 2
+    assert payload["max_account_contract_ceiling"] == 1
+    assert payload["core_enabled"] is False
+    assert payload["simplify_mode"] is True
     assert payload["regime_engine"]["macro_structural_regime"] == STRUCTURAL_BULL
     assert payload["core_anchor_sleeve"]["active"] is True
     assert payload["core_anchor_sleeve"]["structural_invalidation_blend"] == 40.0
@@ -1896,6 +1903,51 @@ def test_pipeline_stuck_alert_debounce() -> None:
     assert s.pipeline_stuck_alerted is True
     # Force rebase should shrink residual
     assert int(s.pipeline_resume_cycle) < 100
+
+
+def test_simplify_tactical_only_1mes() -> None:
+    """Core disabled + ceiling 1 — no core opens; size hard-capped at 1."""
+    import os
+    from engine.config import (
+        PAPER_MAX_MES_CONTRACTS,
+        account_contract_ceiling_limit,
+        paper_max_mes_contracts,
+        virtue_core_enabled,
+    )
+    from engine.dual_sleeve import (
+        STRUCTURAL_BEAR,
+        core_should_open,
+        core_size_default,
+        build_dual_sleeve_state,
+    )
+    from main import VirtueSession
+
+    assert virtue_core_enabled() is False
+    assert int(PAPER_MAX_MES_CONTRACTS) == 1
+    assert int(paper_max_mes_contracts()) == 1
+    assert int(account_contract_ceiling_limit()) == 1
+    assert core_size_default() == 0
+    ok, side = core_should_open(STRUCTURAL_BEAR, core_active=False)
+    assert ok is False
+    assert side == "FLAT"
+
+    # Env override can re-enable for experiments.
+    os.environ["FM_VIRTUE_CORE_ENABLED"] = "1"
+    os.environ["FM_MAX_ACCOUNT_CONTRACT_CEILING"] = "2"
+    try:
+        assert virtue_core_enabled() is True
+        assert int(account_contract_ceiling_limit()) == 2
+        ok, side = core_should_open(STRUCTURAL_BEAR, core_active=False)
+        assert ok is True and side == "SHORT"
+    finally:
+        os.environ.pop("FM_VIRTUE_CORE_ENABLED", None)
+        os.environ.pop("FM_MAX_ACCOUNT_CONTRACT_CEILING", None)
+
+    s = VirtueSession()
+    payload = build_dual_sleeve_state(s, account_nav=16000.0)
+    assert payload["core_enabled"] is False
+    assert payload["simplify_mode"] is True
+    assert payload["max_account_contract_ceiling"] == 1
 
 
 def test_sleeve_pnl_uses_sleeve_entry_not_broker_avg() -> None:
@@ -1991,6 +2043,7 @@ if __name__ == "__main__":
     test_sleeve_reconcile_repairs_desync()
     test_core_invalidation_cooldown_and_tp()
     test_pipeline_stuck_alert_debounce()
+    test_simplify_tactical_only_1mes()
     test_sleeve_pnl_uses_sleeve_entry_not_broker_avg()
     print("ALL VIRTUE BRAIN TESTS PASSED")
 
