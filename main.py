@@ -1429,6 +1429,8 @@ async def _manage_core_sleeve(
     ignore_hours: bool = False,
 ) -> None:
     """Update structural regime; Slow Invalidation Core Escaper + core open."""
+    from engine.config import virtue_core_enabled
+
     regime, bull_s, bear_s = classify_structural_regime(
         macro_bias=str(session.macro_bias or "NEUTRAL"),
         adx=float(adx),
@@ -1441,6 +1443,22 @@ async def _manage_core_sleeve(
     session.structural_bear_streak = bear_s
     session.macro_structural_regime = regime
     session.core_realized_pnl_this_cycle = 0.0
+
+    # Simplify mode: core disabled — flatten any residual core book, never open.
+    if not virtue_core_enabled():
+        if bool(session.core_active) and int(session.core_size) > 0:
+            logger.warning(
+                "CYCLE %s CORE_DISABLED_FLATTEN size=%s — tactical-only simplify mode",
+                session.cycle,
+                session.core_size,
+            )
+            await _close_core_sleeve(
+                session,
+                price=price,
+                stop_ticks=stop_ticks,
+                reason="core_disabled_simplify",
+            )
+        return
 
     # Temperance: circuit breaker — manage/exit only, no new core.
     if bool(session.circuit_breaker_tripped) or bool(session.virtue_pnl_lock_active):
@@ -1536,15 +1554,18 @@ async def _manage_core_sleeve(
     # Room under ceiling for core size.
     tac = int(session.tactical_size) if bool(session.tactical_active) else 0
     need = core_size_default()
-    from engine.config import MAX_ACCOUNT_CONTRACT_CEILING
+    if need < 1:
+        return
+    from engine.dual_sleeve import account_contract_ceiling
 
-    if tac + need > int(MAX_ACCOUNT_CONTRACT_CEILING):
+    ceiling = int(account_contract_ceiling())
+    if tac + need > ceiling:
         logger.info(
             "CYCLE %s CORE_OPEN_BLOCKED ceiling tac=%s need=%s cap=%s",
             session.cycle,
             tac,
             need,
-            int(MAX_ACCOUNT_CONTRACT_CEILING),
+            ceiling,
         )
         return
     # If tactical is opposite, do not open core (alignment / net rule).
@@ -3199,10 +3220,11 @@ async def run_cycle(
         return
 
     contracts = min(int(sized.contracts), int(base_contracts))
-    from engine.config import MAX_ACCOUNT_CONTRACT_CEILING
+    from engine.dual_sleeve import account_contract_ceiling
 
     core_occ = int(session.core_size) if bool(session.core_active) else 0
-    room = max(0, int(MAX_ACCOUNT_CONTRACT_CEILING) - core_occ)
+    ceiling = int(account_contract_ceiling())
+    room = max(0, ceiling - core_occ)
     contracts = min(contracts, room)
     if contracts < 1:
         logger.warning(
@@ -3213,7 +3235,7 @@ async def run_cycle(
             base_contracts,
             room,
             core_occ,
-            int(MAX_ACCOUNT_CONTRACT_CEILING),
+            ceiling,
         )
         session.last_action = "FLAT"
         return
@@ -3411,6 +3433,26 @@ async def run_loop(
             logger.exception("BOOT CORE_MAX_HOLD force-zero failed")
     else:
         logger.info("BOOT CORE_MAX_HOLD_DISABLED cycles=0 (structure/adverse/$ TP only)")
+
+    from engine.config import (
+        account_contract_ceiling_limit,
+        paper_max_mes_contracts,
+        virtue_core_enabled,
+    )
+
+    if not virtue_core_enabled():
+        logger.info(
+            "BOOT CORE_SLEEVE_DISABLED tactical_only=1 ceiling=%s paper_max=%s "
+            "(FM_VIRTUE_CORE_ENABLED=0) — simplify mode",
+            int(account_contract_ceiling_limit()),
+            int(paper_max_mes_contracts()),
+        )
+    else:
+        logger.warning(
+            "BOOT CORE_SLEEVE_ENABLED ceiling=%s paper_max=%s — dual-sleeve active",
+            int(account_contract_ceiling_limit()),
+            int(paper_max_mes_contracts()),
+        )
 
     # Absolute pipeline_resume from a prior process is meaningless after cycle→0.
     # Rebase to a short Temperance cool-off so deploy cannot lock the day forever.

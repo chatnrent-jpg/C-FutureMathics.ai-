@@ -4,8 +4,11 @@ Dual-sleeve Unified Rules of Engagement.
 CORE (anchor)  — slow structural bias, 1 MES, closed on structural invalidation.
 TACTICAL       — existing virtue satellite; temperance / outcome state owned here only.
 
-Rules:
-1. Net exposure ceiling = 2 MES account-wide.
+Default simplify mode (Aug 6+): core DISABLED, ceiling = 1 MES tactical-only.
+Flip FM_VIRTUE_CORE_ENABLED=1 + ceiling 2 only after edge proves clean.
+
+Rules (when core enabled):
+1. Net exposure ceiling = MAX_ACCOUNT_CONTRACT_CEILING account-wide.
 2. Tactical may add only when aligned with core (or core is flat).
 3. Core closes on high-timeframe regime flip / invalidation blend — not blind expiry.
 4. Core PnL never feeds tactical temperance (consecutive_losses / blend buffers).
@@ -20,7 +23,6 @@ from zoneinfo import ZoneInfo
 
 from engine.config import (
     FORWARD_TEST_TIMEZONE,
-    MAX_ACCOUNT_CONTRACT_CEILING,
     POINT_VALUE,
     TICK_SIZE,
     TICK_VALUE,
@@ -35,6 +37,8 @@ from engine.config import (
     VIRTUE_CORE_TP_DOLLARS,
     VIRTUE_SCORE_LONG_ENTER,
     VIRTUE_SCORE_SHORT_ENTER,
+    account_contract_ceiling_limit,
+    virtue_core_enabled,
 )
 
 
@@ -44,7 +48,7 @@ STRUCTURAL_NEUTRAL = "STRUCTURAL_NEUTRAL"
 
 
 def account_contract_ceiling() -> int:
-    return max(1, int(MAX_ACCOUNT_CONTRACT_CEILING))
+    return account_contract_ceiling_limit()
 
 
 def classify_structural_regime(
@@ -98,6 +102,8 @@ def classify_structural_regime(
 
 
 def core_should_open(structural_regime: str, *, core_active: bool) -> tuple[bool, str]:
+    if not virtue_core_enabled():
+        return False, "FLAT"
     if core_active:
         return False, ""
     if structural_regime == STRUCTURAL_BULL:
@@ -375,6 +381,8 @@ def build_dual_sleeve_state(session: Any, *, account_nav: float) -> dict[str, An
     return {
         "account_nav": round(float(account_nav or 0.0), 2),
         "max_account_contract_ceiling": account_contract_ceiling(),
+        "core_enabled": bool(virtue_core_enabled()),
+        "simplify_mode": (not virtue_core_enabled()) and account_contract_ceiling() <= 1,
         "regime_engine": {
             "macro_structural_regime": str(
                 getattr(session, "macro_structural_regime", STRUCTURAL_NEUTRAL)
@@ -441,6 +449,8 @@ def build_dual_sleeve_state(session: Any, *, account_nav: float) -> dict[str, An
 
 
 def core_size_default() -> int:
+    if not virtue_core_enabled():
+        return 0
     return max(1, int(VIRTUE_CORE_SIZE))
 
 

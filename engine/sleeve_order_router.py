@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from engine.config import MAX_ACCOUNT_CONTRACT_CEILING
 from engine.dual_sleeve import account_contract_ceiling, tactical_entry_allowed
 
 log = logging.getLogger("virtue.sleeve_router")
@@ -61,7 +60,7 @@ def _books(session: Any) -> dict[str, Any]:
         if tac_active
         else 0,
         "tactical_active": tac_active,
-        "ceiling": int(MAX_ACCOUNT_CONTRACT_CEILING),
+        "ceiling": int(account_contract_ceiling()),
     }
 
 

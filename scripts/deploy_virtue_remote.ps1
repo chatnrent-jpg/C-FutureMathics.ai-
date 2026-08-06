@@ -34,7 +34,11 @@ $tmpEnv = Join-Path $env:TEMP ("fm_market_data_env_{0}.txt" -f [guid]::NewGuid()
 try {
     $envLines = @(
         "FM_DATA_SOURCE=alpaca",
-        "VIRTUE_SESSION_MODE=rth"
+        "VIRTUE_SESSION_MODE=rth",
+        # Temperance simplify: tactical-only 1 MES (override any stale 2-MES remote env)
+        "FM_VIRTUE_CORE_ENABLED=0",
+        "FM_MAX_ACCOUNT_CONTRACT_CEILING=1",
+        "FM_PAPER_MAX_MES_CONTRACTS=1"
     )
     if ($dbKey) {
         $envLines += "DATABENTO_API_KEY=$dbKey"
