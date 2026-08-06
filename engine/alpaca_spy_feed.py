@@ -113,25 +113,46 @@ class AlpacaSPYFeed:
                     if not quote:
                         return None
                     
-                    # Extract bid/ask/last
-                    bid_price = float(quote.get("bp", 0))
-                    ask_price = float(quote.get("ap", 0))
-                    
+                    # Extract bid/ask/last + quote sizes for VWAP weight
+                    bid_price = float(quote.get("bp", 0) or 0)
+                    ask_price = float(quote.get("ap", 0) or 0)
+                    bid_size = float(quote.get("bs", 0) or 0)
+                    ask_size = float(quote.get("as", 0) or 0)
+
                     # Use mid-price as "last" if no trade price available
                     last_price = (bid_price + ask_price) / 2 if bid_price and ask_price else 0
-                    
+
                     if last_price <= 0:
                         return None
-                    
+
+                    # Prefer latest trade size when quote sizes are empty.
+                    trade_size = 0.0
+                    try:
+                        turl = f"{self.data_url}/v2/stocks/SPY/trades/latest"
+                        async with session.get(
+                            turl, headers=headers, timeout=aiohttp.ClientTimeout(total=2)
+                        ) as tresp:
+                            if tresp.status == 200:
+                                tdata = await tresp.json()
+                                trade = tdata.get("trade") or {}
+                                trade_size = float(trade.get("s", 0) or 0)
+                                tp = float(trade.get("p", 0) or 0)
+                                if tp > 0:
+                                    last_price = tp
+                    except Exception:
+                        trade_size = 0.0
+
+                    spy_size = max(trade_size, bid_size + ask_size, 1.0)
+
                     self._last_spy_price = last_price
                     self._last_mes_proxy = round(last_price * SPY_TO_MES_SCALE, 2)
                     self._sequence += 1
-                    
+
                     return {
                         "spy_bid": bid_price,
                         "spy_ask": ask_price,
                         "spy_last": last_price,
-                        "spy_size": quote.get("as", 0),  # ask size
+                        "spy_size": spy_size,
                         "timestamp": quote.get("t", datetime.now().isoformat()),
                     }
         except Exception as e:
@@ -205,24 +226,39 @@ class AlpacaSPYFeed:
         timeframe: str = "5Min",
         limit: int = 120,
         lookback_days: int = 10,
+        session_rth: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Fetch recent SPY OHLCV bars from Alpaca (for Wisdom warmup).
         Alpaca requires start/end — bare limit-only requests return bars=null.
         Returns list of dicts: open, high, low, close, timestamp.
+
+        session_rth=True → bars from today's 09:30 America/New_York (true day VWAP seed).
         """
         if not self.is_configured():
             return []
         try:
             import aiohttp
             from datetime import datetime, timedelta, timezone
+            from zoneinfo import ZoneInfo
 
             headers = {
                 "APCA-API-KEY-ID": self.api_key,
                 "APCA-API-SECRET-KEY": self.api_secret,
             }
             end = datetime.now(timezone.utc)
-            start = end - timedelta(days=max(1, int(lookback_days)))
+            if session_rth:
+                et = ZoneInfo("America/New_York")
+                now_et = end.astimezone(et)
+                start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                if now_et < start:
+                    # Pre-open: use prior RTH day open so seed is not empty.
+                    start = (start - timedelta(days=1)).replace(
+                        hour=9, minute=30, second=0, microsecond=0
+                    )
+                start = start.astimezone(timezone.utc)
+            else:
+                start = end - timedelta(days=max(1, int(lookback_days)))
             params = {
                 "timeframe": timeframe,
                 "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -257,6 +293,7 @@ class AlpacaSPYFeed:
                                     "high": float(row["h"]),
                                     "low": float(row["l"]),
                                     "close": float(row["c"]),
+                                    "volume": float(row.get("v") or 1.0),
                                     "timestamp": row.get("t"),
                                 }
                             )
@@ -284,6 +321,7 @@ class AlpacaSPYFeed:
                         "high": self.scale_spy_to_mes(float(row["high"])),
                         "low": self.scale_spy_to_mes(float(row["low"])),
                         "close": self.scale_spy_to_mes(float(row["close"])),
+                        "volume": max(1.0, float(row.get("volume") or 1.0)),
                     }
                 )
             except (KeyError, TypeError, ValueError):

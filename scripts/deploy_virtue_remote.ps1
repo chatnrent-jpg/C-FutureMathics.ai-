@@ -18,6 +18,38 @@ if (-not (Test-Path $Key)) {
 
 $ssh = @("-i", $Key, "-o", "StrictHostKeyChecking=no")
 
+# Paper/default: Alpaca SPY->MES + cash RTH. Keep Databento key on box as standby only.
+# Flip back later with FM_DATA_SOURCE=databento + VIRTUE_SESSION_MODE=cme if needed.
+Write-Host "Syncing Alpaca/RTH primary (+ Databento standby key) on $Remote ..."
+$localEnv = Join-Path $Root ".env.local"
+$dbKey = ""
+if (Test-Path $localEnv) {
+    foreach ($line in Get-Content $localEnv) {
+        if ($line -match '^\s*DATABENTO_API_KEY=(.+)\s*$') {
+            $dbKey = $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+}
+$tmpEnv = Join-Path $env:TEMP ("fm_market_data_env_{0}.txt" -f [guid]::NewGuid().ToString("n"))
+try {
+    $envLines = @(
+        "FM_DATA_SOURCE=alpaca",
+        "VIRTUE_SESSION_MODE=rth"
+    )
+    if ($dbKey) {
+        $envLines += "DATABENTO_API_KEY=$dbKey"
+    } else {
+        Write-Warning "DATABENTO_API_KEY missing locally - standby key not synced (Alpaca/RTH still applied)"
+    }
+    [System.IO.File]::WriteAllLines($tmpEnv, $envLines)
+    scp @ssh $tmpEnv "${Remote}:/tmp/fm_market_data_env.txt"
+    scp @ssh "$Root\scripts\merge_remote_env_keys.py" "${Remote}:/tmp/merge_remote_env_keys.py"
+    $mergeCmd = "python3 /tmp/merge_remote_env_keys.py --src /tmp/fm_market_data_env.txt --envf /home/ubuntu/FutureMathics.ai/.env.local; rm -f /tmp/merge_remote_env_keys.py /tmp/fm_market_data_env.txt"
+    ssh @ssh $Remote $mergeCmd
+} finally {
+    Remove-Item -Force $tmpEnv -ErrorAction SilentlyContinue
+}
+
 Write-Host "Uploading virtue files to $Remote ..."
 
 scp @ssh `
@@ -28,16 +60,25 @@ scp @ssh `
 
 scp @ssh `
     "$Root\engine\alpaca_spy_feed.py" `
+    "$Root\engine\databento_mes_feed.py" `
     "$Root\engine\webull_clients.py" `
     "$Root\engine\webull_openapi.py" `
     "$Root\engine\webull_futures.py" `
     "$Root\engine\config.py" `
+    "$Root\engine\dual_sleeve.py" `
+    "$Root\engine\sleeve_order_router.py" `
+    "$Root\engine\entry_structure.py" `
+    "$Root\engine\macromathics_core.py" `
+    "$Root\engine\observability.py" `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `
     "$Root\engine\ui_state_bridge.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/engine/"
 
-# main.py imports scripts.run_daily_session.in_market_hours + manus risk/heartbeat
+scp @ssh `
+    "$Root\requirements.txt" `
+    "${Remote}:/home/ubuntu/FutureMathics.ai/"
+
 scp @ssh `
     "$Root\celine\live_vwap.py" `
     "$Root\celine\live_twap.py" `
@@ -58,29 +99,29 @@ scp @ssh `
     "${Remote}:/tmp/futuremathics_virtue.service"
 
 Write-Host "Installing and restarting futuremathics_virtue ..."
-# Single-line remote command avoids PowerShell CRLF breaking bash `set -o pipefail`
-$remoteCmd = @(
+$parts = @(
     "sudo cp /tmp/futuremathics_virtue.service /etc/systemd/system/futuremathics_virtue.service",
     "sudo systemctl daemon-reload"
 )
 if ($StopGrade) {
-    $remoteCmd += @(
+    $parts += @(
         "sudo systemctl stop futuremathics_grade || true",
         "sudo systemctl disable futuremathics_grade || true"
     )
 } else {
-    $remoteCmd += "echo Leaving futuremathics_grade as-is use -StopGrade to cut over"
+    $parts += "echo Leaving futuremathics_grade as-is use -StopGrade to cut over"
 }
-$remoteCmd += @(
+$parts += @(
+    "python3 -m pip install --user --break-system-packages -q 'databento>=0.45.0,<1.0.0' || true",
     "sudo systemctl enable futuremathics_virtue",
     "sudo systemctl restart futuremathics_virtue",
     "sudo systemctl restart futuremathics_dashboard || true",
     "sleep 4",
     "systemctl is-active futuremathics_virtue",
     "systemctl is-active futuremathics_dashboard",
-    "sudo journalctl -u futuremathics_virtue -n 40 --no-pager"
+    "sudo journalctl -u futuremathics_virtue -n 50 --no-pager"
 )
-ssh @ssh $Remote ($remoteCmd -join " && ")
+$remoteCmd = $parts -join " && "
+ssh @ssh $Remote $remoteCmd
 
 Write-Host "Done."
-

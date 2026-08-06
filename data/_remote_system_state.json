@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "updated_at": "2026-07-28T14:53:43.932688+00:00",
+  "symbol": "MES",
+  "strategy": "virtue_wisdom",
+  "data_source": "alpaca_spy_mes_proxy",
+  "last_price": 9244.25,
+  "unrealized_pnl": 62.85,
+  "account_nav": 100000.0,
+  "session": {
+    "realized_pnl_today": 0.0,
+    "open_risk_notional": 225.0,
+    "trades_today": 1,
+    "halted": false,
+    "cycle_count": 3,
+    "last_risk_verdict": "APPROVED",
+    "last_risk_reason": "within_fixed_fractional_budget",
+    "last_action": "LONG"
+  },
+  "open_positions": [
+    {
+      "direction": "LONG",
+      "contracts": 3,
+      "entry_price": 9240.06,
+      "symbol": "MESU6",
+      "order_id": "FM-WB-326DDF42"
+    }
+  ],
+  "virtue": {
+    "regime": "TREND_BULL",
+    "action": "LONG",
+    "reason": "vwap_twap_long vwap=95.2 twap=95.2 blend=95.2",
+    "adx": 41.51,
+    "atr_pct": 0.1296,
+    "vwap_score": 95.23,
+    "twap_score": 95.23,
+    "blended_score": 95.23,
+    "exposure": "LONG",
+    "contracts": 3
+  },
+  "dashboard": {
+    "as_of_utc": "2026-07-28 14:53:43 UTC",
+    "symbol": "MES",
+    "mode": "PAPER",
+    "data_source": "alpaca_spy_mes_proxy",
+    "daily_pnl": 0.0,
+    "daily_pnl_pct": 0.0,
+    "unrealized_pnl": 62.85,
+    "last_price": 9244.25,
+    "account_nav": 100000.0,
+    "starting_nav": 100000.0,
+    "hard_stop_limit": 2000.0,
+    "hard_stop_distance": 2000.0,
+    "open_risk_notional": 225.0,
+    "max_concurrent_risk": 5000.0,
+    "margin_utilization_pct": 4.5,
+    "cycle_count": 3,
+    "trades_today": 1,
+    "risk_verdict": "APPROVED",
+    "risk_reason": "within_fixed_fractional_budget",
+    "boot_status": "running",
+    "heartbeat_state": "GREEN",
+    "open_positions": [
+      {
+        "direction": "LONG",
+        "contracts": 3,
+        "entry_price": 9240.06,
+        "symbol": "MESU6",
+        "order_id": "FM-WB-326DDF42"
+      }
+    ],
+    "strategy": "virtue_wisdom",
+    "regime": "TREND_BULL",
+    "action": "LONG",
+    "vwap_score": 95.23,
+    "twap_score": 95.23,
+    "blended_score": 95.23
+  }
+}

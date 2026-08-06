@@ -1,10 +1,9 @@
 """
-FutureMathics virtue broker — Webull execution + Alpaca market data.
+FutureMathics virtue broker — Webull execution + Databento/Alpaca market data.
 
 - Trade / positions / reconcile: Webull OpenAPI (ApiClient + TradeClient)
-- Live prices: Alpaca SPY → MES proxy (existing $99 market-data subscription)
+- Live prices: Databento CME MES L1 (primary) → Alpaca SPY proxy fallback → Webull snapshot
 - No Interactive Brokers / ib_insync
-- No Webull US_FUTURES quote subscription required
 
 Guardrails (intact):
   1. Position exclusivity — flatten opposite before new entry; wait for fill confirm
@@ -25,16 +24,21 @@ from enum import Enum
 from typing import Any
 
 from engine.config import (
+    DATABENTO_MAX_QUOTE_AGE_S,
     EXECUTION_SYMBOL,
     FIXED_FRACTIONAL_RISK_PCT,
     STARTING_NAV,
     WEBULL_NETWORK_TIMEOUT_S,
     forward_test_force_paper,
+    max_mes_contracts,
     paper_max_mes_contracts,
+    virtue_session_mode,
+    primary_data_source,
     webull_credentials_configured,
     webull_futures_account_id,
 )
 from engine.alpaca_spy_feed import AlpacaSPYFeed
+from engine.databento_mes_feed import DatabentoMESFeed
 from engine.futures_broker_adapter import OrderExecutionResult, RoutingMode
 from engine.webull_clients import ApiClient, TradeClient
 from engine.webull_openapi import webull_is_sandbox
@@ -148,7 +152,7 @@ def calculate_max_contracts(
     max_risk = eq * limit_pct
     risk_per_contract = stop * tv
     raw = int(max_risk // risk_per_contract)
-    cap = hard_cap if hard_cap is not None else paper_max_mes_contracts()
+    cap = hard_cap if hard_cap is not None else max_mes_contracts()
     contracts = max(0, min(raw, int(cap)))
     if contracts < 1:
         return SizeResult(
@@ -208,7 +212,12 @@ def _opposite(direction: str) -> str:
 
 
 def _fill_confirmed(status: str) -> bool:
-    return str(status or "").upper() in {"FILLED", "SUBMITTED", "ACCEPTED", "PARTIAL"}
+    """True only for exchange-confirmed fills (Justice — SUBMITTED is not a fill)."""
+    return str(status or "").upper() in {"FILLED", "PARTIAL"}
+
+
+def _order_working(status: str) -> bool:
+    return str(status or "").upper() in {"SUBMITTED", "ACCEPTED", "PENDING", "NEW"}
 
 
 async def _await_timeout(coro, *, timeout: float = NETWORK_TIMEOUT_S, label: str = "network"):
@@ -223,39 +232,61 @@ class VirtueBroker:
     """
     Virtue execution gate.
 
-    - AlpacaSPYFeed: live MES proxy prices (market data you already pay for)
+    - DatabentoMESFeed: primary CME MES L1 (overnight-capable)
+    - AlpacaSPYFeed: SPY → MES proxy fallback
     - TradeClient: Webull futures account, orders, positions, reconcile
     """
 
     api: ApiClient = field(default_factory=ApiClient)
     trade: TradeClient | None = None
     data: AlpacaSPYFeed = field(default_factory=AlpacaSPYFeed)
-    equity: float = 10_000.0
+    mes_data: DatabentoMESFeed | None = None
+    equity: float = STARTING_NAV
     realized_pnl: float = 0.0
     triage: TriageState = TriageState.READY
     max_price_age_s: float = 5.0
     open_positions: list[dict[str, Any]] = field(default_factory=list)
     network_timeout_s: float = NETWORK_TIMEOUT_S
     _last_price: float = 0.0
+    _last_bid: float = 0.0
+    _last_ask: float = 0.0
     _last_disconnect_at: float | None = None
     _contract: str = EXECUTION_SYMBOL
+    _data_source: str = "alpaca_spy_mes_proxy"
+    _pending_live_order_id: str = ""
+    _pending_live_order_at: float = 0.0
 
     def __post_init__(self) -> None:
         if self.trade is None:
             self.trade = TradeClient(api=self.api, product_root=EXECUTION_SYMBOL)
+        if self.mes_data is None:
+            self.mes_data = DatabentoMESFeed(max_quote_age_s=float(DATABENTO_MAX_QUOTE_AGE_S))
         if not webull_credentials_configured():
             logger.error("WEBULL credentials missing — set WEBULL_APP_KEY / WEBULL_APP_SECRET in .env.local")
-        if not self.data.is_configured():
-            logger.error("ALPACA credentials missing — set ALPACA_API_KEY / ALPACA_API_SECRET for live prices")
-        else:
+        src = primary_data_source()
+        if src == "databento" and self.mes_data.is_configured():
+            self._data_source = "databento_mes"
+            self.mes_data.ensure_started()
+            logger.info("VirtueBroker market data: Databento CME MES L1 (primary)")
+        elif self.data.is_configured():
+            self._data_source = "alpaca_spy_mes_proxy"
             logger.info("VirtueBroker market data: Alpaca SPY → MES proxy")
+        else:
+            logger.error(
+                "No market data — set DATABENTO_API_KEY (preferred) or ALPACA_API_KEY / ALPACA_API_SECRET"
+            )
         acct = webull_futures_account_id() or "(resolve-at-runtime)"
         logger.info(
-            "VirtueBroker Webull execution account=%s product=%s timeout=%.1fs",
+            "VirtueBroker Webull execution account=%s product=%s timeout=%.1fs data_source=%s",
             acct,
             EXECUTION_SYMBOL,
             self.network_timeout_s,
+            self._data_source,
         )
+
+    @property
+    def data_source(self) -> str:
+        return str(self._data_source or "unknown")
 
     # --- compatibility shim for older main/tests that expect .adapter ---
     @property
@@ -299,10 +330,10 @@ class VirtueBroker:
         return await self.health_check_timed()
 
     async def health_check_timed(self) -> tuple[bool, str]:
-        """Healthy when Webull trade API is up; Alpaca data preferred for prices."""
+        """Healthy when Webull trade API is up and primary market data is fresh."""
         parts: list[str] = []
         webull_ok = False
-        alpaca_ok = False
+        data_ok = False
         try:
             webull_ok, wdetail = await _await_timeout(
                 asyncio.to_thread(self.trade.health_check),
@@ -314,9 +345,21 @@ class VirtueBroker:
             logger.exception("webull_health_check_failed err=%s", exc)
             parts.append(f"webull_error={exc}")
 
-        if self.data.is_configured():
+        prefer = primary_data_source()
+        if prefer == "databento" and self.mes_data and self.mes_data.is_configured():
             try:
-                alpaca_ok, adetail = await _await_timeout(
+                data_ok, ddetail = await _await_timeout(
+                    self.mes_data.health_check(),
+                    timeout=max(self.network_timeout_s, 8.0),
+                    label="databento_health",
+                )
+                parts.append(f"databento={ddetail}")
+            except Exception as exc:
+                logger.exception("databento_health_check_failed err=%s", exc)
+                parts.append(f"databento_error={exc}")
+        elif self.data.is_configured():
+            try:
+                data_ok, adetail = await _await_timeout(
                     self.data.health_check(),
                     timeout=self.network_timeout_s,
                     label="alpaca_health",
@@ -325,11 +368,15 @@ class VirtueBroker:
             except Exception as exc:
                 logger.exception("alpaca_health_check_failed err=%s", exc)
                 parts.append(f"alpaca_error={exc}")
+        else:
+            data_ok = True  # no MD configured → don't block webull-only health
 
-        # Execution broker must be up; market data should be up when Alpaca is configured
         if not webull_ok:
             return False, " | ".join(parts)
-        if self.data.is_configured() and not alpaca_ok:
+        # Require primary MD when configured
+        if prefer == "databento" and self.mes_data and self.mes_data.is_configured() and not data_ok:
+            return False, " | ".join(parts)
+        if prefer != "databento" and self.data.is_configured() and not data_ok:
             return False, " | ".join(parts)
         return True, " | ".join(parts)
 
@@ -338,12 +385,85 @@ class VirtueBroker:
 
     async def resolve_market_context_timed(self) -> dict[str, Any]:
         """
-        Prefer Alpaca SPY → MES proxy (paid market data).
-        Fall back to Webull futures snapshot only if Alpaca unavailable.
+        Prefer Databento CME MES L1 when configured.
+        Fall back to Alpaca SPY → MES proxy, then Webull futures snapshot.
         """
         self._contract = self.trade.contract_symbol() if self.trade else EXECUTION_SYMBOL
 
-        # Primary: Alpaca
+        # Primary: Databento CME MES
+        if self.mes_data and self.mes_data.is_configured() and primary_data_source() == "databento":
+            try:
+                mes_quote = await _await_timeout(
+                    self.mes_data.fetch_quote(max_age_s=float(DATABENTO_MAX_QUOTE_AGE_S)),
+                    timeout=max(self.network_timeout_s, 8.0),
+                    label="databento_quote",
+                )
+            except Exception as exc:
+                logger.exception("databento_quote_failed err=%s", exc)
+                mes_quote = None
+            if mes_quote:
+                price = float(mes_quote.get("price") or mes_quote.get("last") or 0.0)
+                # Justice: MES outrights are thousands; reject spread/garbage prints.
+                if 1000.0 <= price <= 20000.0:
+                    db_sym = str(mes_quote.get("symbol") or "").upper()
+                    wb_sym = str(self._contract or "").upper()
+                    # Live cash: Databento front month must match Webull execution contract.
+                    if (
+                        not forward_test_force_paper()
+                        and db_sym
+                        and wb_sym
+                        and db_sym != wb_sym
+                        and db_sym.startswith("MES")
+                        and wb_sym.startswith("MES")
+                    ):
+                        logger.error(
+                            "symbol_mismatch databento=%s webull=%s — Justice stand aside "
+                            "(set WEBULL_FUTURES_SYMBOL=%s)",
+                            db_sym,
+                            wb_sym,
+                            db_sym,
+                        )
+                        return {
+                            "tick": {"price": 0.0, "last": 0.0, "source": "symbol_mismatch"},
+                            "live_stream": False,
+                            "stand_aside": True,
+                            "detail": f"symbol_mismatch:{db_sym}!={wb_sym}",
+                        }
+                    self._last_price = price
+                    self._last_bid = float(mes_quote.get("bid") or price)
+                    self._last_ask = float(mes_quote.get("ask") or price)
+                    self._data_source = "databento_mes"
+                    tick = {
+                        **mes_quote,
+                        "symbol": self._contract or db_sym or EXECUTION_SYMBOL,
+                        "source": "databento_mes",
+                        "databento_symbol": db_sym or mes_quote.get("symbol"),
+                    }
+                    return {
+                        "tick": tick,
+                        "live_stream": True,
+                        "databento": True,
+                        "webull_contract": self._contract,
+                    }
+                logger.error(
+                    "databento_quote_rejected_insane price=%.4f sym=%s — Justice stand aside path",
+                    price,
+                    mes_quote.get("symbol"),
+                )
+            # CME primary: never invent overnight tape from SPY (Justice / Wisdom).
+            if virtue_session_mode() == "cme" and primary_data_source() == "databento":
+                logger.error(
+                    "market_data_stand_aside databento_primary_down — no Alpaca SPY proxy under CME hours"
+                )
+                return {
+                    "tick": {"price": 0.0, "last": 0.0, "source": "databento_unavailable"},
+                    "live_stream": False,
+                    "stand_aside": True,
+                    "detail": "databento_unavailable_cme_mode",
+                }
+            logger.warning("Databento MES quote unavailable/stale — trying Alpaca SPY proxy")
+
+        # Secondary: Alpaca SPY → MES proxy (RTH / non-CME fallback only)
         if self.data.is_configured():
             try:
                 spy_quote = await _await_timeout(
@@ -364,12 +484,12 @@ class VirtueBroker:
                         MAX_SPY_QUOTE_AGE_S,
                         spy_quote.get("timestamp"),
                     )
-                    # Fall through to Webull MES quote; if that fails, caller stands aside
                 else:
                     tick = self.data.get_mes_proxy_tick(spy_quote)
                     price = float(tick.get("price") or tick.get("last") or 0.0)
                     if price > 0:
                         self._last_price = price
+                        self._data_source = "alpaca_spy_mes_proxy"
                         tick = {
                             **tick,
                             "symbol": self._contract,
@@ -386,7 +506,7 @@ class VirtueBroker:
                         }
             logger.warning("Alpaca quote unavailable/stale — trying Webull futures snapshot")
 
-        # Fallback: Webull (requires US_FUTURES subscription)
+        # Tertiary: Webull (requires US_FUTURES subscription)
         try:
             quote = await _await_timeout(
                 asyncio.to_thread(self.trade.get_quote),
@@ -395,14 +515,12 @@ class VirtueBroker:
             )
         except Exception as exc:
             logger.exception("webull_quote_failed err=%s", exc)
-            raise RuntimeError(f"market_data_unavailable alpaca_and_webull_failed: {exc}") from exc
+            raise RuntimeError(f"market_data_unavailable all_sources_failed: {exc}") from exc
 
         if not quote or quote.get("needs_subscription"):
             detail = (quote or {}).get("error") or "webull_quote_unavailable"
-            # Soft fail: Sunday/overnight MES needs live futures quotes; SPY proxy is stale.
-            # Do not raise — caller stands aside (Justice) instead of outage reconnect theater.
             logger.error(
-                "market_data_stand_aside alpaca_stale_or_down webull=%s — no fresh MES price",
+                "market_data_stand_aside databento/alpaca_down webull=%s — no fresh MES price",
                 detail,
             )
             return {
@@ -418,6 +536,7 @@ class VirtueBroker:
 
         self._last_price = price
         self._contract = str(quote.get("symbol") or self._contract)
+        self._data_source = "webull"
         tick = {
             "symbol": self._contract,
             "price": price,
@@ -506,7 +625,8 @@ class VirtueBroker:
         return OrderExecutionResult(
             routing_mode=RoutingMode.PAPER_ROUTE,
             status="FILLED",
-            order_id=f"FM-WB-{uuid.uuid4().hex[:8].upper()}",
+            # Match live Webull ClOrdID shape (fm + hex, ≤32) for Discord / CloudWatch.
+            order_id=f"fm{uuid.uuid4().hex}"[:32],
             fill_price=round(float(fill or 0.0), 2),
             contracts=contracts,
             direction=d,
@@ -592,6 +712,18 @@ class VirtueBroker:
             )
         else:
             self.open_positions = synced
+        # Clear pending live order once we have remote truth (or timeout).
+        if self._pending_live_order_id:
+            age = time.time() - float(self._pending_live_order_at or 0.0)
+            if synced or age >= 30.0:
+                logger.info(
+                    "pending_live_order_clear id=%s age=%.1fs remote_positions=%s",
+                    self._pending_live_order_id,
+                    age,
+                    len(synced),
+                )
+                self._pending_live_order_id = ""
+                self._pending_live_order_at = 0.0
         self.triage = TriageState.READY
         logger.info(
             "reconcile_with_broker ok equity=%.2f realized_pnl=%.2f positions=%s source=%s",
@@ -601,6 +733,31 @@ class VirtueBroker:
             equity_source,
         )
         return BrokerTruth(True, self.equity, self.realized_pnl, list(self.open_positions), detail=equity_source)
+
+    def has_pending_live_order(self, *, max_age_s: float = 30.0) -> bool:
+        if not self._pending_live_order_id:
+            return False
+        age = time.time() - float(self._pending_live_order_at or 0.0)
+        if age > max_age_s:
+            logger.warning(
+                "pending_live_order_stale id=%s age=%.1fs — clearing lock",
+                self._pending_live_order_id,
+                age,
+            )
+            self._pending_live_order_id = ""
+            self._pending_live_order_at = 0.0
+            return False
+        return True
+
+    def quote_spread_ticks(self) -> float | None:
+        """Bid/ask width in MES ticks (0.25). None if unknown."""
+        from engine.config import TICK_SIZE
+
+        bid = float(self._last_bid or 0.0)
+        ask = float(self._last_ask or 0.0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return (ask - bid) / float(TICK_SIZE)
 
     async def poll_until_reconnected_forever(self) -> bool:
         """Infinite Webull outage survival — 30–60s backoff until health + reconcile succeed."""
@@ -694,7 +851,11 @@ class VirtueBroker:
             logger.error("FLATTEN_NO_FILL_CONFIRM status=%s detail=%s", result.status, result.detail)
             return False, 0.0
 
-        fill = float(result.fill_price or price)
+        fill = float(
+            getattr(result, "fills_price", None)
+            or getattr(result, "fill_price", None)
+            or price
+        )
         points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
         approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
         logger.info(
@@ -733,6 +894,41 @@ class VirtueBroker:
             return None
         return notional / qty
 
+    async def close_contracts(
+        self,
+        *,
+        contracts: int,
+        price: float,
+        stop_ticks: int,
+        reason: str = "sleeve_close",
+        entry_price: float | None = None,
+        sleeve: str = "",
+    ) -> tuple[bool, float]:
+        """
+        Close exactly `contracts` of net exposure; leave any remainder untouched.
+
+        Multi-sleeve router primitive — never a whole-account wipe. Prefer this
+        over flatten_all for tactical/core exits so a satellite close cannot
+        clear a structural runner.
+
+        When entry_price is provided, PnL uses that sleeve entry (Justice:
+        dual-sleeve closes must not credit blended net avg into the wrong book).
+        """
+        exposure_dir, exposure_size = self.net_exposure()
+        qty = max(0, int(contracts))
+        if exposure_dir == "FLAT" or exposure_size <= 0 or qty < 1:
+            return True, 0.0
+        leave = max(0, int(exposure_size) - qty)
+        return await self.partial_close(
+            contracts=qty,
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=reason,
+            leave=leave,
+            entry_price=entry_price,
+            sleeve=sleeve,
+        )
+
     async def flatten_all(
         self,
         *,
@@ -742,7 +938,10 @@ class VirtueBroker:
     ) -> tuple[bool, float]:
         """
         Close entire net exposure. Returns (ok, approx_realized_pnl).
-        Used when Wisdom goes FLAT / stop hit (Temperance + Courage exit).
+
+        Legacy / last-resort only. Routine tactical and core exits must use
+        close_contracts / the multi-sleeve order router so structural size
+        cannot be wiped by a satellite exit.
         """
         from engine.config import POINT_VALUE
 
@@ -792,7 +991,11 @@ class VirtueBroker:
             logger.error("FLATTEN_ALL_NO_FILL status=%s detail=%s", result.status, result.detail)
             return False, 0.0
 
-        fill = float(result.fill_price or price)
+        fill = float(
+            getattr(result, "fills_price", None)
+            or getattr(result, "fill_price", None)
+            or price
+        )
         points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
         approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
         self.open_positions = []
@@ -818,10 +1021,15 @@ class VirtueBroker:
         stop_ticks: int,
         reason: str = "take_profit_scale_out",
         leave: int = 1,
+        entry_price: float | None = None,
+        sleeve: str = "",
     ) -> tuple[bool, float]:
         """
         Close `contracts` of net exposure; leave `leave` contracts as a runner.
         Returns (ok, approx_realized_pnl on the closed size).
+
+        Prefer sleeve entry_price when provided so dual-sleeve books do not
+        leak blended broker avg into tactical/core PnL.
         """
         from engine.config import POINT_VALUE
 
@@ -840,19 +1048,28 @@ class VirtueBroker:
             return True, 0.0
         close_qty = min(close_qty, exposure_size - leave_qty)
 
-        entry = self._avg_entry(exposure_dir) or float(price)
+        broker_avg = self._avg_entry(exposure_dir) or float(price)
+        try:
+            sleeve_entry = float(entry_price) if entry_price is not None else 0.0
+        except (TypeError, ValueError):
+            sleeve_entry = 0.0
+        entry = sleeve_entry if sleeve_entry > 0 else float(broker_avg)
         points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
         approx_pnl = round(points * POINT_VALUE * close_qty, 2)
         flat_dir = _opposite(exposure_dir)
+        sleeve_tag = str(sleeve or "").strip().lower()
 
         logger.warning(
-            "PARTIAL_CLOSE reason=%s close %s x%s leave=%s @ %.2f entry≈%.2f pnl≈%.2f",
+            "PARTIAL_CLOSE reason=%s sleeve=%s close %s x%s leave=%s @ %.2f "
+            "entry≈%.2f broker_avg≈%.2f pnl≈%.2f",
             reason,
+            sleeve_tag or "-",
             exposure_dir,
             close_qty,
             leave_qty,
             price,
             entry,
+            broker_avg,
             approx_pnl,
         )
         order = Order(
@@ -883,25 +1100,32 @@ class VirtueBroker:
             logger.error("PARTIAL_CLOSE_NO_FILL status=%s detail=%s", result.status, result.detail)
             return False, 0.0
 
-        fill = float(result.fill_price or price)
+        fill = float(
+            getattr(result, "fills_price", None)
+            or getattr(result, "fill_price", None)
+            or price
+        )
         points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
         approx_pnl = round(points * POINT_VALUE * close_qty, 2)
         remaining = exposure_size - close_qty
-        # Consolidate leftover into one runner row (keep original avg entry)
+        # Leftover book keeps broker avg (other sleeve), not the closed sleeve entry.
+        remain_entry = float(broker_avg)
         self.open_positions = [
             {
                 "direction": exposure_dir,
                 "size": remaining,
-                "price": entry,
-                "entry_price": entry,
+                "price": remain_entry,
+                "entry_price": remain_entry,
                 "order_id": str(result.order_id or ""),
                 "symbol": self._contract or EXECUTION_SYMBOL,
                 "source": "scale_out_runner",
                 "scaled_out_tp": True,
+                "sleeve": "residual",
             }
         ] if remaining > 0 else []
         logger.info(
-            "PARTIAL_CLOSE_CONFIRMED id=%s status=%s fill=%.2f closed=%s remain=%s pnl≈%.2f reason=%s",
+            "PARTIAL_CLOSE_CONFIRMED id=%s status=%s fill=%.2f closed=%s remain=%s "
+            "pnl≈%.2f reason=%s sleeve=%s",
             result.order_id,
             result.status,
             fill,
@@ -909,6 +1133,7 @@ class VirtueBroker:
             remaining,
             approx_pnl,
             reason,
+            sleeve_tag or "-",
         )
         if forward_test_force_paper() and not webull_is_sandbox():
             return True, approx_pnl
@@ -947,6 +1172,33 @@ class VirtueBroker:
             return float(price) >= entry + target_pts
         return float(price) <= entry - target_pts
 
+    def unrealized_position_pnl(self, *, price: float) -> float:
+        """Open position mark-to-market PnL in dollars (0 when flat)."""
+        from engine.config import POINT_VALUE
+
+        exposure_dir, exposure_size = self.net_exposure()
+        if exposure_dir == "FLAT" or exposure_size <= 0:
+            return 0.0
+        entry = self._avg_entry(exposure_dir)
+        if entry is None:
+            return 0.0
+        points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
+        return round(points * float(POINT_VALUE) * int(exposure_size), 2)
+
+    def take_profit_dollars_hit(self, *, price: float, target_dollars: float) -> bool:
+        """True when open position unrealized PnL reaches the dollar take-profit."""
+        target = float(target_dollars)
+        if target <= 0:
+            return False
+        return self.unrealized_position_pnl(price=price) >= target
+
+    def stop_dollars_hit(self, *, price: float, stop_dollars: float) -> bool:
+        """True when open position unrealized PnL is at/below -stop_dollars."""
+        limit = float(stop_dollars)
+        if limit <= 0:
+            return False
+        return self.unrealized_position_pnl(price=price) <= -limit
+
     def scale_out_close_qty(self, *, leave: int = 1) -> int:
         """Contracts to close so `leave` remain (0 if already at/below leave)."""
         _, size = self.net_exposure()
@@ -980,6 +1232,13 @@ class VirtueBroker:
         )
         if not flattened:
             logger.error("ORDER_BLOCKED exclusivity_flatten_failed")
+            return None
+
+        if self.has_pending_live_order():
+            logger.error(
+                "ORDER_BLOCKED pending_live_order id=%s — Temperance no double-fire",
+                self._pending_live_order_id,
+            )
             return None
 
         order = Order(
@@ -1017,7 +1276,19 @@ class VirtueBroker:
             self.enter_triage("submit_exception")
             return None
 
-        if _fill_confirmed(result.status):
+        status_u = str(result.status or "").upper()
+        if result.routing_mode == RoutingMode.PAPER_ROUTE and _fill_confirmed(status_u):
+            self.open_positions.append(
+                {
+                    "direction": _normalize_direction(order.direction),
+                    "size": order.size,
+                    "price": result.fill_price,
+                    "order_id": result.order_id,
+                    "symbol": result.contract or order.symbol,
+                    "source": "webull_paper_fill",
+                }
+            )
+        elif result.routing_mode == RoutingMode.LIVE_ROUTE and _fill_confirmed(status_u):
             self.open_positions.append(
                 {
                     "direction": _normalize_direction(order.direction),
@@ -1028,6 +1299,25 @@ class VirtueBroker:
                     "source": "webull_fill",
                 }
             )
+        elif result.routing_mode == RoutingMode.LIVE_ROUTE and _order_working(status_u):
+            # Justice: SUBMITTED/ACCEPTED is not a fill — confirm via remote positions.
+            self._pending_live_order_id = str(result.order_id or "unknown")
+            self._pending_live_order_at = time.time()
+            logger.info(
+                "live_order_working status=%s id=%s — reconciling before trusting size",
+                status_u,
+                result.order_id,
+            )
+            try:
+                await asyncio.sleep(0.75)
+                truth = await self.reconcile_with_broker()
+                if not truth.ok:
+                    logger.error(
+                        "live_order_working_reconcile_failed detail=%s — no local size invent",
+                        truth.detail,
+                    )
+            except Exception as exc:
+                logger.exception("live_order_working_reconcile_exception err=%s", exc)
         return result
 
 

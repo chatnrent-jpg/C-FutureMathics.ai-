@@ -1,5 +1,5 @@
 [Unit]
-Description=FutureMathics MES — Virtue Wisdom Brain (Alpaca data + Webull execution)
+Description=FutureMathics MES — Virtue Wisdom Brain (Databento CME / Alpaca + Webull execution)
 After=network.target
 
 [Service]

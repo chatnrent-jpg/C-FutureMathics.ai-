@@ -24,14 +24,20 @@ from engine.config import (
     FORWARD_TEST_MARKET_OPEN_MINUTE,
     FORWARD_TEST_TIMEZONE,
     HANDSHAKE_EQUITY_BASE,
-    VIRTUE_NO_NEW_ENTRY_HOUR,
-    VIRTUE_NO_NEW_ENTRY_MINUTE,
+    VIRTUE_CME_NO_NEW_ENTRY_HOUR,
+    VIRTUE_CME_NO_NEW_ENTRY_MINUTE,
+    VIRTUE_ENTRY_WINDOW_1_END,
+    VIRTUE_ENTRY_WINDOW_1_START,
+    VIRTUE_ENTRY_WINDOW_2_END,
+    VIRTUE_ENTRY_WINDOW_2_START,
     VIRTUE_RTH_CLOSE_HOUR,
     VIRTUE_RTH_CLOSE_MINUTE,
-    VIRTUE_RTH_ONLY,
     VIRTUE_RTH_OPEN_HOUR,
     VIRTUE_RTH_OPEN_MINUTE,
     forward_test_force_paper,
+    live_allow_overnight,
+    primary_data_source,
+    virtue_session_mode,
 )
 from engine.futures_broker_adapter import FuturesBrokerAdapter
 from engine.futures_orchestrator import FuturesOrchestrator, OrchestratorConfig
@@ -86,23 +92,166 @@ def in_rth_hours(now: datetime | None = None) -> bool:
     return open_t <= dt.time() < close_t
 
 
+def _live_cash_day_window(now: datetime | None = None) -> bool:
+    """
+    Live cash Temperance window (no overnight): Mon–Fri 09:30–16:45 ET.
+    Outside → flatten / stand aside even if Globex is open.
+    """
+    dt = (now or datetime.now(TZ)).astimezone(TZ)
+    if dt.weekday() >= 5:
+        return False
+    open_t = time(VIRTUE_RTH_OPEN_HOUR, VIRTUE_RTH_OPEN_MINUTE)
+    cut = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
+    return open_t <= dt.time() < cut
+
+
 def virtue_session_open(now: datetime | None = None) -> bool:
-    """Session gate for virtue main: RTH-only when enabled, else CME hours."""
-    if VIRTUE_RTH_ONLY:
-        return in_rth_hours(now)
-    return in_market_hours(now)
+    """
+    Session gate for virtue main.
+
+    CME (Databento): Sun 18:00 ET → Fri 17:00 ET, daily maint 17:00–18:00 ET.
+    RTH (Alpaca fallback): Mon–Fri 09:30–16:00 ET only.
+    Live cash default: daytime-only window (no overnight) unless FM_LIVE_ALLOW_OVERNIGHT=1.
+    """
+    if virtue_session_mode() == "cme":
+        if not in_market_hours(now):
+            return False
+        if not live_allow_overnight():
+            return _live_cash_day_window(now)
+        return True
+    return in_rth_hours(now)
 
 
-def virtue_entries_allowed(now: datetime | None = None) -> bool:
+def _et_now(now: datetime | None = None) -> datetime:
+    """Normalize any aware/naive stamp into America/New_York (US/Eastern market stream)."""
+    dt = now or datetime.now(TZ)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ)
+    return dt.astimezone(TZ)
+
+
+def allow_new_entries(now: datetime | None = None) -> bool:
+    """
+    Primary RTH entry windows (America/New_York):
+      09:45–11:30 ET and 13:45–15:55 ET (start inclusive, end exclusive).
+
+    Session may still be open outside these windows for manage/exit only.
+    Extreme-trend override lives in virtue_entries_allowed(..., adx=, blend=).
+    """
+    dt = _et_now(now)
+    if dt.weekday() >= 5:
+        return False
+    t = dt.time()
+    windows = (
+        (
+            time(*VIRTUE_ENTRY_WINDOW_1_START),
+            time(*VIRTUE_ENTRY_WINDOW_1_END),
+        ),
+        (
+            time(*VIRTUE_ENTRY_WINDOW_2_START),
+            time(*VIRTUE_ENTRY_WINDOW_2_END),
+        ),
+    )
+    return any(start <= t < end for start, end in windows)
+
+
+def extreme_trend_entry_ok(*, adx: float, blend: float) -> bool:
+    """Courage override: finished trend may enter outside primary windows."""
+    from engine.config import (
+        VIRTUE_EXTREME_ADX_OVERRIDE,
+        VIRTUE_EXTREME_BLEND_LONG,
+        VIRTUE_EXTREME_BLEND_SHORT,
+    )
+
+    try:
+        a = float(adx)
+        b = float(blend)
+    except (TypeError, ValueError):
+        return False
+    if a < float(VIRTUE_EXTREME_ADX_OVERRIDE):
+        return False
+    return b <= float(VIRTUE_EXTREME_BLEND_SHORT) or b >= float(VIRTUE_EXTREME_BLEND_LONG)
+
+
+def below_vwap_short_entry_ok(*, blend: float, vwap_score: float | None = None) -> bool:
+    """
+    Lunch / off-window Courage: clear session-VWAP bear (blend + VWAP score).
+    Aligns with short enter band (≤42), not the stricter extreme≤35 cut.
+    """
+    from engine.config import (
+        VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX,
+        VIRTUE_SCORE_SHORT_ENTER,
+    )
+
+    try:
+        b = float(blend)
+    except (TypeError, ValueError):
+        return False
+    if b > float(VIRTUE_SCORE_SHORT_ENTER):
+        return False
+    if vwap_score is None:
+        return True
+    try:
+        return float(vwap_score) <= float(VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX)
+    except (TypeError, ValueError):
+        return False
+
+
+def virtue_entries_allowed(
+    now: datetime | None = None,
+    *,
+    adx: float | None = None,
+    blend: float | None = None,
+    vwap_score: float | None = None,
+) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
-    Last 15 minutes of RTH are manage/exit only (no overnight gap from late entries).
+
+    Requires session open AND (primary RTH windows OR extreme-trend override
+    OR clear below-VWAP short structure).
+    CME overnight mode additionally blocks 16:45–17:00 ET pre-maintenance.
     """
     if not virtue_session_open(now):
         return False
-    dt = (now or datetime.now(TZ)).astimezone(TZ)
-    cutoff = time(VIRTUE_NO_NEW_ENTRY_HOUR, VIRTUE_NO_NEW_ENTRY_MINUTE)
-    return dt.time() < cutoff
+    in_window = allow_new_entries(now)
+    if not in_window:
+        if adx is None or blend is None:
+            return False
+        extreme = extreme_trend_entry_ok(adx=float(adx), blend=float(blend))
+        structural_short = below_vwap_short_entry_ok(
+            blend=float(blend), vwap_score=vwap_score
+        )
+        if not (extreme or structural_short):
+            return False
+    dt = _et_now(now)
+    if virtue_session_mode() == "cme" and live_allow_overnight():
+        if dt.weekday() < 5:
+            t = dt.time()
+            cut = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
+            maint_start = time(17, 0)
+            if cut <= t < maint_start:
+                return False
+    return True
+
+
+def virtue_session_label() -> str:
+    """Human-readable timetable for boot logs / dashboard."""
+    mode = virtue_session_mode()
+    src = primary_data_source()
+    windows = "entries=09:45-11:30&13:45-15:55ET+extreme"
+    if mode == "cme":
+        if live_allow_overnight():
+            return (
+                f"CME_GLOBEX data={src} hours=Sun18:00-Fri17:00ET "
+                f"maint=17:00-18:00 {windows} overnight=ON"
+            )
+        return (
+            f"CME_CASH_DAY data={src} hours=Mon-Fri 09:30-16:45ET "
+            f"{windows} overnight=OFF"
+        )
+    return (
+        f"RTH_CASH data={src} hours=Mon-Fri 09:30-16:00ET {windows}"
+    )
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:
     ensure_boot_system_state()

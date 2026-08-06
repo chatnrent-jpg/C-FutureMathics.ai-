@@ -157,7 +157,17 @@ class FuturesBrokerAdapter:
                     self._sequence += 1
                     return {"tick": tick, "live_stream": True, "webull": True}
 
-            # Priority 3: Local sim fallback
+            # Priority 3: Local sim — paper/dev only. Never invent tape for live cash.
+            from engine.config import forward_test_force_paper
+
+            if not forward_test_force_paper():
+                logger.error("market_data_stand_aside — refusing sim ticks in live mode")
+                return {
+                    "tick": {"price": 0.0, "last": 0.0, "source": "unavailable"},
+                    "live_stream": False,
+                    "stand_aside": True,
+                    "detail": "sim_forbidden_live",
+                }
             tick = self._sim_tick()
             if self._using_webull:
                 tick["webull_quote_missing"] = True
@@ -180,7 +190,7 @@ class FuturesBrokerAdapter:
                     asyncio.to_thread(get_account_balance),
                     timeout=NETWORK_TIMEOUT_S,
                 )
-                positions = await asyncio.wait_for(
+                positions, pos_err = await asyncio.wait_for(
                     asyncio.to_thread(get_futures_positions),
                     timeout=NETWORK_TIMEOUT_S,
                 )
@@ -191,6 +201,14 @@ class FuturesBrokerAdapter:
                         "realized_pnl": 0.0,
                         "positions": [],
                         "detail": str(bal.get("error") or "balance_failed"),
+                    }
+                if pos_err:
+                    return {
+                        "ok": False,
+                        "equity": float(bal.get("equity") or 0.0),
+                        "realized_pnl": 0.0,
+                        "positions": [],
+                        "detail": f"positions_fetch_failed:{pos_err}",
                     }
                 equity = float(bal.get("equity") or 0.0)
                 realized = float(
