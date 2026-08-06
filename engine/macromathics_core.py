@@ -81,7 +81,8 @@ def phase2_time_decay_triggered(
     PHASE 2 — stagnation failsafe.
 
     Marks entry_cycle_marker on first exposure. Triggers when elapsed >=
-    MAX_STAGNATION_CYCLES and open_pnl <= VIRTUE_TIME_DECAY_MIN_OPEN_PNL.
+    MAX_STAGNATION_CYCLES and open_pnl <= VIRTUE_TIME_DECAY_MIN_OPEN_PNL
+    (default 0: cut flat/red stagnation only — never knife a green scalp).
     """
     exposure = str(session_state.get("engine_exposure", "FLAT") or "FLAT").upper()
     if exposure == "FLAT":

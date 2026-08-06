@@ -246,13 +246,15 @@ def _core_adverse_or_stale_failsafe(
                 f"core_failsafe:adverse_dollars pnl={pnl:.2f}"
                 f"<=-{float(VIRTUE_CORE_MAX_ADVERSE_DOLLARS):.0f}",
             )
+    max_hold = int(VIRTUE_CORE_MAX_HOLD_CYCLES)
     marker = getattr(session, "core_entry_cycle", None)
-    if marker is not None and current_cycle is not None:
+    # 0/negative = hold sleeve has no time expiry (structure + adverse $ only).
+    if max_hold > 0 and marker is not None and current_cycle is not None:
         elapsed = int(current_cycle) - int(marker)
-        if elapsed >= int(VIRTUE_CORE_MAX_HOLD_CYCLES):
+        if elapsed >= max_hold:
             return (
                 True,
-                f"core_failsafe:max_hold elapsed={elapsed}>={int(VIRTUE_CORE_MAX_HOLD_CYCLES)}",
+                f"core_failsafe:max_hold elapsed={elapsed}>={max_hold}",
             )
     return False, ""
 

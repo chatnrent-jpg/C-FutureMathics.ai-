@@ -58,10 +58,21 @@ def test_wisdom_chop_stand_aside() -> None:
 def test_score_vs_anchor_bounds() -> None:
     from strategy import score_vs_anchor
 
+    # Legacy linear scale (compat)
     assert score_vs_anchor(100.0, 100.0, scale=10.0) == 50.0
     assert score_vs_anchor(110.0, 100.0, scale=10.0) == 100.0
     assert score_vs_anchor(90.0, 100.0, scale=10.0) == 0.0
     assert score_vs_anchor(105.0, 100.0, scale=10.0) == 75.0
+
+    # Sticky bps mode (session VWAP — VolumeWatch MACRO-style native math)
+    assert score_vs_anchor(100.0, 100.0) == 50.0
+    # +3 bps → bull band start (70); +10 bps → 100
+    assert score_vs_anchor(100.03, 100.0) == 70.0
+    assert score_vs_anchor(100.10, 100.0) == 100.0
+    # −3 bps → bear gate 45 (sticky ≤45); deeper stays ≤45
+    assert score_vs_anchor(99.97, 100.0) == 45.0
+    assert score_vs_anchor(99.90, 100.0) <= 45.0
+    assert score_vs_anchor(99.90, 100.0) < score_vs_anchor(99.97, 100.0)
 
 
 def test_score_discontinuity_stands_aside() -> None:
@@ -926,13 +937,14 @@ def test_check_virtue_pnl_lock_trailing_floor() -> None:
 
 
 def test_check_time_decay_exit_stagnant_hold() -> None:
-    """After 15 cycles with open_pnl <= $25, time_decay triggers flatten."""
+    """After MAX cycles with open_pnl <= $0, time_decay cuts flat/red — never green."""
     from main import VirtueSession, check_time_decay_exit, update_outcome_state
     from engine.config import (
         VIRTUE_TIME_DECAY_COOLDOWN_CYCLES,
         VIRTUE_TIME_DECAY_MAX_CYCLES,
     )
 
+    max_c = int(VIRTUE_TIME_DECAY_MAX_CYCLES)
     s = VirtueSession()
     s.cycle = 10
     # Flat → no trigger, marker cleared
@@ -953,25 +965,25 @@ def test_check_time_decay_exit_stagnant_hold() -> None:
     assert hit is False
     assert s.entry_cycle_marker == 10
 
-    # Not yet 15 cycles
-    hit, _ = check_time_decay_exit(s, 24, open_pnl=10.0, exposure="LONG")
+    # Not yet max cycles
+    hit, _ = check_time_decay_exit(s, 10 + max_c - 1, open_pnl=-5.0, exposure="LONG")
     assert hit is False
 
-    # 15 elapsed but making progress (> $25) → keep
-    hit, _ = check_time_decay_exit(s, 25, open_pnl=30.0, exposure="LONG")
+    # Max elapsed but still green → keep (Courage toward $100 TP)
+    hit, _ = check_time_decay_exit(s, 10 + max_c, open_pnl=20.0, exposure="LONG")
     assert hit is False
 
-    # 15 elapsed and stagnant → cut
-    hit, reason = check_time_decay_exit(s, 25, open_pnl=20.0, exposure="LONG")
+    # Max elapsed and flat/red stagnation → cut
+    hit, reason = check_time_decay_exit(s, 10 + max_c, open_pnl=0.0, exposure="LONG")
     assert hit is True
     assert "time_decay" in reason
 
-    update_outcome_state(s, 12.0, reason, current_engine_cycle=25)
+    update_outcome_state(s, -2.0, reason, current_engine_cycle=10 + max_c)
     assert s.last_reason == "time_decay"
     assert s.entry_cycle_marker is None
-    assert s.pipeline_resume_cycle == 25 + int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES)
+    assert s.pipeline_resume_cycle == 10 + max_c + int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES)
     assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 8
-    assert int(VIRTUE_TIME_DECAY_MAX_CYCLES) == 15
+    assert int(VIRTUE_TIME_DECAY_MAX_CYCLES) == 36
 
 
 def test_observability_metric_lines_and_webhook_guard() -> None:
@@ -1067,7 +1079,7 @@ def test_macromathics_core_production_phases() -> None:
         phase3_velocity_gates,
     )
 
-    assert int(MAX_STAGNATION_CYCLES) == 15
+    assert int(MAX_STAGNATION_CYCLES) == 36
     assert float(PROFIT_GUARD_THRESHOLD) == 150.0
     assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 8
 
@@ -1079,8 +1091,11 @@ def test_macromathics_core_production_phases() -> None:
     hit, floor = phase1_profit_guard_triggered(state)
     assert hit is True
 
-    td = {"engine_exposure": "LONG", "entry_cycle_marker": 1, "open_pnl": 10.0}
-    assert phase2_time_decay_triggered(td, 16) is True
+    # Green open_pnl never time-decays; flat/red after 36 cycles does.
+    td_green = {"engine_exposure": "LONG", "entry_cycle_marker": 1, "open_pnl": 10.0}
+    assert phase2_time_decay_triggered(td_green, 37) is False
+    td = {"engine_exposure": "LONG", "entry_cycle_marker": 1, "open_pnl": 0.0}
+    assert phase2_time_decay_triggered(td, 37) is True
     assert phase2_time_decay_triggered(td, 10) is False
 
     # Floor 20: ADX 14 → penalty 3 → 58 / 42

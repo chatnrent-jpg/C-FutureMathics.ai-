@@ -2,9 +2,10 @@
 FutureMathics native Wisdom brain — market regime classification.
 
 Pillar 1 (Wisdom / Phronesis):
-  VWAP + TWAP scored 0–100% (50 = at average).
-  - Both scores > 50 → LONG
-  - Both scores < 50 → SHORT
+  Session VWAP + TWAP scored 0–100% from price distance in bps
+  (institutional fair-value: price above / below the average — sticky).
+  - Both scores bullish → LONG
+  - Both scores bearish (≤45) → SHORT
   - Disagree / neutral → STAND ASIDE
   ATR% chaos → STAND ASIDE (never force trades in unstable vol)
 
@@ -60,16 +61,45 @@ class RegimeDecision:
     blended_score: float = 50.0
 
 
-def score_vs_anchor(price: float, anchor: float, *, scale: float) -> float:
+def score_vs_anchor(
+    price: float,
+    anchor: float,
+    *,
+    scale: float | None = None,
+    bull_bps: float = 3.0,
+    bear_bps: float = 3.0,
+) -> float:
     """
-    Map price vs anchor to 0–100.
-    50 = price at anchor; >50 price above; <50 price below.
-    ±scale maps to the full 0–100 range (clamped).
+    Map price vs session VWAP/TWAP to 0–100 (sticky distance score).
+
+    Primary (VolumeWatch MACRO-style, native math — no VW dependency):
+      bps = (price - anchor) / anchor × 10_000
+      ≥ +3 bps → bull band (70→100)
+      ≤ −3 bps → bear band (≤45, sticky for hours in trends)
+      near zero → mid 45–70
+
+    Legacy: if ``scale`` is provided, keep the old linear ATR/% map for tests.
     """
-    if price <= 0 or anchor <= 0 or scale <= 0:
+    if price <= 0 or anchor <= 0:
         return 50.0
-    raw = 50.0 + 50.0 * ((float(price) - float(anchor)) / float(scale))
-    return round(max(0.0, min(100.0, raw)), 2)
+    if scale is not None and float(scale) > 0:
+        raw = 50.0 + 50.0 * ((float(price) - float(anchor)) / float(scale))
+        return round(max(0.0, min(100.0, raw)), 2)
+
+    bps = (float(price) - float(anchor)) / float(anchor) * 10_000.0
+    bull = max(0.1, float(bull_bps))
+    bear = max(0.1, float(bear_bps))
+    if bps >= bull:
+        # +3 bps → 70, +10 bps → 100
+        t = min(1.0, (bps - bull) / 7.0)
+        return round(70.0 + 30.0 * t, 2)
+    if bps <= -bear:
+        # −3 bps → 45 (bear gate), deeper → down toward 20
+        t = min(1.0, (-bps - bear) / 27.0)
+        return round(max(0.0, 45.0 - 25.0 * t), 2)
+    if bps >= 0:
+        return round(50.0 + (bps / bull) * 20.0, 2)  # 50 → 70
+    return round(50.0 + (bps / bear) * 5.0, 2)  # 50 → 45
 
 
 @dataclass
@@ -90,15 +120,19 @@ class WisdomStrategy:
     adx_trend_min: float = 18.0  # flat long entries require ADX >= this (Wisdom)
     adx_short_min: float = 22.0  # shorts need stronger ADX (Temperance)
     atr_pct_chaos_max: float = 0.15  # ATR% of price; MES/proxy chaos stand-aside
-    score_atr_mult: float = 2.0  # ATR component of score scale
-    score_price_pct: float = 0.004  # ±0.4% of price spans 0–100 (trend extensions register)
-    max_anchor_gap_pct: float = 0.004  # >40bps price vs VWAP → rebase (Justice)
+    score_atr_mult: float = 2.0  # legacy linear score scale (unused when bps scoring)
+    score_price_pct: float = 0.004  # legacy linear score scale
+    # Ghost/seed discontinuity only — real session distance is the signal (do not wipe).
+    max_anchor_gap_pct: float = 0.01  # ≥100 bps + jump → rebase (Justice ghost)
     long_enter: float = 58.0  # ENTER long from flat (both scores >=)
     short_enter: float = 42.0  # ENTER short from flat (both scores <=)
     long_exit: float = 45.0  # while LONG: flatten when both scores <= hysteresis
     short_exit: float = 55.0  # while SHORT: flatten when both scores >= hysteresis
-    anchor_window: int = 60  # rolling VWAP/TWAP lookback (seed + live)
+    # 0 = session cumulative VWAP/TWAP (RTH day); >0 = rolling lookback (tests)
+    anchor_window: int = 0
     min_anchor_samples: int = 20
+    score_bull_bps: float = 3.0  # price ≥ +3 bps vs VWAP → bull band
+    score_bear_bps: float = 3.0  # price ≤ −3 bps vs VWAP → bear band (≤45)
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     highs: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     lows: deque[float] = field(default_factory=lambda: deque(maxlen=300))
@@ -155,14 +189,18 @@ class WisdomStrategy:
         for bar in bars:
             self.update(bar)
 
+    def reset_session_anchors(self) -> None:
+        """Clear session VWAP/TWAP on ET day roll (keep OHLC/ATR memory)."""
+        assert self.vwap_tracker is not None and self.twap_tracker is not None
+        self.vwap_tracker.reset()
+        self.twap_tracker.reset()
+
     def rebase_anchors_to_price(self, live_price: float) -> None:
         """
-        Pin rolling VWAP/TWAP (and OHLC path) onto the live quote (Justice).
+        Pin VWAP/TWAP (and OHLC path) onto the live quote on ghost/seed faults only.
 
-        1) Shift OHLC so last close == live (preserve relative path / ATR).
-        2) Rebuild VWAP/TWAP from that aligned window.
-        3) If the average is still ≥1% off live (ghost seed), flat-pin anchors
-           at the live print so scores cannot clamp to 0/100 and fake a SHORT/LONG.
+        Justice: never trade on a wrong-scale average. Do NOT call this just because
+        price is a few bps away from session VWAP — that distance is the signal.
         """
         assert self.vwap_tracker is not None and self.twap_tracker is not None
         px = float(live_price)
@@ -172,14 +210,15 @@ class WisdomStrategy:
         highs = list(self.highs)
         lows = list(self.lows)
         vols = list(self.volumes)
+        lookback = int(self.anchor_window) if int(self.anchor_window) > 0 else len(closes)
         if closes:
             shift = px - float(closes[-1])
             if abs(shift) > 1e-12:
                 self.closes = deque((float(c) + shift for c in closes), maxlen=self.closes.maxlen)
                 self.highs = deque((float(h) + shift for h in highs), maxlen=self.highs.maxlen)
                 self.lows = deque((float(lo) + shift for lo in lows), maxlen=self.lows.maxlen)
-            window = list(self.closes)[-self.anchor_window :]
-            vols = list(self.volumes)[-self.anchor_window :]
+            window = list(self.closes)[-lookback:] if lookback > 0 else list(self.closes)
+            vols = list(self.volumes)[-lookback:] if lookback > 0 else list(self.volumes)
         else:
             window = [px]
             vols = [1.0]
@@ -198,31 +237,36 @@ class WisdomStrategy:
             self.vwap_tracker.reset()
             self.twap_tracker.reset()
             n_ohlc = len(self.closes) if self.closes else max(int(self.min_anchor_samples), 20)
-            n = max(int(self.min_anchor_samples), min(int(self.anchor_window), n_ohlc))
+            aw = int(self.anchor_window)
+            n = max(
+                int(self.min_anchor_samples),
+                min(aw, n_ohlc) if aw > 0 else min(n_ohlc, max(int(self.min_anchor_samples), 20)),
+            )
             for _ in range(n):
                 self.vwap_tracker.update_trade(price=px, size=1.0)
                 self.twap_tracker.update(px)
 
     def anchor_gap_too_wide(self, price: float) -> bool:
         """
-        True on seed/live disconnect from rolling VWAP (Justice).
+        True only on seed/live ghost disconnect (Justice) — not normal VWAP distance.
 
-        - Sudden jump: gap wide AND last close jumped (classic seed cutover).
-        - Ghost VWAP: average ≥1% off live even when last close already matches
-          (the deploy failure that left blend=0 / false SHORT in a bull).
+        Session price sitting 3–40 bps under VWAP is a BEAR signal, not a rebase trigger.
+        Ghost if VWAP *or* TWAP sits ≥1% off live (seed can skew one without the other).
         """
-        assert self.vwap_tracker is not None
+        assert self.vwap_tracker is not None and self.twap_tracker is not None
         px = float(price)
         vwap = float(self.vwap_tracker.vwap or 0.0)
+        twap = float(self.twap_tracker.twap or 0.0)
         closes = list(self.closes)
-        if px <= 0 or vwap <= 0 or not closes:
+        if px <= 0 or not closes:
             return False
-        gap_pct = abs(px - vwap) / px
         atr = self._atr()
         jump = abs(px - float(closes[-1]))
         jump_gate = max(2.0 * atr if atr > 0 else 0.0, px * 0.002, 5.0)
-        gap_gate = max(self.max_anchor_gap_pct, (3.0 * atr / px) if atr > 0 else self.max_anchor_gap_pct)
-        sudden = gap_pct > gap_gate and jump > jump_gate
+        gap_vwap = (abs(px - vwap) / px) if vwap > 0 else 0.0
+        gap_twap = (abs(px - twap) / px) if twap > 0 else 0.0
+        gap_pct = max(gap_vwap, gap_twap)
+        sudden = gap_pct >= 0.01 and jump > jump_gate
         ghost = gap_pct >= 0.01  # ≥100 bps — never trade on a ghost average
         return sudden or ghost
 
@@ -380,10 +424,13 @@ class WisdomStrategy:
         assert self.vwap_tracker is not None and self.twap_tracker is not None
         vwap = float(self.vwap_tracker.vwap or price)
         twap = float(self.twap_tracker.twap or price)
-        # Wide scale so normal MES noise doesn't slam scores to 0/100
-        scale = self.score_scale(price=price, atr=atr)
-        vwap_score = score_vs_anchor(price, vwap, scale=scale)
-        twap_score = score_vs_anchor(price, twap, scale=scale)
+        # Sticky bps distance vs session anchors (price above/below — not ATR chatter).
+        vwap_score = score_vs_anchor(
+            price, vwap, bull_bps=self.score_bull_bps, bear_bps=self.score_bear_bps
+        )
+        twap_score = score_vs_anchor(
+            price, twap, bull_bps=self.score_bull_bps, bear_bps=self.score_bear_bps
+        )
         blended = round((vwap_score + twap_score) / 2.0, 2)
         hold = (holding or "").upper()
 

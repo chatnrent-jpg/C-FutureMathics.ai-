@@ -823,9 +823,15 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     # Structural confirm streaks reset with the ET day (core position may still be open).
     session.structural_bull_streak = 0
     session.structural_bear_streak = 0
+    # Fresh RTH session VWAP/TWAP — sticky day anchor starts empty.
+    try:
+        session.strategy.reset_session_anchors()
+        session.anchors_aligned = False
+    except Exception:
+        logger.exception("session_anchor_reset_failed on day roll")
     logger.info(
         "SESSION_DAY_ROLL et_date=%s prior_date=%s prior_realized=%.2f prior_trades=%s "
-        "book_equity=%.2f — day counters reset; NAV compounds (not reset)",
+        "book_equity=%.2f — day counters + session VWAP/TWAP reset; NAV compounds",
         today,
         prior_date,
         prior_pnl,
@@ -1962,13 +1968,11 @@ async def run_cycle(
         tick_vol = 1.0
     tick_vol = max(1.0, tick_vol)
 
-    # Align rolling VWAP/TWAP to live print (seed bars can sit far from quote).
-    # Also rebase when VWAP↔TWAP diverge beyond ATR×N (sketch: anchor disagreement).
+    # Rebase ONLY on ghost/seed faults (Justice). Session price≠VWAP is the signal —
+    # do not wipe anchors when VWAP/TWAP diverge a few ATRs (that is regime info).
     try:
-        need_rebase = (
-            (not session.anchors_aligned)
-            or session.strategy.anchor_gap_too_wide(price)
-            or session.strategy.anchors_diverged(atr_mult=float(VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT))
+        need_rebase = (not session.anchors_aligned) or session.strategy.anchor_gap_too_wide(
+            price
         )
         if need_rebase:
             session.strategy.rebase_anchors_to_price(price)

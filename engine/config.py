@@ -102,7 +102,8 @@ VIRTUE_CORE_INVALIDATION_BLEND_LONG = 40.0
 VIRTUE_CORE_INVALIDATION_BLEND_SHORT = 60.0  # == 100 - LONG depth (legacy alias)
 # Core adverse failsafe (Temperance) — sticky does not mean suicidal.
 VIRTUE_CORE_MAX_ADVERSE_DOLLARS = 150.0
-VIRTUE_CORE_MAX_HOLD_CYCLES = 90  # ~7.5 min at 5s poll
+# 0 = disabled. Core is the HOLD sleeve — exit on structure/adverse $, not a short timer.
+VIRTUE_CORE_MAX_HOLD_CYCLES = 0
 
 # Live — aligned to $15k / 2 MES profile
 LIVE_RISK_NAV_CAP = 15_000.0
@@ -237,7 +238,7 @@ VIRTUE_COURSE_CORRECT_LONG_BLEND = 45.0   # LONG + blend <= 45 → force flatten
 # Chase: block only extreme late entries. 72 was freezing re-entry after $100 TP in bulls.
 VIRTUE_SCORE_LONG_CHASE_MAX = 85.0
 VIRTUE_SCORE_SHORT_CHASE_MIN = 15.0
-# Score scale: ±score_price_pct of price maps to 0–100 (smaller → more sensitive to extensions)
+# Legacy linear score scale (Wisdom now uses sticky bps vs session VWAP; kept for compat).
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
 VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
@@ -285,10 +286,11 @@ VIRTUE_PIPELINE_BULL_SHORT_PENALTY = 5.0
 # Velocity gate: widen blend bands when ADX is weak (blocks slow-drift traps).
 # VIRTUE_VELOCITY_ADX_FLOOR set above with canonical ADX ladder (= 20.0)
 VIRTUE_VELOCITY_PENALTY_PER_ADX = 0.5  # points added/subtracted per ADX unit below floor
-# Time-decay exit: flatten stagnant holds that never progress toward TP.
-MAX_STAGNATION_CYCLES = 15  # cut stale trades after N engine loops
+# Time-decay: tactical SCALP only — cut dead/red holds, never knife a green trade.
+# Green tactical waits for $100 TP / course-correct / $75 stop (Courage).
+MAX_STAGNATION_CYCLES = 36  # ~3 min at 5s — enough to see if a scalp is alive
 VIRTUE_TIME_DECAY_MAX_CYCLES = MAX_STAGNATION_CYCLES
-VIRTUE_TIME_DECAY_MIN_OPEN_PNL = 25.0  # must be making progress (> this) to keep holding
+VIRTUE_TIME_DECAY_MIN_OPEN_PNL = 0.0  # cut only if open_pnl <= 0 (flat/red stagnation)
 # Legacy ATR TP helpers (Virtue exits use VIRTUE_POSITION_TP_DOLLARS; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS
