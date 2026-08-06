@@ -963,26 +963,26 @@ def test_is_entry_pipeline_clear_layer1_cycle_lock() -> None:
 
 
 def test_check_virtue_pnl_lock_trailing_floor() -> None:
-    """Peak >= $150 arms 60% floor; breach latches day shut-down."""
+    """Peak >= $100 arms hard $25 floor; breach latches circuit breaker."""
     from main import VirtueSession, check_virtue_pnl_lock, _credit_realized_pnl
-    from engine.config import VIRTUE_PNL_LOCK_ARM_PEAK, VIRTUE_PNL_LOCK_FLOOR_FRAC
+    from engine.config import VIRTUE_PNL_LOCK_ARM_PEAK, VIRTUE_PNL_LOCK_HARD_FLOOR
 
     s = VirtueSession()
     assert check_virtue_pnl_lock(s) is False
 
-    s.realized_pnl_today = 149.0
-    s.peak_realized_pnl_today = 149.0
-    assert check_virtue_pnl_lock(s) is False
+    s.realized_pnl_today = 99.0
+    s.peak_realized_pnl_today = 99.0
+    assert check_virtue_pnl_lock(s) is False  # not armed yet
 
-    s.realized_pnl_today = 200.0
-    assert check_virtue_pnl_lock(s) is False  # armed but above floor
-    assert s.peak_realized_pnl_today == 200.0
-    floor = 200.0 * float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
-    assert floor == 120.0
+    s.realized_pnl_today = 104.0
+    s.peak_realized_pnl_today = 104.0
+    assert check_virtue_pnl_lock(s) is False  # armed but above $25 floor
+    assert float(VIRTUE_PNL_LOCK_HARD_FLOOR) == 25.0
 
-    s.realized_pnl_today = 120.0
+    s.realized_pnl_today = 25.0
     assert check_virtue_pnl_lock(s) is True
     assert s.virtue_pnl_lock_active is True
+    assert s.circuit_breaker_tripped is True
     assert s.last_regime == "CHOP_NO_TRADE"
 
     # Latched — stays locked even if PnL recovers (Justice: no silent unlock)
@@ -993,7 +993,7 @@ def test_check_virtue_pnl_lock_trailing_floor() -> None:
     s2 = VirtueSession()
     _credit_realized_pnl(s2, 160.0)
     assert s2.peak_realized_pnl_today == 160.0
-    assert float(VIRTUE_PNL_LOCK_ARM_PEAK) == 150.0
+    assert float(VIRTUE_PNL_LOCK_ARM_PEAK) == 100.0
 
 
 def test_check_time_decay_exit_stagnant_hold() -> None:
@@ -1140,16 +1140,17 @@ def test_macromathics_core_production_phases() -> None:
     )
 
     assert int(MAX_STAGNATION_CYCLES) == 36
-    assert float(PROFIT_GUARD_THRESHOLD) == 150.0
+    assert float(PROFIT_GUARD_THRESHOLD) == 100.0
     assert int(VIRTUE_TIME_DECAY_COOLDOWN_CYCLES) == 8
 
-    state = {"realized_pnl_today": 200.0, "peak_realized_pnl_today": 200.0}
+    state = {"realized_pnl_today": 104.0, "peak_realized_pnl_today": 104.0}
     hit, floor = phase1_profit_guard_triggered(state)
     assert hit is False
-    assert floor == 120.0
-    state["realized_pnl_today"] = 120.0
+    assert floor == 25.0
+    state["realized_pnl_today"] = 25.0
     hit, floor = phase1_profit_guard_triggered(state)
     assert hit is True
+    assert state.get("circuit_breaker_tripped") is True
 
     # Green open_pnl never time-decays; flat/red after 36 cycles does.
     td_green = {"engine_exposure": "LONG", "entry_cycle_marker": 1, "open_pnl": 10.0}
@@ -1643,9 +1644,13 @@ def test_multi_sleeve_order_router() -> None:
         )
         assert ok is True
         assert detail == "tactical_closed"
-        assert pnl == 12.5
+        # Sleeve entry 5421 → exit 5425: LONG 4pts * $5 = $20 (not broker spy 12.5)
+        assert pnl == 20.0
         assert s.broker.calls[0][0] == "close_contracts"
         assert s.broker.calls[0][1]["contracts"] == 1
+        assert float(s.broker.calls[0][1].get("entry_price") or 0) == 5421.0
+        assert str(s.broker.calls[0][1].get("sleeve") or "") == "tac"
+        assert "tac:" in str(s.broker.calls[0][1].get("reason") or "")
         assert s.broker.net_exposure() == ("LONG", 1)  # core remains
         assert s.core_active is True and s.core_size == 1
 
@@ -1833,6 +1838,98 @@ def test_dual_sleeve_unified_rules() -> None:
     assert st["dual_sleeve"]["core_anchor_sleeve"]["side"] == "LONG"
 
 
+def test_core_invalidation_cooldown_and_tp() -> None:
+    """Invalidation arms 20m cooldown; ADX breakout can clear; core TP at $75."""
+    from engine.config import POINT_VALUE, VIRTUE_CORE_TP_DOLLARS
+    from engine.dual_sleeve import (
+        STRUCTURAL_BEAR,
+        STRUCTURAL_BULL,
+        arm_core_invalidation_cooldown,
+        core_reentry_allowed,
+        core_tp_hit,
+    )
+    from main import VirtueSession
+
+    assert float(VIRTUE_CORE_TP_DOLLARS) == 75.0
+    s = VirtueSession()
+    s.core_active = True
+    s.core_side = "SHORT"
+    s.core_size = 1
+    s.core_entry_price = 9600.0
+    # SHORT +15 pts * $5 = $75
+    assert core_tp_hit(s, 9585.0) is True
+    assert core_tp_hit(s, 9590.0) is False
+
+    arm_core_invalidation_cooldown(s, closed_side="SHORT")
+    assert float(s.core_reentry_blocked_until) > 0
+    ok, why = core_reentry_allowed(
+        s, side="SHORT", adx=20.0, structural_regime=STRUCTURAL_BEAR
+    )
+    assert ok is False
+    assert "cooldown" in why
+    ok, why = core_reentry_allowed(
+        s, side="SHORT", adx=30.0, structural_regime=STRUCTURAL_BEAR
+    )
+    assert ok is True
+    assert "adx_breakout" in why
+    # Bull open while cooldown for short still cleared after breakout path
+    arm_core_invalidation_cooldown(s, closed_side="LONG")
+    ok, _ = core_reentry_allowed(
+        s, side="LONG", adx=30.0, structural_regime=STRUCTURAL_BULL
+    )
+    assert ok is True
+    assert POINT_VALUE == 5.0
+
+
+def test_pipeline_stuck_alert_debounce() -> None:
+    """Depth > 100 for 30s fires CRITICAL once then force-rebases absurd depth."""
+    from main import VirtueSession, _check_pipeline_stuck_alert, _pipeline_queue_depth
+    import time
+
+    s = VirtueSession()
+    s.cycle = 1
+    s.pipeline_resume_cycle = 5000
+    assert _pipeline_queue_depth(s) > 100
+    s.pipeline_stuck_since = time.time() - 35.0
+    s.pipeline_stuck_alerted = False
+    _check_pipeline_stuck_alert(s)
+    assert s.pipeline_stuck_alerted is True
+    # Force rebase should shrink residual
+    assert int(s.pipeline_resume_cycle) < 100
+
+
+def test_sleeve_pnl_uses_sleeve_entry_not_broker_avg() -> None:
+    """Dual SHORT close credits tactical from tactical entry, not blended avg."""
+    from broker import VirtueBroker
+    import asyncio
+
+    async def _run() -> None:
+        b = VirtueBroker()
+        b.open_positions = [
+            {
+                "direction": "SHORT",
+                "size": 2,
+                "price": 9620.0,
+                "entry_price": 9620.0,
+            }
+        ]
+        # Tactical entered better (9615); sleeve entry must win over blended 9620.
+        ok, pnl = await b.close_contracts(
+            contracts=1,
+            price=9610.0,
+            stop_ticks=30,
+            reason="tac:time_decay",
+            entry_price=9615.0,
+            sleeve="tac",
+        )
+        assert ok is True
+        # SHORT: (9615 - 9610) * 5 * 1 = 25
+        assert abs(float(pnl) - 25.0) < 0.01
+        assert b.net_exposure()[1] == 1
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -1892,5 +1989,8 @@ if __name__ == "__main__":
     test_anti_churn_temperance_gates()
     test_entry_structure_atr_adx_spread_gates()
     test_sleeve_reconcile_repairs_desync()
+    test_core_invalidation_cooldown_and_tp()
+    test_pipeline_stuck_alert_debounce()
+    test_sleeve_pnl_uses_sleeve_entry_not_broker_avg()
     print("ALL VIRTUE BRAIN TESTS PASSED")
 

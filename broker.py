@@ -851,7 +851,11 @@ class VirtueBroker:
             logger.error("FLATTEN_NO_FILL_CONFIRM status=%s detail=%s", result.status, result.detail)
             return False, 0.0
 
-        fill = float(result.fill_price or price)
+        fill = float(
+            getattr(result, "fills_price", None)
+            or getattr(result, "fill_price", None)
+            or price
+        )
         points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
         approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
         logger.info(
@@ -897,6 +901,8 @@ class VirtueBroker:
         price: float,
         stop_ticks: int,
         reason: str = "sleeve_close",
+        entry_price: float | None = None,
+        sleeve: str = "",
     ) -> tuple[bool, float]:
         """
         Close exactly `contracts` of net exposure; leave any remainder untouched.
@@ -904,6 +910,9 @@ class VirtueBroker:
         Multi-sleeve router primitive — never a whole-account wipe. Prefer this
         over flatten_all for tactical/core exits so a satellite close cannot
         clear a structural runner.
+
+        When entry_price is provided, PnL uses that sleeve entry (Justice:
+        dual-sleeve closes must not credit blended net avg into the wrong book).
         """
         exposure_dir, exposure_size = self.net_exposure()
         qty = max(0, int(contracts))
@@ -916,6 +925,8 @@ class VirtueBroker:
             stop_ticks=stop_ticks,
             reason=reason,
             leave=leave,
+            entry_price=entry_price,
+            sleeve=sleeve,
         )
 
     async def flatten_all(
@@ -980,7 +991,11 @@ class VirtueBroker:
             logger.error("FLATTEN_ALL_NO_FILL status=%s detail=%s", result.status, result.detail)
             return False, 0.0
 
-        fill = float(result.fill_price or price)
+        fill = float(
+            getattr(result, "fills_price", None)
+            or getattr(result, "fill_price", None)
+            or price
+        )
         points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
         approx_pnl = round(points * POINT_VALUE * abs(exposure_size), 2)
         self.open_positions = []
@@ -1006,10 +1021,15 @@ class VirtueBroker:
         stop_ticks: int,
         reason: str = "take_profit_scale_out",
         leave: int = 1,
+        entry_price: float | None = None,
+        sleeve: str = "",
     ) -> tuple[bool, float]:
         """
         Close `contracts` of net exposure; leave `leave` contracts as a runner.
         Returns (ok, approx_realized_pnl on the closed size).
+
+        Prefer sleeve entry_price when provided so dual-sleeve books do not
+        leak blended broker avg into tactical/core PnL.
         """
         from engine.config import POINT_VALUE
 
@@ -1028,19 +1048,28 @@ class VirtueBroker:
             return True, 0.0
         close_qty = min(close_qty, exposure_size - leave_qty)
 
-        entry = self._avg_entry(exposure_dir) or float(price)
+        broker_avg = self._avg_entry(exposure_dir) or float(price)
+        try:
+            sleeve_entry = float(entry_price) if entry_price is not None else 0.0
+        except (TypeError, ValueError):
+            sleeve_entry = 0.0
+        entry = sleeve_entry if sleeve_entry > 0 else float(broker_avg)
         points = (float(price) - entry) if exposure_dir == "LONG" else (entry - float(price))
         approx_pnl = round(points * POINT_VALUE * close_qty, 2)
         flat_dir = _opposite(exposure_dir)
+        sleeve_tag = str(sleeve or "").strip().lower()
 
         logger.warning(
-            "PARTIAL_CLOSE reason=%s close %s x%s leave=%s @ %.2f entry≈%.2f pnl≈%.2f",
+            "PARTIAL_CLOSE reason=%s sleeve=%s close %s x%s leave=%s @ %.2f "
+            "entry≈%.2f broker_avg≈%.2f pnl≈%.2f",
             reason,
+            sleeve_tag or "-",
             exposure_dir,
             close_qty,
             leave_qty,
             price,
             entry,
+            broker_avg,
             approx_pnl,
         )
         order = Order(
@@ -1071,25 +1100,32 @@ class VirtueBroker:
             logger.error("PARTIAL_CLOSE_NO_FILL status=%s detail=%s", result.status, result.detail)
             return False, 0.0
 
-        fill = float(result.fill_price or price)
+        fill = float(
+            getattr(result, "fills_price", None)
+            or getattr(result, "fill_price", None)
+            or price
+        )
         points = (fill - entry) if exposure_dir == "LONG" else (entry - fill)
         approx_pnl = round(points * POINT_VALUE * close_qty, 2)
         remaining = exposure_size - close_qty
-        # Consolidate leftover into one runner row (keep original avg entry)
+        # Leftover book keeps broker avg (other sleeve), not the closed sleeve entry.
+        remain_entry = float(broker_avg)
         self.open_positions = [
             {
                 "direction": exposure_dir,
                 "size": remaining,
-                "price": entry,
-                "entry_price": entry,
+                "price": remain_entry,
+                "entry_price": remain_entry,
                 "order_id": str(result.order_id or ""),
                 "symbol": self._contract or EXECUTION_SYMBOL,
                 "source": "scale_out_runner",
                 "scaled_out_tp": True,
+                "sleeve": "residual",
             }
         ] if remaining > 0 else []
         logger.info(
-            "PARTIAL_CLOSE_CONFIRMED id=%s status=%s fill=%.2f closed=%s remain=%s pnl≈%.2f reason=%s",
+            "PARTIAL_CLOSE_CONFIRMED id=%s status=%s fill=%.2f closed=%s remain=%s "
+            "pnl≈%.2f reason=%s sleeve=%s",
             result.order_id,
             result.status,
             fill,
@@ -1097,6 +1133,7 @@ class VirtueBroker:
             remaining,
             approx_pnl,
             reason,
+            sleeve_tag or "-",
         )
         if forward_test_force_paper() and not webull_is_sandbox():
             return True, approx_pnl

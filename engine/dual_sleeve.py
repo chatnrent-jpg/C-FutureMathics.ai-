@@ -15,16 +15,24 @@ from __future__ import annotations
 
 from typing import Any
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 from engine.config import (
+    FORWARD_TEST_TIMEZONE,
     MAX_ACCOUNT_CONTRACT_CEILING,
+    POINT_VALUE,
     TICK_SIZE,
     TICK_VALUE,
     VIRTUE_CORE_CONFIRM_CYCLES,
     VIRTUE_CORE_INVALIDATION_BLEND_LONG,
+    VIRTUE_CORE_INVALIDATION_COOLDOWN_S,
     VIRTUE_CORE_MAX_ADVERSE_DOLLARS,
     VIRTUE_CORE_MAX_HOLD_CYCLES,
+    VIRTUE_CORE_REENTRY_ADX_MIN,
     VIRTUE_CORE_STRUCTURAL_ADX_MIN,
     VIRTUE_CORE_SIZE,
+    VIRTUE_CORE_TP_DOLLARS,
     VIRTUE_SCORE_LONG_ENTER,
     VIRTUE_SCORE_SHORT_ENTER,
 )
@@ -385,6 +393,13 @@ def build_dual_sleeve_state(session: Any, *, account_nav: float) -> dict[str, An
             "structural_invalidation_blend": float(
                 VIRTUE_CORE_INVALIDATION_BLEND_LONG
             ),
+            "tp_dollars": float(VIRTUE_CORE_TP_DOLLARS),
+            "reentry_blocked_until": float(
+                getattr(session, "core_reentry_blocked_until", 0.0) or 0.0
+            ),
+            "reentry_blocked_side": str(
+                getattr(session, "core_reentry_blocked_side", "FLAT") or "FLAT"
+            ),
             "realized_pnl_today": round(
                 float(getattr(session, "core_realized_pnl_today", 0.0) or 0.0), 2
             ),
@@ -431,3 +446,82 @@ def core_size_default() -> int:
 
 def structural_confirm_cycles() -> int:
     return max(1, int(VIRTUE_CORE_CONFIRM_CYCLES))
+
+
+def core_open_pnl_dollars(session: Any, price: float) -> float:
+    """Mark-to-market dollars for the active core sleeve only."""
+    if not bool(getattr(session, "core_active", False)):
+        return 0.0
+    side = str(getattr(session, "core_side", "FLAT") or "FLAT").upper()
+    entry = float(getattr(session, "core_entry_price", 0.0) or 0.0)
+    size = int(getattr(session, "core_size", 0) or 0)
+    if entry <= 0 or size <= 0 or side not in {"LONG", "SHORT"}:
+        return 0.0
+    pts = (float(price) - entry) if side == "LONG" else (entry - float(price))
+    return round(pts * float(POINT_VALUE) * size, 2)
+
+
+def core_tp_hit(session: Any, price: float, *, tp_dollars: float | None = None) -> bool:
+    """True when core open PnL reaches structural take-profit."""
+    target = float(
+        tp_dollars if tp_dollars is not None else VIRTUE_CORE_TP_DOLLARS
+    )
+    return core_open_pnl_dollars(session, price) >= target - 1e-9
+
+
+def arm_core_invalidation_cooldown(session: Any, *, closed_side: str) -> None:
+    """Start 20m core re-entry block after invalidation close."""
+    try:
+        now = datetime.now(ZoneInfo(FORWARD_TEST_TIMEZONE))
+    except Exception:
+        now = datetime.now(timezone.utc)
+    cool_s = max(0, int(VIRTUE_CORE_INVALIDATION_COOLDOWN_S))
+    until = now.timestamp() + float(cool_s)
+    session.core_reentry_blocked_until = float(until)
+    session.core_reentry_blocked_side = str(closed_side or "FLAT").upper()
+
+
+def core_reentry_allowed(
+    session: Any,
+    *,
+    side: str,
+    adx: float,
+    structural_regime: str,
+) -> tuple[bool, str]:
+    """
+    After invalidation, block new core entries until cooldown expires OR
+    ADX proves a directional breakout aligning with the desired side.
+    """
+    until = float(getattr(session, "core_reentry_blocked_until", 0.0) or 0.0)
+    if until <= 0:
+        return True, "core_reentry:ok"
+    try:
+        now_ts = datetime.now(ZoneInfo(FORWARD_TEST_TIMEZONE)).timestamp()
+    except Exception:
+        now_ts = datetime.now(timezone.utc).timestamp()
+    remaining = until - now_ts
+    if remaining <= 0:
+        session.core_reentry_blocked_until = 0.0
+        session.core_reentry_blocked_side = "FLAT"
+        return True, "core_reentry:cooldown_elapsed"
+
+    want = str(side or "FLAT").upper()
+    regime = str(structural_regime or STRUCTURAL_NEUTRAL).upper()
+    adx_val = float(adx or 0.0)
+    adx_ok = adx_val >= float(VIRTUE_CORE_REENTRY_ADX_MIN)
+    regime_ok = (
+        (want == "LONG" and regime == STRUCTURAL_BULL)
+        or (want == "SHORT" and regime == STRUCTURAL_BEAR)
+    )
+    if adx_ok and regime_ok:
+        session.core_reentry_blocked_until = 0.0
+        session.core_reentry_blocked_side = "FLAT"
+        return True, (
+            f"core_reentry:adx_breakout adx={adx_val:.1f}>="
+            f"{float(VIRTUE_CORE_REENTRY_ADX_MIN):.0f} regime={regime}"
+        )
+    return (
+        False,
+        f"core_reentry:cooldown remaining={remaining:.0f}s "
+        f"adx={adx_val:.1f} need>={float(VIRTUE_CORE_REENTRY_ADX_MIN):.0f}",
+    )

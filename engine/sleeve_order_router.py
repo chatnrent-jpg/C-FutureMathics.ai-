@@ -97,6 +97,8 @@ async def _dispatch_close_qty(
     price: float,
     stop_ticks: int,
     reason: str,
+    entry_price: float | None = None,
+    sleeve: str = "",
 ) -> tuple[bool, float]:
     """
     Close exactly `contracts` of broker net exposure.
@@ -112,6 +114,8 @@ async def _dispatch_close_qty(
                 price=price,
                 stop_ticks=stop_ticks,
                 reason=reason,
+                entry_price=entry_price,
+                sleeve=sleeve,
             )
         # Legacy fallback — leave = net - qty (still not flatten_all).
         net_dir, net_sz = broker.net_exposure()
@@ -124,6 +128,8 @@ async def _dispatch_close_qty(
             stop_ticks=stop_ticks,
             reason=reason,
             leave=leave,
+            entry_price=entry_price,
+            sleeve=sleeve,
         )
     except Exception as exc:
         log.exception("sleeve_dispatch_close_failed err=%s reason=%s", exc, reason)
@@ -163,14 +169,17 @@ async def execute_tactical_action(
             return True, 0.0, "tactical_already_flat"
         tac_side = b["tactical_side"]
         tac_size = int(b["tactical_size"])
+        tac_entry = float(getattr(session, "tactical_entry_price", 0.0) or 0.0)
         order_side = "SELL" if tac_side == "LONG" else "BUY"
+        tagged_reason = f"tac:{reason}" if not str(reason).startswith("tac:") else reason
         log.info(
             "ROUTER tactical_close dispatch=%s qty=%s leave_core=%s reason=%s "
-            "net_exposure=%s",
+            "entry=%.2f net_exposure=%s",
             order_side,
             tac_size,
             int(b["core_size"]) if b["core_active"] else 0,
-            reason,
+            tagged_reason,
+            tac_entry,
             net_exposure,
         )
         ok, pnl = await _dispatch_close_qty(
@@ -178,13 +187,43 @@ async def execute_tactical_action(
             contracts=tac_size,
             price=price,
             stop_ticks=stop_ticks,
-            reason=reason,
+            reason=tagged_reason,
+            entry_price=tac_entry if tac_entry > 0 else None,
+            sleeve="tac",
         )
         if ok:
+            # Justice: recompute from sleeve entry + mark if broker blended avg leaked.
+            if tac_entry > 0 and tac_side in {"LONG", "SHORT"}:
+                from engine.config import POINT_VALUE
+
+                pts = (
+                    (float(price) - tac_entry)
+                    if tac_side == "LONG"
+                    else (tac_entry - float(price))
+                )
+                sleeve_pnl = round(pts * float(POINT_VALUE) * tac_size, 2)
+                if abs(sleeve_pnl - float(pnl or 0.0)) > 0.01:
+                    log.info(
+                        "ROUTER tactical_pnl_sleeve_override broker=%.2f sleeve=%.2f "
+                        "entry=%.2f",
+                        float(pnl or 0.0),
+                        sleeve_pnl,
+                        tac_entry,
+                    )
+                    pnl = sleeve_pnl
             if mark_flat is not None:
                 mark_flat(session)
             if on_filled is not None:
-                on_filled(session, pnl=pnl, reason=reason, side="FLAT")
+                on_filled(
+                    session,
+                    pnl=pnl,
+                    reason=tagged_reason,
+                    side="FLAT",
+                    entry_price=tac_entry,
+                    exit_price=float(price),
+                    contracts=tac_size,
+                    direction=tac_side,
+                )
             return True, float(pnl or 0.0), "tactical_closed"
         return False, 0.0, "tactical_close_failed"
 
@@ -307,24 +346,59 @@ async def execute_core_action(
         if not b["core_active"] or int(b["core_size"]) <= 0:
             return True, 0.0, "core_already_flat"
         core_sz = int(b["core_size"])
+        core_side = str(b["core_side"] or "FLAT").upper()
+        core_entry = float(getattr(session, "core_entry_price", 0.0) or 0.0)
+        tagged_reason = (
+            f"core:{reason}" if not str(reason).startswith("core:") else reason
+        )
         log.info(
-            "ROUTER core_close qty=%s leave_tactical=%s reason=%s",
+            "ROUTER core_close qty=%s leave_tactical=%s reason=%s entry=%.2f",
             core_sz,
             int(b["tactical_size"]) if b["tactical_active"] else 0,
-            reason,
+            tagged_reason,
+            core_entry,
         )
         ok, pnl = await _dispatch_close_qty(
             broker,
             contracts=core_sz,
             price=price,
             stop_ticks=stop_ticks,
-            reason=reason,
+            reason=tagged_reason,
+            entry_price=core_entry if core_entry > 0 else None,
+            sleeve="core",
         )
         if ok:
+            if core_entry > 0 and core_side in {"LONG", "SHORT"}:
+                from engine.config import POINT_VALUE
+
+                pts = (
+                    (float(price) - core_entry)
+                    if core_side == "LONG"
+                    else (core_entry - float(price))
+                )
+                sleeve_pnl = round(pts * float(POINT_VALUE) * core_sz, 2)
+                if abs(sleeve_pnl - float(pnl or 0.0)) > 0.01:
+                    log.info(
+                        "ROUTER core_pnl_sleeve_override broker=%.2f sleeve=%.2f "
+                        "entry=%.2f",
+                        float(pnl or 0.0),
+                        sleeve_pnl,
+                        core_entry,
+                    )
+                    pnl = sleeve_pnl
             if mark_flat is not None:
                 mark_flat(session)
             if on_filled is not None:
-                on_filled(session, pnl=pnl, reason=reason, side="FLAT")
+                on_filled(
+                    session,
+                    pnl=pnl,
+                    reason=tagged_reason,
+                    side="FLAT",
+                    entry_price=core_entry,
+                    exit_price=float(price),
+                    contracts=core_sz,
+                    direction=core_side,
+                )
             return True, float(pnl or 0.0), "core_closed"
         return False, 0.0, "core_close_failed"
 

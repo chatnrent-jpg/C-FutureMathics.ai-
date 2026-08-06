@@ -39,9 +39,12 @@ if str(ROOT) not in sys.path:
 
 from broker import NETWORK_TIMEOUT_S, Order, SizeResult, VirtueBroker
 from engine.dual_sleeve import (
+    arm_core_invalidation_cooldown,
     classify_structural_regime,
+    core_reentry_allowed,
     core_should_open,
     core_size_default,
+    core_tp_hit,
     evaluate_core_macro_safety,
     reconcile_sleeves_to_broker,
     structural_confirm_cycles,
@@ -68,6 +71,7 @@ from engine.entry_structure import (
 from engine.observability import (
     notify_core_macro_invalidation,
     notify_course_correct,
+    notify_pipeline_stuck,
     notify_position_opened,
     notify_profit_guard,
     notify_time_decay,
@@ -82,7 +86,12 @@ from engine.config import (
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    VIRTUE_CORE_MAX_HOLD_CYCLES,
+    VIRTUE_CORE_TP_DOLLARS,
+    VIRTUE_PIPELINE_STUCK_ALERT_S,
+    VIRTUE_PIPELINE_STUCK_DEPTH,
     VIRTUE_PNL_LOCK_ARM_PEAK,
+    VIRTUE_PNL_LOCK_HARD_FLOOR,
     VIRTUE_PNL_LOCK_FLOOR_FRAC,
     VIRTUE_ANCHOR_DIVERGENCE_ATR_MULT,
     VIRTUE_FORCE_EVENT_MAX_S,
@@ -185,6 +194,7 @@ class VirtueSession:
     realized_pnl_today: float = 0.0
     peak_realized_pnl_today: float = 0.0  # high-water mark for trailing profit lock
     virtue_pnl_lock_active: bool = False  # day shut down after trailing floor breach
+    circuit_breaker_tripped: bool = False  # alias latch for peak-lock day halt
     trades_today: int = 0
     session_date_et: str = ""  # YYYY-MM-DD America/New_York — Temperance day bucket
     last_risk_verdict: str = ""
@@ -209,6 +219,8 @@ class VirtueSession:
     anchors_aligned: bool = False
     entry_cooldown_cycles: int = 0  # skip new entries after anchor rebase (non-trade)
     pipeline_resume_cycle: int = 0  # absolute engine cycle when entries may resume
+    pipeline_stuck_since: float = 0.0  # unix ts when depth first exceeded stuck threshold
+    pipeline_stuck_alerted: bool = False  # debounce CRITICAL webhook
     layer1_streak_clear: bool = True  # entry_pipeline Layer-1 readiness flag
     entry_cycle_marker: int | None = None  # engine cycle when current exposure opened
     consecutive_tp_streak: int = 0  # Temperance: cool re-entry after multi-TP runs
@@ -234,6 +246,8 @@ class VirtueSession:
     core_size: int = 0
     core_entry_price: float = 0.0
     core_entry_cycle: int | None = None
+    core_reentry_blocked_until: float = 0.0  # unix ts — invalidation hysteresis
+    core_reentry_blocked_side: str = "FLAT"
     last_price: float = 0.0  # last accepted quote (core adverse failsafe)
     core_realized_pnl_today: float = 0.0
     core_realized_pnl_this_cycle: float = 0.0
@@ -296,13 +310,16 @@ def check_virtue_pnl_lock(
         return hit
 
     # Already latched for the day — stay locked (Justice: no silent unlock).
-    if bool(session.virtue_pnl_lock_active):
+    if bool(session.virtue_pnl_lock_active) or bool(session.circuit_breaker_tripped):
+        session.virtue_pnl_lock_active = True
+        session.circuit_breaker_tripped = True
         return True
 
     state = {
         "realized_pnl_today": float(session.realized_pnl_today or 0.0),
         "peak_realized_pnl_today": float(session.peak_realized_pnl_today or 0.0),
         "virtue_pnl_lock_active": bool(session.virtue_pnl_lock_active),
+        "circuit_breaker_tripped": bool(session.circuit_breaker_tripped),
     }
     hit, floor_lock = phase1_profit_guard_triggered(state)
     session.peak_realized_pnl_today = float(
@@ -310,6 +327,7 @@ def check_virtue_pnl_lock(
     )
     if hit:
         session.virtue_pnl_lock_active = True
+        session.circuit_breaker_tripped = True
         session.last_regime = "CHOP_NO_TRADE"
         session.last_signal_reason = (
             f"virtue_pnl_lock peak={session.peak_realized_pnl_today:.2f} "
@@ -317,7 +335,7 @@ def check_virtue_pnl_lock(
         )
         logger.error(
             "VIRTUE_PNL_LOCK triggered peak=%.2f floor=%.2f realized=%.2f — "
-            "day shut down (Temperance)",
+            "circuit_breaker_tripped (Temperance)",
             session.peak_realized_pnl_today,
             floor_lock,
             session.realized_pnl_today,
@@ -831,6 +849,11 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     session.realized_pnl_today = 0.0
     session.peak_realized_pnl_today = 0.0
     session.virtue_pnl_lock_active = False
+    session.circuit_breaker_tripped = False
+    session.core_reentry_blocked_until = 0.0
+    session.core_reentry_blocked_side = "FLAT"
+    session.pipeline_stuck_since = 0.0
+    session.pipeline_stuck_alerted = False
     session.trades_today = 0
     session.consecutive_tp_streak = 0
     session.last_tp_timestamp = 0.0
@@ -1206,8 +1229,79 @@ def _credit_tactical_pnl(session: VirtueSession, pnl: float) -> None:
     _credit_realized_pnl(session, delta)
 
 
+def _persist_virtue_trade(
+    session: VirtueSession,
+    *,
+    sleeve: str,
+    direction: str,
+    contracts: int,
+    entry_price: float,
+    exit_price: float,
+    pnl: float,
+    reason: str,
+) -> None:
+    """Best-effort SQLite insert for dual-sleeve fills (Justice: never drop silently)."""
+    try:
+        from engine.trade_history import TradeHistoryDB, TradeRecord
+        import uuid
+
+        sleeve_tag = str(sleeve or "UNK").upper()
+        trade_id = f"{sleeve_tag}-{uuid.uuid4().hex[:12].upper()}"
+        pos_id = f"POS-{sleeve_tag}-{int(session.cycle)}"
+        risk = abs(float(VIRTUE_POSITION_STOP_DOLLARS))
+        reward = abs(
+            float(VIRTUE_CORE_TP_DOLLARS)
+            if sleeve_tag == "CORE"
+            else float(VIRTUE_POSITION_TP_DOLLARS)
+        )
+        r_mult = (float(pnl) / risk) if risk > 1e-9 else 0.0
+        nav = float(getattr(session.broker, "equity", 0.0) or 0.0)
+        TradeHistoryDB().insert_trade(
+            TradeRecord(
+                trade_id=trade_id,
+                position_id=pos_id,
+                symbol=str(EXECUTION_SYMBOL),
+                direction=str(direction or "FLAT").upper(),
+                contracts=max(1, int(contracts or 1)),
+                entry_price=float(entry_price or 0.0),
+                exit_price=float(exit_price or 0.0),
+                stop_price=0.0,
+                target_price=0.0,
+                entry_time=datetime.now(_ET).isoformat(),
+                exit_time=datetime.now(_ET).isoformat(),
+                duration_seconds=0.0,
+                realized_pnl=float(pnl or 0.0),
+                risk_amount=float(risk),
+                reward_amount=float(reward),
+                r_multiple=float(r_mult),
+                exit_reason=str(reason or "unknown"),
+                nav_at_entry=nav,
+                nav_at_exit=nav,
+                daily_pnl_before=float(session.realized_pnl_today or 0.0),
+                session_date=str(session.session_date_et or et_session_date()),
+                cycle_number=int(session.cycle),
+            )
+        )
+    except Exception:
+        logger.exception(
+            "virtue_trade_history_insert_failed sleeve=%s reason=%s pnl=%.2f",
+            sleeve,
+            reason,
+            float(pnl or 0.0),
+        )
+
+
 def _on_tactical_router_close(
-    session: VirtueSession, *, pnl: float, reason: str, side: str, **_: Any
+    session: VirtueSession,
+    *,
+    pnl: float,
+    reason: str,
+    side: str,
+    entry_price: float = 0.0,
+    exit_price: float = 0.0,
+    contracts: int = 1,
+    direction: str = "",
+    **_: Any,
 ) -> None:
     _credit_tactical_pnl(session, pnl)
     update_outcome_state(
@@ -1215,11 +1309,31 @@ def _on_tactical_router_close(
     )
     session.long_streak = 0
     session.short_streak = 0
+    _persist_virtue_trade(
+        session,
+        sleeve="TAC",
+        direction=direction or str(getattr(session, "tactical_side", "") or side),
+        contracts=int(contracts or 1),
+        entry_price=float(entry_price or 0.0),
+        exit_price=float(exit_price or 0.0),
+        pnl=float(pnl or 0.0),
+        reason=str(reason or "tactical_close"),
+    )
 
 
 def _on_core_router_close(
-    session: VirtueSession, *, pnl: float, reason: str, side: str, **_: Any
+    session: VirtueSession,
+    *,
+    pnl: float,
+    reason: str,
+    side: str,
+    entry_price: float = 0.0,
+    exit_price: float = 0.0,
+    contracts: int = 1,
+    direction: str = "",
+    **_: Any,
 ) -> None:
+    prior_side = str(direction or getattr(session, "core_side", "") or "FLAT")
     _credit_core_pnl(session, pnl)
     logger.warning(
         "CYCLE %s CORE_SLEEVE_CLOSED reason=%s pnl≈%.2f — temperance untouched "
@@ -1229,8 +1343,21 @@ def _on_core_router_close(
         pnl,
         calculate_net_account_exposure(session),
     )
+    reason_s = str(reason or "")
+    if "core_invalidation" in reason_s:
+        arm_core_invalidation_cooldown(session, closed_side=prior_side)
+    _persist_virtue_trade(
+        session,
+        sleeve="CORE",
+        direction=prior_side,
+        contracts=int(contracts or 1),
+        entry_price=float(entry_price or 0.0),
+        exit_price=float(exit_price or 0.0),
+        pnl=float(pnl or 0.0),
+        reason=reason_s or "core_close",
+    )
     # Macro invalidation gets a dedicated portfolio advisory from the escaper.
-    if str(reason or "").startswith("core_invalidation"):
+    if "core_invalidation" in reason_s:
         return
     notify_trade_closed(
         reason=reason, pnl=float(pnl), cooldown_cycles=0, cycle=session.cycle
@@ -1315,6 +1442,30 @@ async def _manage_core_sleeve(
     session.macro_structural_regime = regime
     session.core_realized_pnl_this_cycle = 0.0
 
+    # Temperance: circuit breaker — manage/exit only, no new core.
+    if bool(session.circuit_breaker_tripped) or bool(session.virtue_pnl_lock_active):
+        if bool(session.core_active) and int(session.core_size) > 0:
+            # Still allow structural/TP exits while locked? Peak lock flattens
+            # elsewhere; here skip new opens only.
+            pass
+        else:
+            return
+
+    # Core take-profit — bank structural premium before invalidation churn.
+    if bool(session.core_active) and core_tp_hit(session, price):
+        logger.info(
+            "CYCLE %s CORE_TAKE_PROFIT hit target=$%.0f — closing core anchor",
+            session.cycle,
+            float(VIRTUE_CORE_TP_DOLLARS),
+        )
+        await _close_core_sleeve(
+            session,
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=f"core_take_profit_${float(VIRTUE_CORE_TP_DOLLARS):.0f}",
+        )
+        return
+
     # Slow Invalidation — sticky through NEUTRAL; exit only hard flip / deep breakdown.
     inv, inv_reason = evaluate_core_macro_safety(
         session,
@@ -1347,6 +1498,9 @@ async def _manage_core_sleeve(
             )
         return
 
+    if bool(session.circuit_breaker_tripped) or bool(session.virtue_pnl_lock_active):
+        return
+
     open_ok, side = core_should_open(regime, core_active=bool(session.core_active))
     if not open_ok:
         return
@@ -1364,6 +1518,19 @@ async def _manage_core_sleeve(
             "CYCLE %s CORE_OPEN_BLOCKED %s",
             session.cycle,
             session.last_structure_reason,
+        )
+        return
+    reentry_ok, reentry_why = core_reentry_allowed(
+        session,
+        side=side,
+        adx=float(adx),
+        structural_regime=str(regime),
+    )
+    if not reentry_ok:
+        logger.info(
+            "CYCLE %s CORE_OPEN_BLOCKED %s",
+            session.cycle,
+            reentry_why,
         )
         return
     # Room under ceiling for core size.
@@ -1883,6 +2050,46 @@ async def _rth_gate_or_flatten(
     return False
 
 
+def _pipeline_queue_depth(session: VirtueSession) -> int:
+    resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
+    cur = int(getattr(session, "cycle", 0) or 0)
+    if resume <= 0 or cur >= resume:
+        return 0
+    return max(0, resume - cur)
+
+
+def _check_pipeline_stuck_alert(session: VirtueSession) -> None:
+    """
+    Post-boot health: if pipeline depth > 100 for >= 30s, fire CRITICAL alert once.
+    """
+    depth = _pipeline_queue_depth(session)
+    now = time.time()
+    threshold = int(VIRTUE_PIPELINE_STUCK_DEPTH)
+    alert_s = float(VIRTUE_PIPELINE_STUCK_ALERT_S)
+    if depth > threshold:
+        if float(session.pipeline_stuck_since or 0.0) <= 0:
+            session.pipeline_stuck_since = now
+        stuck_for = now - float(session.pipeline_stuck_since)
+        if stuck_for >= alert_s and not bool(session.pipeline_stuck_alerted):
+            session.pipeline_stuck_alerted = True
+            notify_pipeline_stuck(depth=depth, seconds=stuck_for)
+            # Belt-and-suspenders: rebase again if absurd residual after boot.
+            from engine.macromathics_core import cooldown_cycles_for_reason
+
+            cool = max(
+                0, int(cooldown_cycles_for_reason(session.last_reason or "time_decay"))
+            )
+            if depth > max(cool * 2, threshold):
+                session.pipeline_resume_cycle = int(session.cycle) + cool
+                logger.error(
+                    "PIPELINE_STUCK_FORCE_REBASE depth=%s → resume=%s",
+                    depth,
+                    session.pipeline_resume_cycle,
+                )
+    else:
+        session.pipeline_stuck_since = 0.0
+
+
 async def run_cycle(
     session: VirtueSession,
     *,
@@ -1894,6 +2101,7 @@ async def run_cycle(
     session.cycle += 1
     # Temperance: new ET calendar day → clear yesterday's PnL/trade counters (Justice).
     roll_daily_counters_if_needed(session)
+    _check_pipeline_stuck_alert(session)
     # Tick post-rebase entry cooldown every cycle (even while holding).
     cooldown_blocks_entry = session.entry_cooldown_cycles > 0
     if session.entry_cooldown_cycles > 0:
@@ -2253,6 +2461,19 @@ async def run_cycle(
     # PHASE 1 — FINANCIAL PROTECTION (Profit Guard / Virtue Balance)
     # ============================================================
     if check_virtue_pnl_lock(session):
+        session.circuit_breaker_tripped = True
+        session.virtue_pnl_lock_active = True
+        # Cancel any pending live order lock so flatten can proceed.
+        try:
+            if getattr(session.broker, "_pending_live_order_id", ""):
+                session.broker._pending_live_order_id = ""
+                session.broker._pending_live_order_at = 0.0
+                logger.warning(
+                    "CYCLE %s circuit_breaker cleared pending_live_order for flatten",
+                    session.cycle,
+                )
+        except Exception:
+            logger.exception("circuit_breaker_pending_clear_failed")
         net_dir_vl, net_size_vl = session.broker.net_exposure()
         if net_size_vl > 0 or absolute_contract_footprint(session) > 0:
             try:
@@ -2261,7 +2482,7 @@ async def run_cycle(
                     session,
                     price=price,
                     stop_ticks=stop_ticks,
-                    reason="virtue_pnl_lock",
+                    reason="session_close_flatten:virtue_pnl_lock",
                     close_tactical=_close_tactical_sleeve,
                     close_core=_close_core_sleeve,
                     credit_residual=_credit_realized_pnl,
@@ -2273,13 +2494,15 @@ async def run_cycle(
             if ok:
                 logger.warning(
                     "CYCLE %s VIRTUE_PNL_LOCK_FLAT sleeves_closed prior=%s x%s "
-                    "pnl≈%.2f peak=%.2f realized=%.2f",
+                    "pnl≈%.2f peak=%.2f realized=%.2f floor=%.2f "
+                    "circuit_breaker_tripped=True",
                     session.cycle,
                     net_dir_vl,
                     net_size_vl,
                     pnl,
                     session.peak_realized_pnl_today,
                     session.realized_pnl_today,
+                    float(VIRTUE_PNL_LOCK_HARD_FLOOR),
                 )
             else:
                 logger.error(
@@ -2588,16 +2811,20 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Temperance: Virtue Balance trailing lock — preserve green-day floor.
-    if check_virtue_pnl_lock(session):
-        floor = float(session.peak_realized_pnl_today) * float(VIRTUE_PNL_LOCK_FLOOR_FRAC)
+    # Temperance: Virtue Balance hard floor + circuit breaker — no new entries.
+    if (
+        bool(session.circuit_breaker_tripped)
+        or bool(session.virtue_pnl_lock_active)
+        or check_virtue_pnl_lock(session)
+    ):
         logger.info(
-            "CYCLE %s virtue_pnl_lock Active peak=%.2f floor=%.2f realized=%.2f — "
-            "no new entries (day shut down)",
+            "CYCLE %s virtue_pnl_lock Active peak=%.2f floor=%.2f realized=%.2f "
+            "circuit_breaker=%s — no new entries (day shut down)",
             session.cycle,
             session.peak_realized_pnl_today,
-            floor,
+            float(VIRTUE_PNL_LOCK_HARD_FLOOR),
             session.realized_pnl_today,
+            bool(session.circuit_breaker_tripped),
         )
         session.last_action = "FLAT"
         return
@@ -3170,6 +3397,21 @@ async def run_loop(
             session.tactical_size if session.tactical_active else 0,
             session.macro_structural_regime,
         )
+    # Force-disable core time expiry (Temperance — hold sleeve is structural).
+    if int(VIRTUE_CORE_MAX_HOLD_CYCLES) != 0:
+        logger.error(
+            "BOOT CORE_MAX_HOLD_NONZERO value=%s — forcing 0 (structure/adverse only)",
+            int(VIRTUE_CORE_MAX_HOLD_CYCLES),
+        )
+        try:
+            import engine.config as _cfg
+
+            _cfg.VIRTUE_CORE_MAX_HOLD_CYCLES = 0
+        except Exception:
+            logger.exception("BOOT CORE_MAX_HOLD force-zero failed")
+    else:
+        logger.info("BOOT CORE_MAX_HOLD_DISABLED cycles=0 (structure/adverse/$ TP only)")
+
     # Absolute pipeline_resume from a prior process is meaningless after cycle→0.
     # Rebase to a short Temperance cool-off so deploy cannot lock the day forever.
     prior_resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
@@ -3178,9 +3420,23 @@ async def run_loop(
 
         cool = max(0, int(cooldown_cycles_for_reason(session.last_reason or "time_decay")))
         session.pipeline_resume_cycle = cool
+        session.pipeline_stuck_since = 0.0
+        session.pipeline_stuck_alerted = False
         logger.info(
             "BOOT pipeline_resume_rebased prior=%s → resume=%s (cycle reset)",
             prior_resume,
+            cool,
+        )
+    # Belt-and-suspenders: absurd residual depth at boot even after rebase.
+    boot_depth = _pipeline_queue_depth(session)
+    if boot_depth > int(VIRTUE_PIPELINE_STUCK_DEPTH) and int(session.cycle) == 0:
+        from engine.macromathics_core import cooldown_cycles_for_reason
+
+        cool = max(0, int(cooldown_cycles_for_reason(session.last_reason or "time_decay")))
+        session.pipeline_resume_cycle = cool
+        logger.error(
+            "BOOT pipeline_resume_force_clear absurd_depth=%s → resume=%s",
+            boot_depth,
             cool,
         )
 
@@ -3196,6 +3452,17 @@ async def run_loop(
         )
         session.virtue_pnl_lock_active = bool(
             day_bucket.get("virtue_pnl_lock_active") or False
+        )
+        session.circuit_breaker_tripped = bool(
+            day_bucket.get("circuit_breaker_tripped")
+            or day_bucket.get("virtue_pnl_lock_active")
+            or False
+        )
+        session.core_reentry_blocked_until = float(
+            day_bucket.get("core_reentry_blocked_until") or 0.0
+        )
+        session.core_reentry_blocked_side = str(
+            day_bucket.get("core_reentry_blocked_side") or "FLAT"
         )
         session.trades_today = int(day_bucket["trades_today"])
         session.consecutive_tp_streak = int(day_bucket.get("consecutive_tp_streak") or 0)

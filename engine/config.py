@@ -104,6 +104,13 @@ VIRTUE_CORE_INVALIDATION_BLEND_SHORT = 60.0  # == 100 - LONG depth (legacy alias
 VIRTUE_CORE_MAX_ADVERSE_DOLLARS = 150.0
 # 0 = disabled. Core is the HOLD sleeve — exit on structure/adverse $, not a short timer.
 VIRTUE_CORE_MAX_HOLD_CYCLES = 0
+# After core_invalidation close: block re-entry for this many seconds (hysteresis).
+VIRTUE_CORE_INVALIDATION_COOLDOWN_S = 1200  # 20 minutes
+# Early clear of invalidation cooldown when ADX proves a structural breakout.
+VIRTUE_CORE_REENTRY_ADX_MIN = 28.0
+# Core take-profit — bank structural premium before flip/invalidation whipsaws.
+# Slightly tighter than tactical $100 so 1 MES proxy noise can still reach target.
+VIRTUE_CORE_TP_DOLLARS = 75.0
 
 # Live — aligned to $15k / 2 MES profile
 LIVE_RISK_NAV_CAP = 15_000.0
@@ -158,11 +165,17 @@ GRADE_CONTRACTS = 2  # align with paper max (scale-out runner profile)
 GRADE_HARD_STOP_TICKS = 200
 GRADE_CYCLE_INTERVAL_S = 30.0  # poll VolumeWatch + MES frequently
 GRADE_DAILY_PROFIT_LOCK = 500.0  # ~3.3% of $15k — day done; no new entries (Temperance)
-# Virtue Balance / Profit Guard trailing lock (Temperance).
-PROFIT_GUARD_THRESHOLD = 150.0  # start locking gains at this peak realized PnL
-PROFIT_GUARD_RETAIN_PCT = 0.60  # retain 60% of peak; breach → day shut down
-VIRTUE_PNL_LOCK_ARM_PEAK = PROFIT_GUARD_THRESHOLD
-VIRTUE_PNL_LOCK_FLOOR_FRAC = PROFIT_GUARD_RETAIN_PCT
+# Virtue Balance / Profit Guard — hard trailing lock (Temperance).
+# Arm when peak realized >= $100; breach if daily realized drops to/below $25.
+VIRTUE_PNL_LOCK_ARM_PEAK = 100.0
+VIRTUE_PNL_LOCK_HARD_FLOOR = 25.0
+PROFIT_GUARD_THRESHOLD = VIRTUE_PNL_LOCK_ARM_PEAK  # alias for macromathics_core
+# Legacy retain-pct kept for UI/compat; phase1 uses HARD_FLOOR when armed.
+PROFIT_GUARD_RETAIN_PCT = 0.25  # unused by hard-floor path (was 0.60 of peak)
+VIRTUE_PNL_LOCK_FLOOR_FRAC = PROFIT_GUARD_RETAIN_PCT  # legacy alias
+# Pipeline stuck-on-reboot health check (cycle depth after rebase).
+VIRTUE_PIPELINE_STUCK_DEPTH = 100
+VIRTUE_PIPELINE_STUCK_ALERT_S = 30.0
 # 0 = stand aside after lock (do not keep trading smaller)
 PROFIT_LOCK_MAX_CONTRACTS = 0
 GRADE_DAILY_LOSS_HALT = 300.0  # 2% of $15k

@@ -15,13 +15,13 @@ from typing import Any
 
 from engine.config import (
     MAX_STAGNATION_CYCLES,
-    PROFIT_GUARD_RETAIN_PCT,
     PROFIT_GUARD_THRESHOLD,
     VIRTUE_BASE_TP_COOLDOWN_CYCLES,
     VIRTUE_HARD_STOP_COOLDOWN_CYCLES,
     VIRTUE_PIPELINE_BULL_SHORT_PENALTY,
     VIRTUE_PIPELINE_LONG_BLEND_BASE,
     VIRTUE_PIPELINE_SHORT_BLEND_BASE,
+    VIRTUE_PNL_LOCK_HARD_FLOOR,
     VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES,
     VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES,
     VIRTUE_TIME_DECAY_COOLDOWN_CYCLES,
@@ -39,7 +39,7 @@ __all__ = [
     "VIRTUE_TIME_DECAY_COOLDOWN_CYCLES",
     "MAX_STAGNATION_CYCLES",
     "PROFIT_GUARD_THRESHOLD",
-    "PROFIT_GUARD_RETAIN_PCT",
+    "VIRTUE_PNL_LOCK_HARD_FLOOR",
     "phase1_profit_guard_triggered",
     "phase2_time_decay_triggered",
     "phase3_velocity_gates",
@@ -50,7 +50,10 @@ __all__ = [
 
 def phase1_profit_guard_triggered(session_state: dict[str, Any]) -> tuple[bool, float]:
     """
-    PHASE 1 — trailing daily profit floor.
+    PHASE 1 — hard daily profit floor (Temperance).
+
+    Arms when peak_realized >= PROFIT_GUARD_THRESHOLD ($100).
+    Triggers when realized <= VIRTUE_PNL_LOCK_HARD_FLOOR ($25).
 
     Returns (triggered, floor_lock). Updates peak_realized_pnl_today in-place.
     """
@@ -59,13 +62,13 @@ def phase1_profit_guard_triggered(session_state: dict[str, Any]) -> tuple[bool, 
     if realized > peak:
         session_state["peak_realized_pnl_today"] = realized
         peak = realized
+    floor_lock = float(VIRTUE_PNL_LOCK_HARD_FLOOR)
     if bool(session_state.get("virtue_pnl_lock_active")):
-        floor = peak * float(PROFIT_GUARD_RETAIN_PCT) if peak > 0 else 0.0
-        return True, floor
+        return True, floor_lock
     if peak >= float(PROFIT_GUARD_THRESHOLD):
-        floor_lock = peak * float(PROFIT_GUARD_RETAIN_PCT)
         if realized <= floor_lock + 1e-9:
             session_state["virtue_pnl_lock_active"] = True
+            session_state["circuit_breaker_tripped"] = True
             session_state["Regime"] = "CHOP_NO_TRADE"
             session_state["regime"] = "CHOP_NO_TRADE"
             return True, floor_lock

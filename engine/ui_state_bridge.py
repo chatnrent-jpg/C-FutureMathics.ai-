@@ -15,6 +15,7 @@ from engine.config import (
     VIRTUE_PIPELINE_LONG_BLEND_BASE,
     VIRTUE_PIPELINE_SHORT_BLEND_BASE,
     VIRTUE_PNL_LOCK_ARM_PEAK,
+    VIRTUE_PNL_LOCK_HARD_FLOOR,
     VIRTUE_PNL_LOCK_FLOOR_FRAC,
     VIRTUE_SCORE_LONG_ENTER,
     VIRTUE_SCORE_SHORT_ENTER,
@@ -556,14 +557,21 @@ def build_virtue_system_state(
             "virtue_pnl_lock_active": bool(
                 getattr(session, "virtue_pnl_lock_active", False)
             ),
-            "virtue_pnl_lock_floor": round(
-                float(getattr(session, "peak_realized_pnl_today", 0.0) or 0.0)
-                * float(VIRTUE_PNL_LOCK_FLOOR_FRAC),
-                2,
-            )
-            if float(getattr(session, "peak_realized_pnl_today", 0.0) or 0.0)
-            >= float(VIRTUE_PNL_LOCK_ARM_PEAK)
-            else None,
+            "circuit_breaker_tripped": bool(
+                getattr(session, "circuit_breaker_tripped", False)
+            ),
+            "virtue_pnl_lock_floor": (
+                round(float(VIRTUE_PNL_LOCK_HARD_FLOOR), 2)
+                if float(getattr(session, "peak_realized_pnl_today", 0.0) or 0.0)
+                >= float(VIRTUE_PNL_LOCK_ARM_PEAK)
+                else None
+            ),
+            "core_reentry_blocked_until": float(
+                getattr(session, "core_reentry_blocked_until", 0.0) or 0.0
+            ),
+            "core_reentry_blocked_side": str(
+                getattr(session, "core_reentry_blocked_side", "FLAT") or "FLAT"
+            ),
             "session_date_et": str(getattr(session, "session_date_et", "") or ""),
             "open_risk_notional": open_risk,
             "trades_today": int(getattr(session, "trades_today", 0) or 0),
@@ -786,6 +794,9 @@ def load_persisted_day_bucket(
         "realized_pnl_today": 0.0,
         "peak_realized_pnl_today": 0.0,
         "virtue_pnl_lock_active": False,
+        "circuit_breaker_tripped": False,
+        "core_reentry_blocked_until": 0.0,
+        "core_reentry_blocked_side": "FLAT",
         "trades_today": 0,
         "consecutive_tp_streak": 0,
         "last_tp_timestamp": 0.0,
@@ -818,6 +829,11 @@ def load_persisted_day_bucket(
             else pnl
         )
         virtue_lock = bool(sess.get("virtue_pnl_lock_active") or False)
+        circuit_breaker = bool(
+            sess.get("circuit_breaker_tripped") or virtue_lock or False
+        )
+        core_blocked_until = float(sess.get("core_reentry_blocked_until") or 0.0)
+        core_blocked_side = str(sess.get("core_reentry_blocked_side") or "FLAT")
         trades = int(sess.get("trades_today") or 0)
         tp_streak = int(
             sess.get("consecutive_tp_streak")
@@ -885,6 +901,9 @@ def load_persisted_day_bucket(
             "realized_pnl_today": round(pnl, 2),
             "peak_realized_pnl_today": round(max(peak_pnl, pnl), 2),
             "virtue_pnl_lock_active": virtue_lock,
+            "circuit_breaker_tripped": circuit_breaker,
+            "core_reentry_blocked_until": max(0.0, core_blocked_until),
+            "core_reentry_blocked_side": core_blocked_side,
             "trades_today": max(0, trades),
             "consecutive_tp_streak": max(0, tp_streak),
             "last_tp_timestamp": max(0.0, last_tp),
@@ -945,11 +964,25 @@ def restore_dual_sleeve_books(session: Any, *, state_path: Any | None = None) ->
             session.core_realized_pnl_today = float(
                 core.get("realized_pnl_today") or 0.0
             )
+            session.core_reentry_blocked_until = float(
+                core.get("reentry_blocked_until") or 0.0
+            )
+            session.core_reentry_blocked_side = str(
+                core.get("reentry_blocked_side") or "FLAT"
+            )
         else:
             session.core_active = False
             session.core_side = "FLAT"
             session.core_size = 0
             session.core_entry_price = 0.0
+            # Keep invalidation cooldown even when core is flat.
+            if core.get("reentry_blocked_until") is not None:
+                session.core_reentry_blocked_until = float(
+                    core.get("reentry_blocked_until") or 0.0
+                )
+                session.core_reentry_blocked_side = str(
+                    core.get("reentry_blocked_side") or "FLAT"
+                )
 
         eng = str(tac.get("engine_exposure") or "FLAT").upper()
         tac_sz = int(tac.get("size") or 0)

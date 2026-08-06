@@ -134,6 +134,24 @@ def notify_profit_guard(*, realized: float, floor: float, peak: float) -> None:
     )
 
 
+def notify_pipeline_stuck(*, depth: int, seconds: float) -> None:
+    """Urgent reboot freeze alert — fire-and-forget webhook + metric."""
+    emit_metric(
+        "PipelineQueueStuck",
+        Depth=int(depth),
+        Seconds=float(seconds),
+    )
+    send_chat_notification(
+        "CRITICAL: Pipeline Queue Stuck on Reboot\n"
+        f"depth={int(depth)} stuck_for={float(seconds):.0f}s"
+    )
+    logger.error(
+        "CRITICAL: Pipeline Queue Stuck on Reboot depth=%s seconds=%.1f",
+        depth,
+        seconds,
+    )
+
+
 def notify_course_correct(*, exposure: str, blend: float, reason: str = "") -> None:
     emit_metric(
         "CourseCorrectTriggered",
