@@ -398,6 +398,8 @@ def build_virtue_system_state(
     vwap_score: float = 50.0,
     twap_score: float = 50.0,
     blended_score: float = 50.0,
+    vol_conviction: float = 50.0,
+    market_lift: float = 50.0,
     data_source: str = "alpaca_spy_mes_proxy",
     last_risk_verdict: str = "",
     last_risk_reason: str = "",
@@ -593,6 +595,8 @@ def build_virtue_system_state(
             "vwap_score": round(float(vwap_score), 2),
             "twap_score": round(float(twap_score), 2),
             "blended_score": round(float(blended_score), 2),
+            "vol_conviction": round(float(vol_conviction), 2),
+            "market_lift": round(float(market_lift), 2),
             "exposure": net_dir,
             "contracts": int(net_size),
         },
@@ -631,6 +635,8 @@ def build_virtue_system_state(
             "vwap_score": round(float(vwap_score), 2),
             "twap_score": round(float(twap_score), 2),
             "blended_score": round(float(blended_score), 2),
+            "vol_conviction": round(float(vol_conviction), 2),
+            "market_lift": round(float(market_lift), 2),
         },
     }
 

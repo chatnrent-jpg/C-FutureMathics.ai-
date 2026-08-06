@@ -55,6 +55,66 @@ def test_wisdom_chop_stand_aside() -> None:
     assert 20.0 <= d.blended_score <= 80.0
 
 
+def test_structural_short_below_vwap_with_soft_adx() -> None:
+    """Price < session VWAP + short scores + low lift → SHORT (below-VWAP path)."""
+    s = WisdomStrategy(
+        atr_pct_chaos_max=50.0,
+        adx_trend_min=20.0,
+        adx_short_min=20.0,
+        adx_short_below_vwap_min=12.0,
+        market_lift_short_max=45.0,
+        vol_dead_max=35.0,
+    )
+    s.seed(_trending_bars(90, bull=False, step=2.0))
+    last = float(list(s.closes)[-1])
+    # Session open well above last → dead lift; price still below session VWAP.
+    s.session_open = last + 80.0
+    d = s.evaluate()
+    assert d.vwap_score <= s.short_enter
+    assert d.twap_score <= s.short_enter
+    assert d.market_lift <= 45.0
+    assert d.action == SignalAction.SHORT
+    assert "SHORT SETUP" in d.reason
+    assert "below-VWAP" in d.reason
+
+
+def test_macro_bias_latches_bear_from_vwap_score() -> None:
+    from main import VirtueSession, update_macro_bias
+
+    s = VirtueSession()
+    s.macro_bias = "BULL"
+    update_macro_bias(s, vwap_score=30.0, blend=30.0, adx=12.0)
+    assert s.macro_bias == "BEAR"
+
+
+def test_macro_participation_blocks_fake_long() -> None:
+    """Vol Conv 30% + Lift ~0% must not print LONG even if price > VWAP."""
+    s = WisdomStrategy(
+        atr_pct_chaos_max=50.0,
+        adx_trend_min=0.0,
+        vol_dead_max=35.0,
+        vol_conviction_long_min=45.0,
+        market_lift_long_min=40.0,
+    )
+    # Strong uptrend → VWAP/TWAP scores hot
+    s.seed(_trending_bars(90, bull=True, step=2.0))
+    # Kill volume on last print + pin session open ≈ last (dead lift)
+    last = float(list(s.closes)[-1])
+    s.session_open = last
+    s.volumes[-1] = 0.2  # vs avg ~1.0 → ~11% conviction
+    d = s.evaluate()
+    assert d.action == SignalAction.FLAT
+    assert d.vol_conviction <= 35.0 or d.market_lift < 40.0
+    assert "MACRO PARTICIPATION" in d.reason or "DEAD VOLUME" in d.reason
+
+
+def test_market_lift_and_vol_conviction_scores() -> None:
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
+    s.seed(_trending_bars(40, bull=True, step=1.0))
+    assert s.market_lift_score() > 50.0  # session open << last in uptrend
+    assert 0.0 <= s.volume_conviction_score() <= 100.0
+
+
 def test_score_vs_anchor_bounds() -> None:
     from strategy import score_vs_anchor
 
@@ -1216,7 +1276,7 @@ def test_verify_pipeline_entry_temperance_and_bull_short() -> None:
 
 
 def test_evaluate_directional_gate_bull_day_shorts() -> None:
-    """On BULL days, shorts need blend<=35 and ADX>=25."""
+    """On BULL days, shorts need blend<=35 and ADX>=18 (below-VWAP-friendly)."""
     from main import evaluate_directional_gate
 
     ok, reason = evaluate_directional_gate(
@@ -1226,12 +1286,12 @@ def test_evaluate_directional_gate_bull_day_shorts() -> None:
     assert "bull_day_short_denied" in reason
 
     ok, reason = evaluate_directional_gate(
-        "SHORT", macro_bias="BULL", blend=34.0, adx=24.0
+        "SHORT", macro_bias="BULL", blend=34.0, adx=17.0
     )
     assert ok is False
 
     ok, reason = evaluate_directional_gate(
-        "SHORT", macro_bias="BULL", blend=34.0, adx=25.0
+        "SHORT", macro_bias="BULL", blend=34.0, adx=18.0
     )
     assert ok is True
 
@@ -1407,6 +1467,33 @@ def test_entry_structure_atr_adx_spread_gates() -> None:
 
     twin = anchor_spread_pct(vwap=100.0, twap=100.0, price=100.5)
     assert twin > 0.0
+
+    # Below-VWAP short: soft ADX + waive ATR/ADX-rise/spread grind.
+    commit_entry_structure_memory(
+        s, atr=2.0, adx=20.0, vwap=100.0, twap=99.5, price=99.0
+    )
+    ok, reason = evaluate_entry_structure_gates(
+        s,
+        atr=1.5,
+        adx=12.0,
+        vwap=100.0,
+        twap=99.6,
+        price=99.0,
+        adx_min=8.0,
+        below_vwap_short=True,
+    )
+    assert ok is True and "below_vwap_short" in reason, reason
+    ok, reason = evaluate_entry_structure_gates(
+        s,
+        atr=1.5,
+        adx=7.0,
+        vwap=100.0,
+        twap=99.6,
+        price=99.0,
+        adx_min=8.0,
+        below_vwap_short=True,
+    )
+    assert ok is False and "adx_weak" in reason
 
 
 def test_sleeve_reconcile_repairs_desync() -> None:
@@ -1750,6 +1837,10 @@ if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
     test_wisdom_chop_stand_aside()
+    test_structural_short_below_vwap_with_soft_adx()
+    test_macro_bias_latches_bear_from_vwap_score()
+    test_macro_participation_blocks_fake_long()
+    test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()
     test_anchor_gap_too_wide()

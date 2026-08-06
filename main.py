@@ -122,6 +122,7 @@ from engine.config import (
     VIRTUE_TIME_DECAY_MIN_OPEN_PNL,
     VIRTUE_ADX_ENTER_MIN,
     VIRTUE_ADX_SHORT_ENTER_MIN,
+    VIRTUE_ADX_SHORT_BELOW_VWAP_MIN,
     VIRTUE_BULL_DAY_SHORT_ADX_MIN,
     VIRTUE_BULL_DAY_SHORT_BLEND_MAX,
     VIRTUE_COURSE_CORRECT_LONG_BLEND,
@@ -133,6 +134,11 @@ from engine.config import (
     VIRTUE_SCORE_LONG_ENTER,
     VIRTUE_SCORE_LONG_EXIT,
     VIRTUE_SCORE_PRICE_PCT,
+    VIRTUE_VOL_CONVICTION_LONG_MIN,
+    VIRTUE_VOL_CONVICTION_SHORT_MIN,
+    VIRTUE_VOL_DEAD_MAX,
+    VIRTUE_MARKET_LIFT_LONG_MIN,
+    VIRTUE_MARKET_LIFT_SHORT_MAX,
     VIRTUE_SCORE_SHORT_CHASE_MIN,
     VIRTUE_SCORE_SHORT_ENTER,
     VIRTUE_SCORE_SHORT_EXIT,
@@ -190,6 +196,8 @@ class VirtueSession:
     last_vwap_score: float = 50.0
     last_twap_score: float = 50.0
     last_blended_score: float = 50.0
+    last_vol_conviction: float = 50.0
+    last_market_lift: float = 50.0
     # Prior-cycle structure memory (ATR expand / ADX rise / VWAP-TWAP spread widen)
     prev_atr: float = 0.0
     prev_adx: float = 0.0
@@ -249,6 +257,12 @@ class VirtueSession:
             score_price_pct=float(VIRTUE_SCORE_PRICE_PCT),
             adx_trend_min=float(VIRTUE_ADX_ENTER_MIN),
             adx_short_min=float(VIRTUE_ADX_SHORT_ENTER_MIN),
+            adx_short_below_vwap_min=float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN),
+            vol_conviction_long_min=float(VIRTUE_VOL_CONVICTION_LONG_MIN),
+            market_lift_long_min=float(VIRTUE_MARKET_LIFT_LONG_MIN),
+            vol_conviction_short_min=float(VIRTUE_VOL_CONVICTION_SHORT_MIN),
+            market_lift_short_max=float(VIRTUE_MARKET_LIFT_SHORT_MAX),
+            vol_dead_max=float(VIRTUE_VOL_DEAD_MAX),
         )
     )
     broker: VirtueBroker = field(default_factory=VirtueBroker)
@@ -393,19 +407,28 @@ def update_macro_bias(
     blend: float = 50.0,
     adx: float = 0.0,
     banked_side: str | None = None,
+    vwap_score: float | None = None,
 ) -> str:
     """
     Sticky ET-day macro bias for asymmetric short friction.
 
-    Latch BULL/BEAR from seed regime, strong structure, or banked TP side.
-    Does not flip on single noisy cycles (Temperance).
+    Latch BULL/BEAR from seed regime, strong structure, banked TP side,
+    or sticky session VWAP score (tape beats stale BULL latch).
     """
+    from engine.config import (
+        VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX,
+        VIRTUE_MACRO_BULL_VWAP_SCORE_MIN,
+    )
+
     bias = (session.macro_bias or "NEUTRAL").upper()
     if bias not in {"BULL", "BEAR", "NEUTRAL"}:
         bias = "NEUTRAL"
     reg = (regime or "").upper()
     act = (action or "").upper()
     side = (banked_side or "").upper()
+    vs = float(vwap_score) if vwap_score is not None else float(
+        getattr(session, "last_vwap_score", 50.0) or 50.0
+    )
 
     if side == "LONG":
         bias = "BULL"
@@ -419,10 +442,15 @@ def update_macro_bias(
         bias = "BULL"
     elif (
         act == "SHORT"
-        and float(adx) >= float(VIRTUE_ADX_SHORT_ENTER_MIN)
         and float(blend) <= 40.0
     ):
+        # SHORT SETUP already cleared Wisdom — latch BEAR even if proxy ADX is soft.
         bias = "BEAR"
+    elif vs <= float(VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX):
+        # Sticky session VWAP in bear band → day bias follows tape (not restored BULL).
+        bias = "BEAR"
+    elif vs >= float(VIRTUE_MACRO_BULL_VWAP_SCORE_MIN) and float(blend) >= 55.0:
+        bias = "BULL"
     elif "BULL" in reg and bias == "NEUTRAL":
         bias = "BULL"
     elif "BEAR" in reg and bias == "NEUTRAL":
@@ -1407,6 +1435,8 @@ def _publish_ui(session: VirtueSession, *, last_price: float | None = None) -> N
         vwap_score=session.last_vwap_score,
         twap_score=session.last_twap_score,
         blended_score=session.last_blended_score,
+        vol_conviction=session.last_vol_conviction,
+        market_lift=session.last_market_lift,
         data_source=session.last_data_source,
         last_risk_verdict=session.last_risk_verdict,
         last_risk_reason=session.last_risk_reason,
@@ -1582,53 +1612,88 @@ async def _heartbeat_probe(broker: VirtueBroker) -> tuple[bool, str]:
 
 
 async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -> int:
-    """Warm WisdomStrategy from Databento MES bars (preferred) or Alpaca SPY→MES proxy."""
+    """Warm WisdomStrategy from the active data plane (Alpaca RTH session or Databento)."""
     bars: list[Bar] = []
     seed_src = "none"
+    prefer_alpaca = primary_data_source() == "alpaca"
     mes_data = getattr(session.broker, "mes_data", None)
-    if mes_data is not None and mes_data.is_configured():
+
+    async def _seed_alpaca_rth() -> list[Bar]:
+        spy_bars = await session.broker.data.fetch_spy_bars(
+            timeframe="1Min",
+            limit=max(int(limit), 390),
+            session_rth=True,
+        )
+        if not spy_bars:
+            spy_bars = await session.broker.data.fetch_spy_bars(
+                timeframe="5Min", limit=limit, session_rth=True
+            )
+        mes_bars = session.broker.data.mes_proxy_bars_from_spy(spy_bars)
+        return [
+            Bar(
+                high=float(b["high"]),
+                low=float(b["low"]),
+                close=float(b["close"]),
+                volume=max(1.0, float(b.get("volume") or 1.0)),
+            )
+            for b in mes_bars
+        ]
+
+    async def _seed_databento() -> list[Bar]:
+        if mes_data is None or not mes_data.is_configured():
+            return []
+        raw = await mes_data.fetch_ohlcv_bars(timeframe="1m", limit=limit, lookback_hours=36)
+        ohlc = mes_data.bars_as_strategy_ohlc(raw)
+        return [
+            Bar(
+                high=float(b["high"]),
+                low=float(b["low"]),
+                close=float(b["close"]),
+                volume=max(1.0, float(b.get("volume") or 1.0)),
+            )
+            for b in ohlc
+        ]
+
+    if prefer_alpaca:
         try:
-            raw = await mes_data.fetch_ohlcv_bars(timeframe="1m", limit=limit, lookback_hours=36)
-            ohlc = mes_data.bars_as_strategy_ohlc(raw)
-            bars = [
-                Bar(
-                    high=float(b["high"]),
-                    low=float(b["low"]),
-                    close=float(b["close"]),
-                    volume=max(1.0, float(b.get("volume") or 1.0)),
-                )
-                for b in ohlc
-            ]
+            bars = await _seed_alpaca_rth()
+            if bars:
+                seed_src = "alpaca_spy_mes_proxy_rth"
+                session.last_data_source = "alpaca_spy_mes_proxy"
+        except Exception as exc:
+            logger.exception("alpaca_bar_seed_failed err=%s", exc)
+        if not bars:
+            try:
+                bars = await _seed_databento()
+                if bars:
+                    seed_src = "databento_mes"
+                    session.last_data_source = "databento_mes"
+            except Exception as exc:
+                logger.exception("databento_bar_seed_failed err=%s", exc)
+    else:
+        try:
+            bars = await _seed_databento()
             if bars:
                 seed_src = "databento_mes"
                 session.last_data_source = "databento_mes"
         except Exception as exc:
             logger.exception("databento_bar_seed_failed err=%s", exc)
-
-    if not bars:
-        try:
-            spy_bars = await session.broker.data.fetch_spy_bars(timeframe="5Min", limit=limit)
-            mes_bars = session.broker.data.mes_proxy_bars_from_spy(spy_bars)
-            bars = [
-                Bar(
-                    high=float(b["high"]),
-                    low=float(b["low"]),
-                    close=float(b["close"]),
-                    volume=max(1.0, float(b.get("volume") or 1.0)),
-                )
-                for b in mes_bars
-            ]
-            if bars:
-                seed_src = "alpaca_spy_mes_proxy"
-                session.last_data_source = "alpaca_spy_mes_proxy"
-        except Exception as exc:
-            logger.exception("alpaca_bar_seed_failed err=%s", exc)
-            return 0
+        if not bars:
+            try:
+                bars = await _seed_alpaca_rth()
+                if bars:
+                    seed_src = "alpaca_spy_mes_proxy_rth"
+                    session.last_data_source = "alpaca_spy_mes_proxy"
+            except Exception as exc:
+                logger.exception("alpaca_bar_seed_failed err=%s", exc)
 
     if not bars:
         logger.warning("bar_seed empty — Wisdom stays in WARMUP until live ticks accumulate")
         return 0
+    # Fresh session anchors from RTH seed — do not carry ghost VWAP from prior process.
+    session.strategy.reset_session_anchors()
     session.strategy.seed(bars)
+    session.anchors_aligned = True  # session VWAP is intentional; don't wipe on first tick
     session.broker._last_price = float(bars[-1].close)
     decision = session.strategy.evaluate()
     update_macro_bias(
@@ -1637,6 +1702,7 @@ async def seed_wisdom_from_market(session: VirtueSession, *, limit: int = 120) -
         action=decision.action.value,
         blend=float(decision.blended_score),
         adx=float(decision.adx),
+        vwap_score=float(decision.vwap_score),
     )
     logger.info(
         "WISDOM_SEEDED src=%s bars=%s regime=%s action=%s vwap=%.1f twap=%.1f blend=%.1f "
@@ -1969,14 +2035,13 @@ async def run_cycle(
     tick_vol = max(1.0, tick_vol)
 
     # Rebase ONLY on ghost/seed faults (Justice). Session price≠VWAP is the signal —
-    # do not wipe anchors when VWAP/TWAP diverge a few ATRs (that is regime info).
+    # never wipe a valid RTH VWAP just because boot hasn't "aligned" yet.
     try:
-        need_rebase = (not session.anchors_aligned) or session.strategy.anchor_gap_too_wide(
-            price
-        )
+        if not session.anchors_aligned:
+            session.anchors_aligned = True
+        need_rebase = session.strategy.anchor_gap_too_wide(price)
         if need_rebase:
             session.strategy.rebase_anchors_to_price(price)
-            session.anchors_aligned = True
             session.entry_cooldown_cycles = max(
                 int(session.entry_cooldown_cycles),
                 max(0, int(VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES)),
@@ -2013,9 +2078,18 @@ async def run_cycle(
     session.last_vwap_score = float(decision.vwap_score)
     session.last_twap_score = float(decision.twap_score)
     session.last_blended_score = float(decision.blended_score)
+    session.last_vol_conviction = float(decision.vol_conviction)
+    session.last_market_lift = float(decision.market_lift)
     # RTH windows (ET) + structure memory — compute before commit for this cycle's gates.
     session.allow_new_entries = bool(ignore_hours) or allow_new_entries()
     # allow_new_entries flag is window-only; extreme override applied at fire time.
+    # Below-VWAP SHORT: soft ADX floor + waive ATR/ADX-rise grind (Wisdom).
+    below_vwap_short_structure = (
+        str(decision.action.value).upper() == "SHORT"
+        and float(decision.vwap or 0.0) > 0
+        and float(price) < float(decision.vwap)
+        and float(decision.blended_score) <= float(VIRTUE_SCORE_SHORT_ENTER)
+    )
     structure_ok, structure_reason = evaluate_entry_structure_gates(
         session,
         atr=float(decision.atr),
@@ -2023,6 +2097,12 @@ async def run_cycle(
         vwap=float(decision.vwap),
         twap=float(decision.twap),
         price=float(price),
+        adx_min=(
+            float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
+            if below_vwap_short_structure
+            else None
+        ),
+        below_vwap_short=below_vwap_short_structure,
     )
     session.last_structure_ok = bool(structure_ok)
     session.last_structure_reason = str(structure_reason)
@@ -2051,6 +2131,7 @@ async def run_cycle(
         action=decision.action.value,
         blend=float(decision.blended_score),
         adx=float(decision.adx),
+        vwap_score=float(decision.vwap_score),
     )
     bias_now = str(session.macro_bias or "NEUTRAL")
     long_buf = effective_temperance_blend_buffer(
@@ -2085,6 +2166,22 @@ async def run_cycle(
     else:
         session.long_streak = (session.long_streak + 1) if is_raw_long else 0
         session.short_streak = (session.short_streak + 1) if is_raw_short else 0
+    # Justice: when raw short is ready but Courage does not fire, name the gate.
+    if is_raw_short and decision.action.value != "SHORT":
+        logger.info(
+            "CYCLE %s SHORT_BLOCKED first_gate=%s streak=%s bias=%s "
+            "blend=%.1f adx=%.1f lift=%.1f vol=%.1f px=%.2f vwap_px=%.2f",
+            session.cycle,
+            (decision.reason or "unknown").split("—")[0].strip()[:80],
+            session.short_streak,
+            bias_now,
+            float(decision.blended_score),
+            float(decision.adx),
+            float(decision.market_lift),
+            float(decision.vol_conviction),
+            price,
+            float(decision.vwap),
+        )
     # Cycle log / friction: show side-aware buffer (0 when strong with-trend waived).
     if decision.action.value == "LONG":
         blend_buffer = float(long_buf)
@@ -2094,6 +2191,7 @@ async def run_cycle(
         blend_buffer = float(max(long_buf, short_buf))
     logger.info(
         "CYCLE %s regime=%s action=%s vwap=%.1f%% twap=%.1f%% blend=%.1f%% "
+        "lift=%.1f%% vol_conv=%.1f%% "
         "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr=%.2f atr_pct=%.2f "
         "tp=$%.0f (~%st) sl=$%.0f (~%st) open_pnl=%.2f long_streak=%s short_streak=%s "
         "macro_bias=%s temperance_buf=%.1f velocity=%.1f reason=%s exposure=%s",
@@ -2103,6 +2201,8 @@ async def run_cycle(
         decision.vwap_score,
         decision.twap_score,
         decision.blended_score,
+        decision.market_lift,
+        decision.vol_conviction,
         price,
         decision.vwap,
         decision.twap,
@@ -2469,8 +2569,15 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Wisdom: freeze tactical satellite in weak ADX (core uses its own structural gate).
-    if float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN):
+    # Wisdom: freeze tactical satellite in weak ADX — except below-VWAP shorts
+    # (proxy ADX under-reads; SHORT SETUP already cleared the soft floor).
+    below_vwap_short = (
+        str(decision.action.value).upper() == "SHORT"
+        and float(decision.vwap or 0.0) > 0
+        and float(price) < float(decision.vwap)
+        and float(decision.adx) >= float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
+    )
+    if float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN) and not below_vwap_short:
         logger.info(
             "CYCLE %s tactical_adx_freeze adx=%.1f < %.1f — no satellite entry "
             "(stand aside micro; core may still manage structurally)",
@@ -2520,15 +2627,18 @@ async def run_cycle(
     entries_ok = bool(ignore_hours) or virtue_entries_allowed(
         adx=float(decision.adx),
         blend=float(decision.blended_score),
+        vwap_score=float(decision.vwap_score),
     )
     if not entries_ok:
         logger.info(
-            "CYCLE %s no_new_entry_window allow_new_entries=%s adx=%.1f blend=%.1f — "
-            "manage/exit only (entries=09:45-11:30&13:45-15:55ET+extreme)",
+            "CYCLE %s no_new_entry_window allow_new_entries=%s "
+            "adx=%.1f blend=%.1f vwap=%.1f — "
+            "manage/exit only (entries=09:45-11:30&13:45-15:55ET+extreme|+belowVWAP)",
             session.cycle,
             bool(session.allow_new_entries),
             float(decision.adx),
             float(decision.blended_score),
+            float(decision.vwap_score),
         )
         session.last_action = "FLAT"
         return
@@ -2713,24 +2823,36 @@ async def run_cycle(
             int(VIRTUE_MULTI_TP_COOLDOWN_STREAK),
         )
 
-    # Wisdom: shorts need stronger ADX than longs (fewer counter-trend traps).
-    if side == "SHORT" and float(decision.adx) < float(VIRTUE_ADX_SHORT_ENTER_MIN):
-        logger.info(
-            "CYCLE %s short_adx_too_weak adx=%.1f < %.1f — stand aside",
-            session.cycle,
-            float(decision.adx),
-            float(VIRTUE_ADX_SHORT_ENTER_MIN),
+    # Wisdom: shorts — standard ADX floor, or softer when price < session VWAP.
+    if side == "SHORT":
+        px_now = float(price)
+        vwap_now = float(decision.vwap or 0.0)
+        below_vwap = vwap_now > 0 and px_now < vwap_now
+        short_adx_need = (
+            float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
+            if below_vwap and float(blend) <= float(VIRTUE_SCORE_SHORT_ENTER)
+            else float(VIRTUE_ADX_SHORT_ENTER_MIN)
         )
-        session.last_action = "FLAT"
-        return
+        if float(decision.adx) < short_adx_need:
+            logger.info(
+                "CYCLE %s SHORT_BLOCKED short_adx_too_weak adx=%.1f < %.1f "
+                "below_vwap=%s — stand aside",
+                session.cycle,
+                float(decision.adx),
+                short_adx_need,
+                below_vwap,
+            )
+            session.last_action = "FLAT"
+            return
 
-    # Layer 2b — hard bull-day short extremes (ADX + blend<=35) after pipeline blend gate.
+    # Layer 2b — hard bull-day short extremes (ADX + blend) after pipeline blend gate.
     update_macro_bias(
         session,
         regime=decision.regime.value,
         action=decision.action.value,
         blend=blend,
         adx=float(decision.adx),
+        vwap_score=float(decision.vwap_score),
     )
     gate_ok, gate_reason = evaluate_directional_gate(
         side,
@@ -3047,6 +3169,19 @@ async def run_loop(
             session.tactical_side if session.tactical_active else "FLAT",
             session.tactical_size if session.tactical_active else 0,
             session.macro_structural_regime,
+        )
+    # Absolute pipeline_resume from a prior process is meaningless after cycle→0.
+    # Rebase to a short Temperance cool-off so deploy cannot lock the day forever.
+    prior_resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
+    if prior_resume > 0 and int(session.cycle) == 0:
+        from engine.macromathics_core import cooldown_cycles_for_reason
+
+        cool = max(0, int(cooldown_cycles_for_reason(session.last_reason or "time_decay")))
+        session.pipeline_resume_cycle = cool
+        logger.info(
+            "BOOT pipeline_resume_rebased prior=%s → resume=%s (cycle reset)",
+            prior_resume,
+            cool,
         )
 
     # Justice: same ET day → restore Closed-today PnL / trade count (deploy must not wipe).

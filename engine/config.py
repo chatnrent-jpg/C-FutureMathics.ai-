@@ -218,20 +218,33 @@ DATABENTO_MAX_QUOTE_AGE_S = 5.0
 # Canonical ADX ladder (one floor for flat tactical / structure / velocity).
 VIRTUE_ENTRY_ADX_MIN = 20.0
 VIRTUE_ADX_ENTER_MIN = 20.0      # flat long entries need trend strength (Wisdom)
-VIRTUE_ADX_SHORT_ENTER_MIN = 20.0  # aligned floor; shorts still use blend asymmetry
+VIRTUE_ADX_SHORT_ENTER_MIN = 20.0  # default short floor when not below session VWAP
+# Proxy ADX under-reads: allow shorts when price < session VWAP + short scores.
+VIRTUE_ADX_SHORT_BELOW_VWAP_MIN = 8.0
 VIRTUE_TACTICAL_ADX_MIN = 20.0
 VIRTUE_VELOCITY_ADX_FLOOR = 20.0
+# Latch day bias BEAR when session VWAP score stays at/below this (tape > sticky BULL).
+VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX = 45.0
+VIRTUE_MACRO_BULL_VWAP_SCORE_MIN = 55.0
 # Enter on clear edge; exit with hysteresis so mid-band chop cannot scalp every dip.
 VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
 VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
 VIRTUE_SCORE_LONG_EXIT = 45.0    # while LONG: flatten when both <= 45 (not mid-50)
 VIRTUE_SCORE_SHORT_EXIT = 55.0   # while SHORT: flatten when both >= 55 (not mid-50)
 VIRTUE_REQUIRED_STREAK = 2       # 2 clear cycles — faster Courage on clean tape
+# Native MACRO participation gates (Wisdom) — no VolumeWatch dependency.
+# Dead lift / dead volume cannot print LONG SETUP even if VWAP score is high.
+VIRTUE_VOL_CONVICTION_LONG_MIN = 45.0
+VIRTUE_MARKET_LIFT_LONG_MIN = 40.0
+VIRTUE_VOL_CONVICTION_SHORT_MIN = 40.0
+VIRTUE_MARKET_LIFT_SHORT_MAX = 45.0  # shorts need lift in bear/neutral zone
+VIRTUE_VOL_DEAD_MAX = 35.0  # below → stand aside both ways (no participation)
 # Hard daily round-trip cap for tactical sleeve (Temperance).
 VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 12
-# Bull-day asymmetric short filter — counter-trend shorts need extreme confirmation.
+# Bull-day asymmetric short filter — counter-trend shorts need confirmation.
+# Lowered from 25: sticky BULL bias must not hard-block clear below-VWAP bears.
 VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
-VIRTUE_BULL_DAY_SHORT_ADX_MIN = 25.0    # structural reversal ADX floor on BULL days
+VIRTUE_BULL_DAY_SHORT_ADX_MIN = 18.0    # with below-VWAP path; was 25 (proxy never cleared)
 # COURSE_CORRECT hysteresis — aligned with strategy exits (not mid-50 scalp).
 VIRTUE_COURSE_CORRECT_SHORT_BLEND = 55.0  # SHORT + blend >= 55 → force flatten
 VIRTUE_COURSE_CORRECT_LONG_BLEND = 45.0   # LONG + blend <= 45 → force flatten

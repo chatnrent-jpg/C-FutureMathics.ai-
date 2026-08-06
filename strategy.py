@@ -59,6 +59,8 @@ class RegimeDecision:
     vwap_score: float = 50.0
     twap_score: float = 50.0
     blended_score: float = 50.0
+    vol_conviction: float = 50.0
+    market_lift: float = 50.0
 
 
 def score_vs_anchor(
@@ -118,7 +120,8 @@ class WisdomStrategy:
     adx_period: int = 14
     atr_period: int = 14
     adx_trend_min: float = 18.0  # flat long entries require ADX >= this (Wisdom)
-    adx_short_min: float = 22.0  # shorts need stronger ADX (Temperance)
+    adx_short_min: float = 22.0  # default short ADX when not below session VWAP
+    adx_short_below_vwap_min: float = 8.0  # price < VWAP + short scores (proxy ADX)
     atr_pct_chaos_max: float = 0.15  # ATR% of price; MES/proxy chaos stand-aside
     score_atr_mult: float = 2.0  # legacy linear score scale (unused when bps scoring)
     score_price_pct: float = 0.004  # legacy linear score scale
@@ -133,6 +136,13 @@ class WisdomStrategy:
     min_anchor_samples: int = 20
     score_bull_bps: float = 3.0  # price ≥ +3 bps vs VWAP → bull band
     score_bear_bps: float = 3.0  # price ≤ −3 bps vs VWAP → bear band (≤45)
+    # Native MACRO participation (Wisdom) — block fake bulls when lift/vol are dead.
+    vol_conviction_long_min: float = 45.0
+    market_lift_long_min: float = 40.0
+    vol_conviction_short_min: float = 40.0
+    market_lift_short_max: float = 45.0
+    vol_dead_max: float = 35.0
+    session_open: float = 0.0  # first print of RTH session (market lift anchor)
     closes: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     highs: deque[float] = field(default_factory=lambda: deque(maxlen=300))
     lows: deque[float] = field(default_factory=lambda: deque(maxlen=300))
@@ -162,6 +172,8 @@ class WisdomStrategy:
         self.lows.append(low)
         self.closes.append(close)
         self.volumes.append(vol)
+        if self.session_open <= 0:
+            self.session_open = close
         # VWAP uses trade/quote size; TWAP stays equal-weight time average.
         assert self.vwap_tracker is not None and self.twap_tracker is not None
         self.vwap_tracker.update_trade(price=close, size=vol)
@@ -194,6 +206,47 @@ class WisdomStrategy:
         assert self.vwap_tracker is not None and self.twap_tracker is not None
         self.vwap_tracker.reset()
         self.twap_tracker.reset()
+        self.session_open = 0.0
+
+    def volume_conviction_score(self) -> float:
+        """
+        Native Vol Conviction 0–100: latest volume vs recent average.
+        Dead tape (~0.5× avg) → ~30; average → ~55; 2× → 100.
+        """
+        vols = [float(v) for v in self.volumes if float(v) > 0]
+        if len(vols) < 8:
+            return 50.0
+        cur = vols[-1]
+        base = vols[-21:-1] if len(vols) > 21 else vols[:-1]
+        if not base:
+            return 50.0
+        avg = sum(base) / len(base)
+        if avg <= 0:
+            return 50.0
+        ratio = cur / avg
+        if ratio >= 2.0:
+            return 100.0
+        if ratio >= 1.0:
+            return round(55.0 + (ratio - 1.0) * 45.0, 2)
+        return round(max(0.0, min(55.0, ratio * 55.0)), 2)
+
+    def market_lift_score(self) -> float:
+        """
+        Native Market Lift 0–100 from session open → now (bps).
+        Flat session → ~50; +30 bps → 100; −30 bps → 0 (matches dead-lift bears).
+        """
+        if not self.closes:
+            return 50.0
+        px = float(self.closes[-1])
+        op = float(self.session_open) if self.session_open > 0 else float(self.closes[0])
+        if px <= 0 or op <= 0:
+            return 50.0
+        bps = (px - op) / op * 10_000.0
+        if bps >= 30.0:
+            return 100.0
+        if bps <= -30.0:
+            return 0.0
+        return round(50.0 + (bps / 30.0) * 50.0, 2)
 
     def rebase_anchors_to_price(self, live_price: float) -> None:
         """
@@ -217,6 +270,8 @@ class WisdomStrategy:
                 self.closes = deque((float(c) + shift for c in closes), maxlen=self.closes.maxlen)
                 self.highs = deque((float(h) + shift for h in highs), maxlen=self.highs.maxlen)
                 self.lows = deque((float(lo) + shift for lo in lows), maxlen=self.lows.maxlen)
+                if self.session_open > 0:
+                    self.session_open = float(self.session_open) + shift
             window = list(self.closes)[-lookback:] if lookback > 0 else list(self.closes)
             vols = list(self.volumes)[-lookback:] if lookback > 0 else list(self.volumes)
         else:
@@ -387,8 +442,19 @@ class WisdomStrategy:
         twap: float = 0.0,
         vwap_score: float = 50.0,
         twap_score: float = 50.0,
+        vol_conviction: float | None = None,
+        market_lift: float | None = None,
     ) -> RegimeDecision:
         blended = round((vwap_score + twap_score) / 2.0, 2)
+        if vol_conviction is not None:
+            vc = float(vol_conviction)
+        else:
+            vc = float(getattr(self, "_eval_vol_conviction", 50.0))
+        if market_lift is not None:
+            ml = float(market_lift)
+        else:
+            # Do not use `or 50` — lift 0.0 is a valid dead-lift reading.
+            ml = float(getattr(self, "_eval_market_lift", 50.0))
         return RegimeDecision(
             regime=regime,
             action=action,
@@ -403,6 +469,8 @@ class WisdomStrategy:
             vwap_score=vwap_score,
             twap_score=twap_score,
             blended_score=blended,
+            vol_conviction=vc,
+            market_lift=ml,
         )
 
     def evaluate(self, *, holding: str | None = None) -> RegimeDecision:
@@ -432,6 +500,10 @@ class WisdomStrategy:
             price, twap, bull_bps=self.score_bull_bps, bear_bps=self.score_bear_bps
         )
         blended = round((vwap_score + twap_score) / 2.0, 2)
+        vol_c = self.volume_conviction_score()
+        lift = self.market_lift_score()
+        self._eval_vol_conviction = vol_c
+        self._eval_market_lift = lift
         hold = (holding or "").upper()
 
         # Chaos / unstable volatility → stand aside (Wisdom)
@@ -541,15 +613,29 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Flat: clear ENTRY band + ADX strength + EMA alignment (fewer wrong starts)
-        if adx < float(self.adx_trend_min):
+        # Structural short: price below session VWAP + short scores + dead/low lift.
+        # Proxy ADX often stays <20 while day VWAP is clearly bear (VolumeWatch-aligned).
+        price_below_vwap = price < vwap
+        structural_short = bool(
+            enter_short
+            and price_below_vwap
+            and lift <= float(self.market_lift_short_max)
+        )
+        short_adx_floor = (
+            float(self.adx_short_below_vwap_min)
+            if structural_short
+            else float(self.adx_short_min)
+        )
+
+        # Dead participation — never force LONG; structural shorts may trade thinner vol.
+        if vol_c <= float(self.vol_dead_max) and not structural_short:
             return self._empty(
                 regime=Regime.CHOP_NO_TRADE,
                 action=SignalAction.FLAT,
                 reason=(
-                    f"STAND ASIDE | ADX TOO WEAK — "
-                    f"trend strength ADX {adx:.1f} is below floor {self.adx_trend_min:.1f} "
-                    f"(need stronger trend to enter) · blend {blended:.1f}"
+                    f"STAND ASIDE | DEAD VOLUME CONVICTION — "
+                    f"vol_conv {vol_c:.1f}% ≤ {float(self.vol_dead_max):.0f}% "
+                    f"(lift {lift:.1f}%) · blend {blended:.1f}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
@@ -563,34 +649,36 @@ class WisdomStrategy:
             )
 
         if enter_long and ema_fast >= ema_slow:
-            return self._empty(
-                regime=Regime.TREND_BULL,
-                action=SignalAction.LONG,
-                reason=(
-                    f"LONG SETUP | ENTRY BAND CLEARED — "
-                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                    f"≥ enter {self.long_enter:.0f} · ADX {adx:.1f}"
-                ),
-                ema_fast=ema_fast,
-                ema_slow=ema_slow,
-                adx=adx,
-                atr=atr,
-                atr_pct=atr_pct,
-                vwap=vwap,
-                twap=twap,
-                vwap_score=vwap_score,
-                twap_score=twap_score,
-            )
-
-        if enter_short and ema_fast <= ema_slow:
-            if adx < float(self.adx_short_min):
+            if adx < float(self.adx_trend_min):
                 return self._empty(
                     regime=Regime.CHOP_NO_TRADE,
                     action=SignalAction.FLAT,
                     reason=(
-                        f"STAND ASIDE | SHORT ADX TOO WEAK — "
-                        f"ADX {adx:.1f} is below short floor {self.adx_short_min:.1f} "
-                        f"(shorts need stronger trend) · blend {blended:.1f}"
+                        f"STAND ASIDE | ADX TOO WEAK — "
+                        f"trend strength ADX {adx:.1f} is below floor {self.adx_trend_min:.1f} "
+                        f"(need stronger trend to enter) · blend {blended:.1f}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
+            if lift < float(self.market_lift_long_min) or vol_c < float(
+                self.vol_conviction_long_min
+            ):
+                return self._empty(
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
+                    reason=(
+                        f"STAND ASIDE | LONG BLOCKED BY MACRO PARTICIPATION — "
+                        f"lift {lift:.1f}% (need ≥{float(self.market_lift_long_min):.0f}) "
+                        f"vol_conv {vol_c:.1f}% (need ≥{float(self.vol_conviction_long_min):.0f}) "
+                        f"· VWAP/TWAP blend {blended:.1f} alone is not enough"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -603,12 +691,120 @@ class WisdomStrategy:
                     twap_score=twap_score,
                 )
             return self._empty(
+                regime=Regime.TREND_BULL,
+                action=SignalAction.LONG,
+                reason=(
+                    f"LONG SETUP | ENTRY BAND CLEARED — "
+                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                    f"≥ enter {self.long_enter:.0f} · ADX {adx:.1f} "
+                    f"· lift {lift:.1f}% vol_conv {vol_c:.1f}%"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        # Below-VWAP structural shorts may waive EMA lag (proxy EMA often slow).
+        short_ema_ok = ema_fast <= ema_slow or structural_short
+        if enter_short and short_ema_ok:
+            if adx < short_adx_floor:
+                return self._empty(
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
+                    reason=(
+                        f"STAND ASIDE | SHORT ADX TOO WEAK — "
+                        f"ADX {adx:.1f} is below short floor {short_adx_floor:.1f}"
+                        f"{' (below-VWAP path)' if structural_short else ''} "
+                        f"· blend {blended:.1f}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
+            if lift > float(self.market_lift_short_max):
+                return self._empty(
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
+                    reason=(
+                        f"STAND ASIDE | SHORT BLOCKED BY MACRO PARTICIPATION — "
+                        f"lift {lift:.1f}% (need ≤{float(self.market_lift_short_max):.0f}) "
+                        f"· blend {blended:.1f}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
+            # Standard shorts still need volume; structural below-VWAP uses lift+VWAP.
+            if (
+                not structural_short
+                and vol_c < float(self.vol_conviction_short_min)
+            ):
+                return self._empty(
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
+                    reason=(
+                        f"STAND ASIDE | SHORT BLOCKED BY MACRO PARTICIPATION — "
+                        f"vol_conv {vol_c:.1f}% (need ≥{float(self.vol_conviction_short_min):.0f}) "
+                        f"· blend {blended:.1f}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
+            path = "below-VWAP" if structural_short else "standard"
+            return self._empty(
                 regime=Regime.TREND_BEAR,
                 action=SignalAction.SHORT,
                 reason=(
                     f"SHORT SETUP | ENTRY BAND CLEARED — "
                     f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                    f"≤ enter {self.short_enter:.0f} · ADX {adx:.1f}"
+                    f"≤ enter {self.short_enter:.0f} · ADX {adx:.1f} ({path}) "
+                    f"· lift {lift:.1f}% vol_conv {vol_c:.1f}%"
+                ),
+                ema_fast=ema_fast,
+                ema_slow=ema_slow,
+                adx=adx,
+                atr=atr,
+                atr_pct=atr_pct,
+                vwap=vwap,
+                twap=twap,
+                vwap_score=vwap_score,
+                twap_score=twap_score,
+            )
+
+        # Neither side cleared — if ADX is soft and no structural short, say so.
+        if adx < float(self.adx_trend_min) and not structural_short:
+            return self._empty(
+                regime=Regime.CHOP_NO_TRADE,
+                action=SignalAction.FLAT,
+                reason=(
+                    f"STAND ASIDE | ADX TOO WEAK — "
+                    f"trend strength ADX {adx:.1f} is below floor {self.adx_trend_min:.1f} "
+                    f"(need stronger trend to enter) · blend {blended:.1f}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,

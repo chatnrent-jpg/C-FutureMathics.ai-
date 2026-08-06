@@ -43,14 +43,19 @@ def evaluate_entry_structure_gates(
     twap: float,
     price: float,
     adx_min: float | None = None,
+    below_vwap_short: bool = False,
 ) -> tuple[bool, str]:
     """
     Trades initiate when:
       1) ADX > floor and rising vs prior cycle
       2) ATR expanding AND spread widening — OR extreme ADX waiver
+      3) OR below-VWAP structural short: soft ADX floor; waive rise/ATR/spread
 
     Extreme ADX (>= VIRTUE_STRUCTURE_EXTREME_ADX) + rising: waive ATR/spread
     so a finished trend day is not starved by proxy microstructure noise.
+
+    Below-VWAP short: session displacement vs VWAP is the structure (Wisdom);
+    lunch grind often contracts ATR / flatlines proxy ADX — do not starve shorts.
     Justice: missing prior samples → stand aside (no trade on warm-up).
     """
     floor = float(adx_min if adx_min is not None else VIRTUE_ENTRY_ADX_MIN)
@@ -71,14 +76,27 @@ def evaluate_entry_structure_gates(
 
     if adx_now <= floor:
         return False, f"entry_structure:adx_weak adx={adx_now:.1f}<={floor:.1f}"
-    if adx_now <= prev_adx:
+
+    atr_ok = atr_now > prev_atr
+    spread_ok = spread_now > prev_spread
+    adx_rising = adx_now > prev_adx
+
+    # Wisdom: price already below session VWAP with SHORT band cleared —
+    # displacement is structure; waive rise/ATR/spread grind traps.
+    if below_vwap_short:
+        return (
+            True,
+            (
+                f"entry_structure:ok_below_vwap_short adx={adx_now:.1f}>{floor:.1f} "
+                f"atr_exp={atr_ok} adx_rise={adx_rising} spread_widen={spread_ok}"
+            ),
+        )
+
+    if not adx_rising:
         return (
             False,
             f"entry_structure:adx_not_rising adx={adx_now:.1f}<=prev={prev_adx:.1f}",
         )
-
-    atr_ok = atr_now > prev_atr
-    spread_ok = spread_now > prev_spread
 
     if adx_now >= extreme:
         # Rising ADX already proven above; extreme trend is the structure.

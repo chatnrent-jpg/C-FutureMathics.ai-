@@ -173,16 +173,42 @@ def extreme_trend_entry_ok(*, adx: float, blend: float) -> bool:
     return b <= float(VIRTUE_EXTREME_BLEND_SHORT) or b >= float(VIRTUE_EXTREME_BLEND_LONG)
 
 
+def below_vwap_short_entry_ok(*, blend: float, vwap_score: float | None = None) -> bool:
+    """
+    Lunch / off-window Courage: clear session-VWAP bear (blend + VWAP score).
+    Aligns with short enter band (≤42), not the stricter extreme≤35 cut.
+    """
+    from engine.config import (
+        VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX,
+        VIRTUE_SCORE_SHORT_ENTER,
+    )
+
+    try:
+        b = float(blend)
+    except (TypeError, ValueError):
+        return False
+    if b > float(VIRTUE_SCORE_SHORT_ENTER):
+        return False
+    if vwap_score is None:
+        return True
+    try:
+        return float(vwap_score) <= float(VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX)
+    except (TypeError, ValueError):
+        return False
+
+
 def virtue_entries_allowed(
     now: datetime | None = None,
     *,
     adx: float | None = None,
     blend: float | None = None,
+    vwap_score: float | None = None,
 ) -> bool:
     """
     True when new LONG/SHORT entries are allowed.
 
-    Requires session open AND (primary RTH windows OR extreme-trend override).
+    Requires session open AND (primary RTH windows OR extreme-trend override
+    OR clear below-VWAP short structure).
     CME overnight mode additionally blocks 16:45–17:00 ET pre-maintenance.
     """
     if not virtue_session_open(now):
@@ -191,7 +217,11 @@ def virtue_entries_allowed(
     if not in_window:
         if adx is None or blend is None:
             return False
-        if not extreme_trend_entry_ok(adx=float(adx), blend=float(blend)):
+        extreme = extreme_trend_entry_ok(adx=float(adx), blend=float(blend))
+        structural_short = below_vwap_short_entry_ok(
+            blend=float(blend), vwap_score=vwap_score
+        )
+        if not (extreme or structural_short):
             return False
     dt = _et_now(now)
     if virtue_session_mode() == "cme" and live_allow_overnight():

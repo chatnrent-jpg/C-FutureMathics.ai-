@@ -226,24 +226,39 @@ class AlpacaSPYFeed:
         timeframe: str = "5Min",
         limit: int = 120,
         lookback_days: int = 10,
+        session_rth: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Fetch recent SPY OHLCV bars from Alpaca (for Wisdom warmup).
         Alpaca requires start/end — bare limit-only requests return bars=null.
         Returns list of dicts: open, high, low, close, timestamp.
+
+        session_rth=True → bars from today's 09:30 America/New_York (true day VWAP seed).
         """
         if not self.is_configured():
             return []
         try:
             import aiohttp
             from datetime import datetime, timedelta, timezone
+            from zoneinfo import ZoneInfo
 
             headers = {
                 "APCA-API-KEY-ID": self.api_key,
                 "APCA-API-SECRET-KEY": self.api_secret,
             }
             end = datetime.now(timezone.utc)
-            start = end - timedelta(days=max(1, int(lookback_days)))
+            if session_rth:
+                et = ZoneInfo("America/New_York")
+                now_et = end.astimezone(et)
+                start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                if now_et < start:
+                    # Pre-open: use prior RTH day open so seed is not empty.
+                    start = (start - timedelta(days=1)).replace(
+                        hour=9, minute=30, second=0, microsecond=0
+                    )
+                start = start.astimezone(timezone.utc)
+            else:
+                start = end - timedelta(days=max(1, int(lookback_days)))
             params = {
                 "timeframe": timeframe,
                 "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
