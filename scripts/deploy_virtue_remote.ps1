@@ -79,6 +79,12 @@ scp @ssh `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `
     "$Root\engine\ui_state_bridge.py" `
+    "$Root\engine\regime_engine.py" `
+    "$Root\engine\entry_quality.py" `
+    "$Root\engine\institutional_sizing.py" `
+    "$Root\engine\institutional_exits.py" `
+    "$Root\engine\institutional_monitor.py" `
+    "$Root\engine\trade_history.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/engine/"
 
 scp @ssh `
