@@ -68,6 +68,30 @@ from engine.entry_structure import (
     commit_entry_structure_memory,
     evaluate_entry_structure_gates,
 )
+from engine.regime_engine import (
+    detect_regime,
+    regime_allows_entry,
+    regime_is_trending,
+    regime_is_range,
+    MarketRegime,
+    RegimeState,
+)
+from engine.entry_quality import (
+    evaluate_entry_quality,
+    is_institutional_grade,
+)
+from engine.institutional_sizing import (
+    calculate_institutional_size,
+    is_reset_mode,
+)
+from engine.institutional_exits import (
+    evaluate_institutional_exits,
+    update_peak_pnl,
+)
+from engine.institutional_monitor import (
+    evaluate_strategy_health,
+    is_circuit_breaker_tripped,
+)
 from engine.observability import (
     notify_core_macro_invalidation,
     notify_course_correct,
@@ -86,6 +110,7 @@ from engine.config import (
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    institutional_mode_enabled,
     VIRTUE_CORE_MAX_HOLD_CYCLES,
     VIRTUE_CORE_TP_DOLLARS,
     VIRTUE_PIPELINE_STUCK_ALERT_S,
@@ -262,6 +287,12 @@ class VirtueSession:
     cycles_since_heartbeat: int = 0
     last_heartbeat_ok: bool = True
     last_heartbeat_state: str = "GREEN"
+    # Institutional-grade state
+    institutional_regime: str = "RANGE_MEAN_REVERT"
+    institutional_regime_confidence: float = 60.0
+    institutional_entry_grade: str = "F"
+    institutional_peak_pnl: float = 0.0
+    recent_trades: list = field(default_factory=list)
     strategy: WisdomStrategy = field(
         default_factory=lambda: WisdomStrategy(
             long_enter=float(VIRTUE_SCORE_LONG_ENTER),
@@ -1003,6 +1034,18 @@ def update_outcome_state(
     session.last_reason = tag
     if count_trade:
         session.trades_today = int(session.trades_today) + 1
+    
+    # Track recent trades for institutional circuit breaker stats
+    if institutional_mode_enabled():
+        trade_record = {
+            "cycle": cycle,
+            "outcome": "PENDING",  # Will be set below
+            "pnl": delta,
+            "reason": tag,
+        }
+        session.recent_trades.append(trade_record)
+        if len(session.recent_trades) > 20:
+            session.recent_trades = session.recent_trades[-20:]
 
     tp_streak_for_cd = int(session.consecutive_tp_streak)
 
@@ -1010,6 +1053,8 @@ def update_outcome_state(
         session.last_result = "WIN"
         session.consecutive_wins = int(session.consecutive_wins) + 1
         session.consecutive_losses = 0
+        if institutional_mode_enabled() and session.recent_trades:
+            session.recent_trades[-1]["outcome"] = "WIN"
         # Trailing streak penalty uses pre-increment streak: base + streak * bonus.
         streak = int(session.consecutive_tp_streak)
         tp_streak_for_cd = streak
@@ -1028,6 +1073,8 @@ def update_outcome_state(
         session.consecutive_tp_streak = 0
         session.last_tp_timestamp = 0.0
         session.require_tp_pullback = False
+        if institutional_mode_enabled() and session.recent_trades:
+            session.recent_trades[-1]["outcome"] = "LOSS"
 
     elif tag == "stop":
         session.last_result = "LOSS"
@@ -1036,6 +1083,8 @@ def update_outcome_state(
         session.consecutive_tp_streak = 0
         session.last_tp_timestamp = 0.0
         session.require_tp_pullback = False
+        if institutional_mode_enabled() and session.recent_trades:
+            session.recent_trades[-1]["outcome"] = "LOSS"
 
     elif tag == "time_decay":
         # Stagnant exposure cut — fast cool-off (thesis did not break).
@@ -2309,6 +2358,26 @@ async def run_cycle(
     session.last_blended_score = float(decision.blended_score)
     session.last_vol_conviction = float(decision.vol_conviction)
     session.last_market_lift = float(decision.market_lift)
+    
+    # Institutional regime detection (when enabled)
+    regime_state: RegimeState | None = None
+    if institutional_mode_enabled():
+        regime_state = detect_regime(
+            adx=float(decision.adx),
+            atr_pct=float(decision.atr_pct),
+            blend=float(decision.blended_score),
+            ema_fast=float(decision.ema_fast),
+            ema_slow=float(decision.ema_slow),
+        )
+        session.institutional_regime = regime_state.regime.value
+        session.institutional_regime_confidence = regime_state.confidence
+        logger.info(
+            "CYCLE %s REGIME=%s confidence=%.0f%% (%s)",
+            session.cycle,
+            regime_state.regime.value,
+            regime_state.confidence,
+            regime_state.reason,
+        )
     # RTH windows (ET) + structure memory — compute before commit for this cycle's gates.
     session.allow_new_entries = bool(ignore_hours) or allow_new_entries()
     # allow_new_entries flag is window-only; extreme override applied at fire time.
@@ -2589,6 +2658,47 @@ async def run_cycle(
             return
 
     tactical_pnl = _tactical_open_pnl(session, price)
+    
+    # Institutional layered exits (when enabled, checked first)
+    if institutional_mode_enabled() and regime_state is not None:
+        if bool(session.tactical_active) and int(session.tactical_size) > 0:
+            # Update peak PnL for trailing stops
+            session.institutional_peak_pnl = update_peak_pnl(
+                tactical_pnl,
+                session.institutional_peak_pnl,
+            )
+            
+            # Evaluate all 6 exit layers
+            cycles_held = session.cycle - (session.entry_cycle_marker or session.cycle)
+            should_exit, exit_reason, exit_layer = evaluate_institutional_exits(
+                regime=regime_state.regime,
+                holding=session.tactical_side,
+                entry_price=session.tactical_entry_price,
+                current_price=price,
+                open_pnl=tactical_pnl,
+                cycles_held=cycles_held,
+                adx=float(decision.adx),
+                blend=float(decision.blended_score),
+                peak_pnl=session.institutional_peak_pnl,
+            )
+            
+            if should_exit:
+                ok, pnl = await _close_tactical_sleeve(
+                    session,
+                    price=price,
+                    stop_ticks=stop_ticks,
+                    reason=f"institutional_{exit_layer}",
+                )
+                if ok:
+                    logger.info(
+                        "CYCLE %s INSTITUTIONAL_EXIT %s pnl≈%.2f — %s",
+                        session.cycle,
+                        exit_layer,
+                        pnl,
+                        exit_reason,
+                    )
+                session.last_action = "FLAT"
+                return
 
     # Dollar stop — tactical sleeve only (Temperance). Core ignores $ stop.
     if bool(session.tactical_active) and tactical_pnl <= -float(
@@ -2831,6 +2941,27 @@ async def run_cycle(
         )
         session.last_action = "FLAT"
         return
+    
+    # Institutional circuit breaker check (strategy health monitoring)
+    if institutional_mode_enabled():
+        healthy, health_reason, breaker = evaluate_strategy_health(
+            trades_today=session.trades_today,
+            consecutive_losses=session.consecutive_losses,
+            daily_pnl=session.realized_pnl_today,
+            recent_trades=session.recent_trades,
+        )
+        if not healthy:
+            session.layer1_streak_clear = False
+            session.long_streak = 0
+            session.short_streak = 0
+            logger.warning(
+                "CYCLE %s CIRCUIT_BREAKER %s — %s (stand aside)",
+                session.cycle,
+                breaker,
+                health_reason,
+            )
+            session.last_action = "FLAT"
+            return
 
     # Temperance: hard daily tactical round-trip cap (counted on close).
     if int(session.trades_today) >= int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY):
@@ -3035,6 +3166,38 @@ async def run_cycle(
     else:
         session.last_action = "FLAT"
         return
+    
+    # Institutional entry quality grading (A+/A only)
+    if institutional_mode_enabled() and regime_state is not None:
+        grade_ok, grade_reason, grade = evaluate_entry_quality(
+            regime=regime_state.regime,
+            adx=float(decision.adx),
+            prev_adx=float(session.prev_adx or 0.0),
+            atr=float(decision.atr),
+            prev_atr=float(session.prev_atr or 0.0),
+            blend=float(decision.blended_score),
+            vwap_score=float(decision.vwap_score),
+            twap_score=float(decision.twap_score),
+            signal_side=side,
+        )
+        session.institutional_entry_grade = grade
+        
+        if not grade_ok:
+            logger.info(
+                "CYCLE %s ENTRY_QUALITY grade=%s BLOCKED — %s",
+                session.cycle,
+                grade,
+                grade_reason,
+            )
+            session.last_action = "FLAT"
+            return
+        
+        logger.info(
+            "CYCLE %s ENTRY_QUALITY grade=%s APPROVED — %s",
+            session.cycle,
+            grade,
+            grade_reason,
+        )
 
     # Wisdom: do not chase a move that already extended (late entry → stop / RTH flatten).
     blend = float(decision.blended_score)
@@ -3271,7 +3434,26 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    contracts = min(int(sized.contracts), int(base_contracts))
+    # Institutional sizing overrides when enabled
+    if institutional_mode_enabled() and regime_state is not None:
+        inst_contracts, size_reason = calculate_institutional_size(
+            regime=regime_state.regime,
+            regime_confidence=regime_state.confidence,
+            entry_grade=session.institutional_entry_grade,
+            consecutive_losses=session.consecutive_losses,
+            consecutive_wins=session.consecutive_wins,
+            daily_pnl=session.realized_pnl_today,
+            nav=session.broker.equity,
+        )
+        if inst_contracts == 0:
+            logger.info("CYCLE %s INSTITUTIONAL_SIZING zero — %s", session.cycle, size_reason)
+            session.last_action = "FLAT"
+            return
+        contracts = inst_contracts
+        logger.info("CYCLE %s INSTITUTIONAL_SIZING %s contracts — %s", session.cycle, contracts, size_reason)
+    else:
+        contracts = min(int(sized.contracts), int(base_contracts))
+    
     from engine.dual_sleeve import account_contract_ceiling
 
     core_occ = int(session.core_size) if bool(session.core_active) else 0
@@ -3508,7 +3690,14 @@ async def run_loop(
 
     from engine.config import virtue_simple_stack as _boot_simple_stack
 
-    if _boot_simple_stack():
+    if institutional_mode_enabled():
+        logger.info("BOOT INSTITUTIONAL_GRADE_ENABLED — regime-aware adaptive trading")
+        logger.info("  Regimes: TREND (ADX≥22) | RANGE (ADX 12-22) | CHAOS (ATR≥20%% or ADX<12)")
+        logger.info("  Entry: A+ or A grade only (edge+structure+momentum)")
+        logger.info("  Sizing: adaptive (1 MES healthy, 0 reset/breaker)")
+        logger.info("  Exits: 6-layer (L1:stop L2:decay L3:thesis L4:regime L5:tp L6:trail)")
+        logger.info("  Circuit breakers: CB1-CB4 active")
+    elif _boot_simple_stack():
         logger.info(
             "BOOT SIMPLE_STACK_ENABLED bands+stop+tp+peak_lock+time_decay — "
             "ADX/EMA/macro/structure/velocity/streak/course_correct/chase/pullback waived"
