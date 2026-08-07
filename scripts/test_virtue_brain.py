@@ -57,25 +57,31 @@ def test_wisdom_chop_stand_aside() -> None:
 
 def test_structural_short_below_vwap_with_soft_adx() -> None:
     """Price < session VWAP + short scores + low lift → SHORT (below-VWAP path)."""
-    s = WisdomStrategy(
-        atr_pct_chaos_max=50.0,
-        adx_trend_min=20.0,
-        adx_short_min=20.0,
-        adx_short_below_vwap_min=12.0,
-        market_lift_short_max=45.0,
-        vol_dead_max=35.0,
-    )
-    s.seed(_trending_bars(90, bull=False, step=2.0))
-    last = float(list(s.closes)[-1])
-    # Session open well above last → dead lift; price still below session VWAP.
-    s.session_open = last + 80.0
-    d = s.evaluate()
-    assert d.vwap_score <= s.short_enter
-    assert d.twap_score <= s.short_enter
-    assert d.market_lift <= 45.0
-    assert d.action == SignalAction.SHORT
-    assert "SHORT SETUP" in d.reason
-    assert "below-VWAP" in d.reason
+    import os
+
+    os.environ["FM_VIRTUE_SIMPLE_STACK"] = "0"
+    try:
+        s = WisdomStrategy(
+            atr_pct_chaos_max=50.0,
+            adx_trend_min=20.0,
+            adx_short_min=20.0,
+            adx_short_below_vwap_min=12.0,
+            market_lift_short_max=45.0,
+            vol_dead_max=35.0,
+        )
+        s.seed(_trending_bars(90, bull=False, step=2.0))
+        last = float(list(s.closes)[-1])
+        # Session open well above last → dead lift; price still below session VWAP.
+        s.session_open = last + 80.0
+        d = s.evaluate()
+        assert d.vwap_score <= s.short_enter
+        assert d.twap_score <= s.short_enter
+        assert d.market_lift <= 45.0
+        assert d.action == SignalAction.SHORT
+        assert "SHORT SETUP" in d.reason
+        assert "below-VWAP" in d.reason
+    finally:
+        os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
 
 
 def test_macro_bias_latches_bear_from_vwap_score() -> None:
@@ -89,23 +95,52 @@ def test_macro_bias_latches_bear_from_vwap_score() -> None:
 
 def test_macro_participation_blocks_fake_long() -> None:
     """Vol Conv 30% + Lift ~0% must not print LONG even if price > VWAP."""
+    import os
+
+    os.environ["FM_VIRTUE_SIMPLE_STACK"] = "0"
+    try:
+        s = WisdomStrategy(
+            atr_pct_chaos_max=50.0,
+            adx_trend_min=0.0,
+            vol_dead_max=35.0,
+            vol_conviction_long_min=45.0,
+            market_lift_long_min=40.0,
+        )
+        # Strong uptrend → VWAP/TWAP scores hot
+        s.seed(_trending_bars(90, bull=True, step=2.0))
+        # Kill volume on last print + pin session open ≈ last (dead lift)
+        last = float(list(s.closes)[-1])
+        s.session_open = last
+        s.volumes[-1] = 0.2  # vs avg ~1.0 → ~11% conviction
+        d = s.evaluate()
+        assert d.action == SignalAction.FLAT
+        assert d.vol_conviction <= 35.0 or d.market_lift < 40.0
+        assert "MACRO PARTICIPATION" in d.reason or "DEAD VOLUME" in d.reason
+    finally:
+        os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+
+
+def test_simple_stack_blend_only_entry() -> None:
+    """Simple stack: hot VWAP/TWAP prints LONG even with dead macro participation."""
+    import os
+    from engine.config import virtue_simple_stack
+
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)  # default True
+    assert virtue_simple_stack() is True
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
-        adx_trend_min=0.0,
+        adx_trend_min=20.0,
         vol_dead_max=35.0,
         vol_conviction_long_min=45.0,
         market_lift_long_min=40.0,
     )
-    # Strong uptrend → VWAP/TWAP scores hot
     s.seed(_trending_bars(90, bull=True, step=2.0))
-    # Kill volume on last print + pin session open ≈ last (dead lift)
     last = float(list(s.closes)[-1])
     s.session_open = last
-    s.volumes[-1] = 0.2  # vs avg ~1.0 → ~11% conviction
+    s.volumes[-1] = 0.2
     d = s.evaluate()
-    assert d.action == SignalAction.FLAT
-    assert d.vol_conviction <= 35.0 or d.market_lift < 40.0
-    assert "MACRO PARTICIPATION" in d.reason or "DEAD VOLUME" in d.reason
+    assert d.action == SignalAction.LONG
+    assert "SIMPLE STACK" in d.reason
 
 
 def test_market_lift_and_vol_conviction_scores() -> None:
@@ -1989,6 +2024,7 @@ if __name__ == "__main__":
     test_structural_short_below_vwap_with_soft_adx()
     test_macro_bias_latches_bear_from_vwap_score()
     test_macro_participation_blocks_fake_long()
+    test_simple_stack_blend_only_entry()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()

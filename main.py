@@ -2319,20 +2319,25 @@ async def run_cycle(
         and float(price) < float(decision.vwap)
         and float(decision.blended_score) <= float(VIRTUE_SCORE_SHORT_ENTER)
     )
-    structure_ok, structure_reason = evaluate_entry_structure_gates(
-        session,
-        atr=float(decision.atr),
-        adx=float(decision.adx),
-        vwap=float(decision.vwap),
-        twap=float(decision.twap),
-        price=float(price),
-        adx_min=(
-            float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
-            if below_vwap_short_structure
-            else None
-        ),
-        below_vwap_short=below_vwap_short_structure,
-    )
+    from engine.config import virtue_simple_stack
+
+    if virtue_simple_stack():
+        structure_ok, structure_reason = True, "simple_stack:structure_waived"
+    else:
+        structure_ok, structure_reason = evaluate_entry_structure_gates(
+            session,
+            atr=float(decision.atr),
+            adx=float(decision.adx),
+            vwap=float(decision.vwap),
+            twap=float(decision.twap),
+            price=float(price),
+            adx_min=(
+                float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
+                if below_vwap_short_structure
+                else None
+            ),
+            below_vwap_short=below_vwap_short_structure,
+        )
     session.last_structure_ok = bool(structure_ok)
     session.last_structure_reason = str(structure_reason)
     commit_entry_structure_memory(
@@ -2353,7 +2358,11 @@ async def run_cycle(
     # Temperance + velocity: widen bands after losses / course_correct / low ADX.
     # Enables same-cycle flip when opposite streak is already ready (Courage).
     base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
-    vel_penalty = velocity_blend_penalty(adx=float(decision.adx))
+    if virtue_simple_stack():
+        blend_buffer_raw = 0.0
+        vel_penalty = 0.0
+    else:
+        vel_penalty = velocity_blend_penalty(adx=float(decision.adx))
     update_macro_bias(
         session,
         regime=decision.regime.value,
@@ -2537,7 +2546,11 @@ async def run_cycle(
     # ============================================================
     # PHASE 2 — TACTICAL IN-FLIGHT ESCAPES (core uses structural invalidation)
     # ============================================================
-    if bool(session.tactical_active) and int(session.tactical_size) > 0:
+    if (
+        bool(session.tactical_active)
+        and int(session.tactical_size) > 0
+        and not virtue_simple_stack()
+    ):
         tac_side = str(session.tactical_side or "FLAT").upper()
         cc_hit, cc_reason = check_course_correct(
             tac_side, float(decision.blended_score)
@@ -2821,7 +2834,11 @@ async def run_cycle(
         and float(price) < float(decision.vwap)
         and float(decision.adx) >= float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
     )
-    if float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN) and not below_vwap_short:
+    if (
+        not virtue_simple_stack()
+        and float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN)
+        and not below_vwap_short
+    ):
         logger.info(
             "CYCLE %s tactical_adx_freeze adx=%.1f < %.1f — no satellite entry "
             "(stand aside micro; core may still manage structurally)",
@@ -2920,6 +2937,8 @@ async def run_cycle(
 
     # Temperance sizing / blend friction from last_trade_outcome (side-aware waiver).
     base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
+    if virtue_simple_stack():
+        blend_buffer_raw = 0.0
     side_buf = effective_temperance_blend_buffer(
         blend_buffer_raw,
         side=decision.action.value,
@@ -2966,6 +2985,8 @@ async def run_cycle(
         need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
     if float(decision.adx) >= float(VIRTUE_EXTREME_ADX_OVERRIDE):
         need_streak = 1
+    if virtue_simple_stack():
+        need_streak = 1
     side = decision.action.value
     if side == "LONG":
         if session.long_streak < need_streak:
@@ -3000,43 +3021,55 @@ async def run_cycle(
     # Wisdom: do not chase a move that already extended (late entry → stop / RTH flatten).
     blend = float(decision.blended_score)
 
-    # Pipeline validation — Temperance + ADX velocity gate + bull-day short asymmetry.
-    pipe_ok, pipe_reason = verify_pipeline_entry(
-        side,
-        pipeline_system_state(
-            session, blend=blend, adx=float(decision.adx)
-        ),
-    )
-    if not pipe_ok:
+    if virtue_simple_stack():
+        # Simple stack: band signal already cleared — skip velocity/chase/pullback/bias gates.
+        session.require_tp_pullback = False
         logger.info(
-            "CYCLE %s LAYER2_pipeline_entry_denied %s — stand aside",
+            "CYCLE %s SIMPLE_STACK_ENTRY side=%s blend=%.1f streak=%s — "
+            "bands only (pipeline/chase/pullback/bias waived)",
             session.cycle,
-            pipe_reason,
+            side,
+            blend,
+            session.long_streak if side == "LONG" else session.short_streak,
         )
-        session.last_action = "FLAT"
-        return
+    else:
+        # Pipeline validation — Temperance + ADX velocity gate + bull-day short asymmetry.
+        pipe_ok, pipe_reason = verify_pipeline_entry(
+            side,
+            pipeline_system_state(
+                session, blend=blend, adx=float(decision.adx)
+            ),
+        )
+        if not pipe_ok:
+            logger.info(
+                "CYCLE %s LAYER2_pipeline_entry_denied %s — stand aside",
+                session.cycle,
+                pipe_reason,
+            )
+            session.last_action = "FLAT"
+            return
 
-    if side == "LONG" and blend >= float(VIRTUE_SCORE_LONG_CHASE_MAX):
-        logger.info(
-            "CYCLE %s chase_filter LONG blend=%.1f >= %.1f — stand aside (move already extended)",
-            session.cycle,
-            blend,
-            VIRTUE_SCORE_LONG_CHASE_MAX,
-        )
-        session.last_action = "FLAT"
-        return
-    if side == "SHORT" and blend <= float(VIRTUE_SCORE_SHORT_CHASE_MIN):
-        logger.info(
-            "CYCLE %s chase_filter SHORT blend=%.1f <= %.1f — stand aside (move already extended)",
-            session.cycle,
-            blend,
-            VIRTUE_SCORE_SHORT_CHASE_MIN,
-        )
-        session.last_action = "FLAT"
-        return
+        if side == "LONG" and blend >= float(VIRTUE_SCORE_LONG_CHASE_MAX):
+            logger.info(
+                "CYCLE %s chase_filter LONG blend=%.1f >= %.1f — stand aside (move already extended)",
+                session.cycle,
+                blend,
+                VIRTUE_SCORE_LONG_CHASE_MAX,
+            )
+            session.last_action = "FLAT"
+            return
+        if side == "SHORT" and blend <= float(VIRTUE_SCORE_SHORT_CHASE_MIN):
+            logger.info(
+                "CYCLE %s chase_filter SHORT blend=%.1f <= %.1f — stand aside (move already extended)",
+                session.cycle,
+                blend,
+                VIRTUE_SCORE_SHORT_CHASE_MIN,
+            )
+            session.last_action = "FLAT"
+            return
 
     # Temperance: after multi-TP streak, require blend pullback before re-entering.
-    if session.require_tp_pullback:
+    if (not virtue_simple_stack()) and session.require_tp_pullback:
         if side == "LONG" and blend > float(VIRTUE_POST_TP_PULLBACK_BLEND_LONG):
             logger.info(
                 "CYCLE %s post_tp_pullback LONG blend=%.1f > %.1f — wait for cool-off "
@@ -3072,7 +3105,7 @@ async def run_cycle(
         )
 
     # Wisdom: shorts — standard ADX floor, or softer when price < session VWAP.
-    if side == "SHORT":
+    if (not virtue_simple_stack()) and side == "SHORT":
         px_now = float(price)
         vwap_now = float(decision.vwap or 0.0)
         below_vwap = vwap_now > 0 and px_now < vwap_now
@@ -3102,20 +3135,21 @@ async def run_cycle(
         adx=float(decision.adx),
         vwap_score=float(decision.vwap_score),
     )
-    gate_ok, gate_reason = evaluate_directional_gate(
-        side,
-        macro_bias=session.macro_bias,
-        blend=blend,
-        adx=float(decision.adx),
-    )
-    if not gate_ok:
-        logger.info(
-            "CYCLE %s LAYER2_directional_gate_denied %s — stand aside",
-            session.cycle,
-            gate_reason,
+    if not virtue_simple_stack():
+        gate_ok, gate_reason = evaluate_directional_gate(
+            side,
+            macro_bias=session.macro_bias,
+            blend=blend,
+            adx=float(decision.adx),
         )
-        session.last_action = "FLAT"
-        return
+        if not gate_ok:
+            logger.info(
+                "CYCLE %s LAYER2_directional_gate_denied %s — stand aside",
+                session.cycle,
+                gate_reason,
+            )
+            session.last_action = "FLAT"
+            return
 
     # Net Exposure Rule — tactical may fire only when aligned with core (or core flat).
     tac_ok, tac_reason = tactical_entry_allowed(
@@ -3452,6 +3486,18 @@ async def run_loop(
             "BOOT CORE_SLEEVE_ENABLED ceiling=%s paper_max=%s — dual-sleeve active",
             int(account_contract_ceiling_limit()),
             int(paper_max_mes_contracts()),
+        )
+
+    from engine.config import virtue_simple_stack as _boot_simple_stack
+
+    if _boot_simple_stack():
+        logger.info(
+            "BOOT SIMPLE_STACK_ENABLED bands+stop+tp+peak_lock+time_decay — "
+            "ADX/EMA/macro/structure/velocity/streak/course_correct/chase/pullback waived"
+        )
+    else:
+        logger.warning(
+            "BOOT SIMPLE_STACK_DISABLED — full MacroMathics indicator stack active"
         )
 
     # Absolute pipeline_resume from a prior process is meaningless after cycle→0.

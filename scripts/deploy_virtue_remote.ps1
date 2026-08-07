@@ -38,7 +38,9 @@ try {
         # Temperance simplify: tactical-only 1 MES (override any stale 2-MES remote env)
         "FM_VIRTUE_CORE_ENABLED=0",
         "FM_MAX_ACCOUNT_CONTRACT_CEILING=1",
-        "FM_PAPER_MAX_MES_CONTRACTS=1"
+        "FM_PAPER_MAX_MES_CONTRACTS=1",
+        # MacroMathics: bands + stop/TP/lock only (kill overlapping indicator gates)
+        "FM_VIRTUE_SIMPLE_STACK=1"
     )
     if ($dbKey) {
         $envLines += "DATABENTO_API_KEY=$dbKey"
