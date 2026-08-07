@@ -104,6 +104,40 @@ VIRTUE_CORE_SIZE = 1  # structural anchor sleeve (ignored when core disabled)
 # chase, post-TP pullback, bull-day directional gate, temperance blend widening.
 # Override: FM_VIRTUE_SIMPLE_STACK=0 to restore the full indicator stack.
 VIRTUE_SIMPLE_STACK = True
+
+# ============================================================
+# INSTITUTIONAL GRADE — Regime-aware adaptive trading
+# ============================================================
+# Regime detection thresholds (TREND / RANGE / CHAOS classification)
+INSTITUTIONAL_ADX_TREND_MIN = 22.0      # ADX ≥ 22 = TREND mode (trend-following)
+INSTITUTIONAL_ADX_RANGE_MIN = 12.0      # ADX 12-22 = RANGE mode (mean-reversion), < 12 = CHAOS
+INSTITUTIONAL_ATR_CHAOS_MAX = 0.20      # ATR% ≥ 20% = CHAOS (stand aside, high volatility)
+INSTITUTIONAL_ATR_NORMAL_MAX = 0.15     # ATR% ≤ 15% = normal conditions
+
+# Regime-specific behavior
+INSTITUTIONAL_TREND_HOLD_CYCLES = 48    # Hold trends longer (48 cycles ≈ 40 minutes)
+INSTITUTIONAL_RANGE_TP_QUICK = 80.0     # Range mode: quick TP ($80 scalp)
+INSTITUTIONAL_TREND_TP_TRAIL = True     # Trend mode: trailing stops enabled (50% retrace from peak)
+
+# Circuit breakers (strategy health monitoring)
+INSTITUTIONAL_CB_DAILY_PNL_FLOOR = -250.0    # Daily PnL floor ($-250, preserve capital before -$300 hard stop)
+INSTITUTIONAL_CB_MIN_WIN_RATE = 0.30         # Win rate floor (30% over last 10 trades)
+INSTITUTIONAL_CB_MIN_AVG_PNL = -10.0         # Avg PnL floor (-$10 over last 10 trades)
+INSTITUTIONAL_CB_MAX_CONSECUTIVE_LOSSES = 3   # Max consecutive losses before reset mode
+
+# Entry quality standards (only A+ and A setups get sized)
+INSTITUTIONAL_ENTRY_GRADE_MIN = "A"          # Minimum grade for entries ("A+" or "A")
+INSTITUTIONAL_REGIME_CONFIDENCE_MIN = 60.0   # Minimum regime confidence (0-100%)
+
+# Time-of-day windows (institutional standard — highest quality tape only)
+INSTITUTIONAL_ENTRY_WINDOWS = [
+    ((9, 45), (11, 15)),   # Morning: 09:45-11:15 ET (avoid open chaos, stop before lunch)
+    ((14, 0), (15, 30)),   # Afternoon: 14:00-15:30 ET (avoid lunch chop, stop before close)
+]
+INSTITUTIONAL_ALLOW_EXTREME_OVERRIDE = True  # ADX ≥ 35 + blend extreme can enter outside windows
+
+# ============================================================
+
 VIRTUE_CORE_CONFIRM_CYCLES = 5  # HTF bias+ADX confirm before opening core
 VIRTUE_CORE_STRUCTURAL_ADX_MIN = 22.0
 # Slow Invalidation depth from the long edge (sticky through NEUTRAL).
@@ -551,6 +585,26 @@ def virtue_simple_stack() -> bool:
     Default True. Override: FM_VIRTUE_SIMPLE_STACK=0|1.
     """
     return _env_bool_override("FM_VIRTUE_SIMPLE_STACK", bool(VIRTUE_SIMPLE_STACK))
+
+
+def institutional_mode_enabled() -> bool:
+    """
+    Institutional-grade regime-aware adaptive trading.
+
+    When True: TREND/RANGE/CHAOS regime detection, A+/A entry grading,
+    adaptive sizing, layered exits, circuit breakers.
+
+    When False: Falls back to simple_stack or standard MacroMathics.
+
+    Override: FM_INSTITUTIONAL_MODE=1|0 (default: same as simple_stack)
+    """
+    raw = os.getenv("FM_INSTITUTIONAL_MODE", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    # Default: institutional mode ON when simple_stack is ON
+    return virtue_simple_stack()
 
 
 def account_contract_ceiling_limit() -> int:
