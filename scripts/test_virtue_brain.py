@@ -120,6 +120,20 @@ def test_macro_participation_blocks_fake_long() -> None:
         os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
 
 
+def test_hold_path_ignores_chaos_atr_spike() -> None:
+    """Open LONG must not flatten on ATR chaos — only exit bands / hard risk."""
+    s = WisdomStrategy(atr_pct_chaos_max=0.01, adx_trend_min=0.0)  # tiny ceiling
+    s.seed(_trending_bars(90, bull=True, step=2.0))
+    # Holding path: even if ATR% looks "chaos", keep LONG until exit bands.
+    d = s.evaluate(holding="LONG")
+    assert d.action == SignalAction.LONG
+    assert "HOLDING LONG" in d.reason
+    # Flat path still stands aside on chaos.
+    d2 = s.evaluate(holding=None)
+    assert d2.action == SignalAction.FLAT
+    assert "CHAOS" in d2.reason
+
+
 def test_simple_stack_blend_only_entry() -> None:
     """Simple stack: hot VWAP/TWAP prints LONG even with dead macro participation."""
     import os
@@ -2024,6 +2038,7 @@ if __name__ == "__main__":
     test_structural_short_below_vwap_with_soft_adx()
     test_macro_bias_latches_bear_from_vwap_score()
     test_macro_participation_blocks_fake_long()
+    test_hold_path_ignores_chaos_atr_spike()
     test_simple_stack_blend_only_entry()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
