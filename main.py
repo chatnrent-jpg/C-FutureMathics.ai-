@@ -2746,8 +2746,26 @@ async def run_cycle(
             return
 
     # Wisdom stand-aside / thesis-invalid → close tactical only; core is structural.
+    # Only flatten on an explicit thesis-break flatten signal — never on chaos /
+    # mid-band "STAND ASIDE" while the hold path should have kept the book.
     if decision.action == SignalAction.FLAT:
         if bool(session.tactical_active) and int(session.tactical_size) > 0:
+            reason_s = str(decision.reason or "")
+            thesis_break = (
+                "FLATTEN SIGNAL" in reason_s
+                or "THESIS BROKEN" in reason_s
+                or "thesis broken" in reason_s.lower()
+            )
+            if not thesis_break:
+                logger.info(
+                    "CYCLE %s HOLD_THROUGH_FLAT_SIGNAL tactical=%s — "
+                    "reason is stand-aside not thesis break (%s)",
+                    session.cycle,
+                    session.tactical_side,
+                    reason_s[:120],
+                )
+                session.last_action = str(session.tactical_side or "FLAT")
+                return
             ok, pnl = await _close_tactical_sleeve(
                 session,
                 price=price,

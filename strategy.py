@@ -506,8 +506,16 @@ class WisdomStrategy:
         self._eval_market_lift = lift
         hold = (holding or "").upper()
 
-        # Chaos / unstable volatility → stand aside (Wisdom)
-        if atr_pct >= self.atr_pct_chaos_max:
+        # Entry bands (from flat) vs invalidate bands (while holding) — real hysteresis.
+        enter_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
+        enter_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
+        # Thesis broken past hysteresis band (default 45/55) — not every mid-50 dip.
+        exit_long = vwap_score <= self.long_exit and twap_score <= self.long_exit
+        exit_short = vwap_score >= self.short_exit and twap_score >= self.short_exit
+
+        # Chaos ATR blocks NEW entries only. Never knife an open trade on proxy ATR spikes —
+        # open books exit via hysteresis bands / dollar stop / TP / time-decay (Temperance).
+        if atr_pct >= self.atr_pct_chaos_max and hold not in {"LONG", "SHORT"}:
             return self._empty(
                 regime=Regime.CHOP_NO_TRADE,
                 action=SignalAction.FLAT,
@@ -525,13 +533,6 @@ class WisdomStrategy:
                 vwap_score=vwap_score,
                 twap_score=twap_score,
             )
-
-        # Entry bands (from flat) vs invalidate bands (while holding) — real hysteresis.
-        enter_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
-        enter_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
-        # Thesis broken past hysteresis band (default 45/55) — not every mid-50 dip.
-        exit_long = vwap_score <= self.long_exit and twap_score <= self.long_exit
-        exit_short = vwap_score >= self.short_exit and twap_score >= self.short_exit
 
         # While in a trade: hold only while thesis remains valid; else flatten (course-correct).
         # Return FLAT (not reverse) — reverse needs a fresh entry streak from cash (Courage+Temperance).
