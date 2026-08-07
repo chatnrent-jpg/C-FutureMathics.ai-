@@ -98,6 +98,12 @@ MAX_ACCOUNT_CONTRACT_CEILING = 1
 # Override at runtime: FM_VIRTUE_CORE_ENABLED=1|0
 VIRTUE_CORE_ENABLED = False
 VIRTUE_CORE_SIZE = 1  # structural anchor sleeve (ignored when core disabled)
+# MacroMathics simple stack — strip overlapping indicators that confuse the hot path.
+# Keep: VWAP+TWAP bands, chaos ATR, stop/TP, peak lock, time decay, hours/halt.
+# Kill: EMA/ADX/macro participation, structure rise, velocity, streak>1, course_correct,
+# chase, post-TP pullback, bull-day directional gate, temperance blend widening.
+# Override: FM_VIRTUE_SIMPLE_STACK=0 to restore the full indicator stack.
+VIRTUE_SIMPLE_STACK = True
 VIRTUE_CORE_CONFIRM_CYCLES = 5  # HTF bias+ADX confirm before opening core
 VIRTUE_CORE_STRUCTURAL_ADX_MIN = 22.0
 # Slow Invalidation depth from the long edge (sticky through NEUTRAL).
@@ -527,6 +533,24 @@ def virtue_core_enabled() -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return bool(VIRTUE_CORE_ENABLED)
+
+
+def _env_bool_override(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def virtue_simple_stack() -> bool:
+    """
+    MacroMathics simple stack (Wisdom: one signal family).
+
+    Default True. Override: FM_VIRTUE_SIMPLE_STACK=0|1.
+    """
+    return _env_bool_override("FM_VIRTUE_SIMPLE_STACK", bool(VIRTUE_SIMPLE_STACK))
 
 
 def account_contract_ceiling_limit() -> int:
