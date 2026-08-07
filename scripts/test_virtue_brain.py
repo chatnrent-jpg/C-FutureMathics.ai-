@@ -157,6 +157,22 @@ def test_simple_stack_blend_only_entry() -> None:
     assert "SIMPLE STACK" in d.reason
 
 
+def test_institutional_mode_defaults_off() -> None:
+    """Institutional gates must stay OFF unless FM_INSTITUTIONAL_MODE=1 (Courage: trade)."""
+    import os
+    from engine.config import institutional_mode_enabled, virtue_simple_stack
+
+    os.environ.pop("FM_INSTITUTIONAL_MODE", None)
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+    assert virtue_simple_stack() is True
+    assert institutional_mode_enabled() is False
+    os.environ["FM_INSTITUTIONAL_MODE"] = "1"
+    assert institutional_mode_enabled() is True
+    os.environ["FM_INSTITUTIONAL_MODE"] = "0"
+    assert institutional_mode_enabled() is False
+    os.environ.pop("FM_INSTITUTIONAL_MODE", None)
+
+
 def test_market_lift_and_vol_conviction_scores() -> None:
     s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
     s.seed(_trending_bars(40, bull=True, step=1.0))
@@ -2040,6 +2056,7 @@ if __name__ == "__main__":
     test_macro_participation_blocks_fake_long()
     test_hold_path_ignores_chaos_atr_spike()
     test_simple_stack_blend_only_entry()
+    test_institutional_mode_defaults_off()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()

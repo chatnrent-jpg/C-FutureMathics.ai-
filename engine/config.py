@@ -596,15 +596,10 @@ def institutional_mode_enabled() -> bool:
 
     When False: Falls back to simple_stack or standard MacroMathics.
 
-    Override: FM_INSTITUTIONAL_MODE=1|0 (default: same as simple_stack)
+    Override: FM_INSTITUTIONAL_MODE=1|0
+    Default: False (simple stack must trade without institutional gates).
     """
-    raw = os.getenv("FM_INSTITUTIONAL_MODE", "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    # Default: institutional mode ON when simple_stack is ON
-    return virtue_simple_stack()
+    return _env_bool_override("FM_INSTITUTIONAL_MODE", False)
 
 
 def account_contract_ceiling_limit() -> int:

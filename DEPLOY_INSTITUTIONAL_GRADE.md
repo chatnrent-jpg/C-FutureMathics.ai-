@@ -89,10 +89,10 @@ This automatically enables institutional mode.
 To explicitly enable/disable institutional mode:
 
 ```bash
-# Enable institutional-grade (default when simple_stack=1)
+# Enable institutional-grade (opt-in only — OFF by default)
 FM_INSTITUTIONAL_MODE=1
 
-# Disable institutional-grade (falls back to simple_stack)
+# Disable institutional-grade (default — simple stack trades)
 FM_INSTITUTIONAL_MODE=0
 ```
 

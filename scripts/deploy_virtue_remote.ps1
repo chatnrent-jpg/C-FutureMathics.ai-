@@ -40,7 +40,9 @@ try {
         "FM_MAX_ACCOUNT_CONTRACT_CEILING=1",
         "FM_PAPER_MAX_MES_CONTRACTS=1",
         # MacroMathics: bands + stop/TP/lock only (kill overlapping indicator gates)
-        "FM_VIRTUE_SIMPLE_STACK=1"
+        "FM_VIRTUE_SIMPLE_STACK=1",
+        # Institutional filters OFF by default — they blocked valid simple-stack setups
+        "FM_INSTITUTIONAL_MODE=0"
     )
     if ($dbKey) {
         $envLines += "DATABENTO_API_KEY=$dbKey"
