@@ -40,6 +40,9 @@ C_PANEL = "rgba(148,163,184,0.10)"
 C_CARD = "rgba(15,23,42,0.72)"
 C_BG0 = "#070b12"
 C_BG1 = "#0f172a"
+C_GATE_PASS = "#34d399"
+C_GATE_FAIL = "#f87171"
+C_GATE_PARTIAL = "#fbbf24"
 
 
 def load_state() -> dict:
@@ -124,9 +127,13 @@ def _operator_reason_parts(reason: str) -> tuple[str, str]:
 def _inject_css() -> None:
     st.markdown(
         f"""
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
           .stApp {{
             color: {C_INK};
+            font-family: "DM Sans", sans-serif;
             background:
               radial-gradient(1100px 520px at 8% -8%, rgba(45,212,191,0.14), transparent 55%),
               radial-gradient(900px 420px at 92% 0%, rgba(251,113,133,0.10), transparent 52%),
@@ -138,6 +145,7 @@ def _inject_css() -> None:
             color: {C_INK} !important;
           }}
           h1, h2, h3, h4 {{
+            font-family: "Syne", sans-serif !important;
             letter-spacing: 0.04em !important;
             color: {C_INK} !important;
           }}
@@ -163,8 +171,200 @@ def _inject_css() -> None:
           hr {{
             border-color: rgba(148,163,184,0.18) !important;
           }}
+          @keyframes fmGateIn {{
+            from {{ opacity: 0; transform: translateY(10px) scale(0.985); }}
+            to {{ opacity: 1; transform: translateY(0) scale(1); }}
+          }}
+          @keyframes fmGatePulse {{
+            0%, 100% {{ box-shadow: 0 0 0 0 rgba(52,211,153,0.0), 0 18px 48px rgba(0,0,0,0.35); }}
+            50% {{ box-shadow: 0 0 0 10px rgba(52,211,153,0.08), 0 18px 48px rgba(0,0,0,0.35); }}
+          }}
+          @keyframes fmBarFill {{
+            from {{ width: 0%; }}
+          }}
+          @keyframes fmDotPop {{
+            from {{ transform: scale(0.6); opacity: 0.3; }}
+            to {{ transform: scale(1); opacity: 1; }}
+          }}
+          .fm-gate {{
+            animation: fmGateIn 0.55s ease-out both;
+            margin: 0.35rem 0 1.15rem 0;
+            border-radius: 18px;
+            padding: 1.25rem 1.4rem 1.15rem 1.4rem;
+            position: relative;
+            overflow: hidden;
+          }}
+          .fm-gate.fm-gate-pass {{
+            animation: fmGateIn 0.55s ease-out both, fmGatePulse 2.8s ease-in-out 0.6s infinite;
+          }}
+          .fm-gate-logo {{
+            font-family: "Syne", sans-serif;
+            font-weight: 800;
+            font-size: clamp(1.55rem, 2.6vw, 2.35rem);
+            line-height: 1.15;
+            letter-spacing: 0.01em;
+            margin: 0;
+          }}
+          .fm-gate-sub {{
+            font-family: "DM Sans", sans-serif;
+            font-size: 1.05rem;
+            margin-top: 0.45rem;
+            opacity: 0.92;
+          }}
+          .fm-gate-bar-track {{
+            margin-top: 0.95rem;
+            height: 10px;
+            border-radius: 999px;
+            background: rgba(148,163,184,0.18);
+            overflow: hidden;
+          }}
+          .fm-gate-bar {{
+            height: 100%;
+            border-radius: 999px;
+            animation: fmBarFill 0.8s ease-out both;
+          }}
+          .fm-pillars {{
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 0.55rem;
+            margin-top: 1rem;
+          }}
+          @media (max-width: 900px) {{
+            .fm-pillars {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+            .fm-gate-logo {{ font-size: 1.45rem; }}
+          }}
+          .fm-pillar {{
+            border-radius: 12px;
+            padding: 0.65rem 0.55rem;
+            text-align: center;
+            animation: fmDotPop 0.45s ease-out both;
+            min-height: 4.4rem;
+          }}
+          .fm-pillar-name {{
+            font-family: "Syne", sans-serif;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+          }}
+          .fm-pillar-state {{
+            font-family: "DM Sans", sans-serif;
+            font-size: 0.95rem;
+            font-weight: 700;
+            margin-top: 0.28rem;
+          }}
         </style>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def _trading_gate_pillars(
+    *,
+    entry_pipeline: dict,
+    session: dict,
+    age_s: float | None,
+    last_price: object,
+) -> list[dict[str, object]]:
+    """Six position-trading pillars from live virtue entry pipeline (Justice)."""
+    structure_reason = str(entry_pipeline.get("entry_structure_reason") or "")
+    structure_ok = bool(entry_pipeline.get("entry_structure_ok")) or (
+        "simple_stack" in structure_reason.lower() and "waived" in structure_reason.lower()
+    )
+    risk_clear = not (
+        bool(session.get("virtue_pnl_lock_active"))
+        or bool(session.get("circuit_breaker_tripped"))
+        or bool(session.get("halted"))
+    )
+    tape_live = bool(last_price) and (age_s is not None and float(age_s) <= 30.0)
+    return [
+        {
+            "key": "cooldown",
+            "name": "Cooldown",
+            "pass": bool(entry_pipeline.get("layer1_streak_clear")),
+            "detail": "clear" if entry_pipeline.get("layer1_streak_clear") else "locked",
+        },
+        {
+            "key": "window",
+            "name": "Window",
+            "pass": bool(entry_pipeline.get("allow_new_entries")),
+            "detail": "open" if entry_pipeline.get("allow_new_entries") else "closed",
+        },
+        {
+            "key": "structure",
+            "name": "Structure",
+            "pass": structure_ok,
+            "detail": "ok" if structure_ok else "block",
+        },
+        {
+            "key": "reconcile",
+            "name": "Reconcile",
+            "pass": bool(entry_pipeline.get("sleeve_reconcile_ok", True)),
+            "detail": "ok" if entry_pipeline.get("sleeve_reconcile_ok", True) else "fail",
+        },
+        {
+            "key": "risk",
+            "name": "Risk",
+            "pass": risk_clear,
+            "detail": "clear" if risk_clear else "halt",
+        },
+        {
+            "key": "tape",
+            "name": "Tape",
+            "pass": tape_live,
+            "detail": "live" if tape_live else "stale",
+        },
+    ]
+
+
+def _render_trading_gate_logo(
+    pillars: list[dict[str, object]],
+    *,
+    timeframe: str = "1D",
+) -> None:
+    """Logo-scale color-coded 6-Pillar Position Trading Gate."""
+    passed = sum(1 for p in pillars if p.get("pass"))
+    total = max(1, len(pillars))
+    frac = passed / total
+    if passed >= total:
+        accent, bg, status = C_GATE_PASS, "rgba(52,211,153,0.16)", "ALL CLEAR — GATE OPEN"
+        cls = "fm-gate fm-gate-pass"
+    elif passed >= 4:
+        accent, bg, status = C_GATE_PARTIAL, "rgba(251,191,36,0.14)", "PARTIAL — STAND READY"
+        cls = "fm-gate"
+    else:
+        accent, bg, status = C_GATE_FAIL, "rgba(248,113,113,0.14)", "BLOCKED — STAND ASIDE"
+        cls = "fm-gate"
+
+    logo = (
+        f"6-Pillar Position Trading Gate · {_esc(timeframe)} · "
+        f"{passed}/{total} pillars pass"
+    )
+    pillar_html = []
+    for i, p in enumerate(pillars):
+        ok = bool(p.get("pass"))
+        p_color = C_GATE_PASS if ok else C_GATE_FAIL
+        p_bg = "rgba(52,211,153,0.14)" if ok else "rgba(248,113,113,0.14)"
+        delay = 0.08 + (i * 0.05)
+        pillar_html.append(
+            f"<div class='fm-pillar' style='background:{p_bg};border:1px solid {p_color}66;"
+            f"animation-delay:{delay:.2f}s;'>"
+            f"<div class='fm-pillar-name' style='color:{p_color};'>{_esc(p.get('name'))}</div>"
+            f"<div class='fm-pillar-state' style='color:{C_INK};'>"
+            f"{'PASS' if ok else 'FAIL'} · {_esc(p.get('detail'))}</div>"
+            f"</div>"
+        )
+
+    st.markdown(
+        f"<div class='{cls}' style='background:linear-gradient(135deg,{bg},{C_CARD});"
+        f"border:1px solid {accent}66;border-left:10px solid {accent};'>"
+        f"<div class='fm-gate-logo' style='color:{accent};'>{logo}</div>"
+        f"<div class='fm-gate-sub' style='color:{C_INK};'>{_esc(status)}</div>"
+        f"<div class='fm-gate-bar-track'>"
+        f"<div class='fm-gate-bar' style='width:{frac * 100:.1f}%;"
+        f"background:linear-gradient(90deg,{accent},{accent}aa);'></div></div>"
+        f"<div class='fm-pillars'>{''.join(pillar_html)}</div>"
+        f"</div>",
         unsafe_allow_html=True,
     )
 
@@ -249,7 +449,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 _inject_css()
-st.title("MACROMATHICS.AI")
+st.markdown(
+    f"<div style='font-family:Syne,sans-serif;font-weight:800;font-size:clamp(2rem,3.5vw,2.85rem);"
+    f"letter-spacing:0.02em;color:{C_INK};margin:0.1rem 0 0.35rem 0;'>MACROMATHICS.AI</div>",
+    unsafe_allow_html=True,
+)
 
 if os.environ.get("FM_EXTERNAL_ORCHESTRATOR", "").strip().lower() in {"1", "true", "yes"}:
     st.caption("Cloud view — fed by background virtue loop (`system_state.json` poll)")
@@ -260,6 +464,7 @@ dash = data.get("dashboard") or {}
 session = data.get("session") or {}
 grade = data.get("grade") or {}
 virtue = data.get("virtue") or {}
+entry_pipeline = data.get("entry_pipeline") or {}
 positions = data.get("open_positions") or dash.get("open_positions") or []
 last_price = dash.get("last_price") if dash.get("last_price") is not None else data.get("last_price")
 unrealized = dash.get("unrealized_pnl")
@@ -280,6 +485,16 @@ else:
     st.caption("MES futures — Virtue Wisdom brain · Manus risk (Webull execution)")
 if session_label:
     st.caption(session_label)
+
+# Logo-scale 6-Pillar Position Trading Gate (color-coded pass/fail)
+_gate_pillars = _trading_gate_pillars(
+    entry_pipeline=entry_pipeline,
+    session=session,
+    age_s=age_s,
+    last_price=last_price,
+)
+_render_trading_gate_logo(_gate_pillars, timeframe="1D")
+
 if age_s is not None and age_s > 30:
     st.warning(
         f"Engine looks idle — last update {int(age_s)}s ago. "

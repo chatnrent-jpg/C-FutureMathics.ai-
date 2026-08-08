@@ -29,6 +29,7 @@ from engine.config import (
     VIRTUE_VELOCITY_PENALTY_PER_ADX,
     concurrent_risk_cap,
     max_daily_loss_cap,
+    virtue_simple_stack,
 )
 from manus.capital_protection import RiskVerdict
 
@@ -533,7 +534,11 @@ def build_virtue_system_state(
             "layer2_macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
             "layer3_course_correct": "check_every_hold_cycle",
             "allow_new_entries": bool(getattr(session, "allow_new_entries", False)),
-            "entry_windows_et": "09:45-11:30&13:45-15:55+extreme",
+            "entry_windows_et": (
+                "09:30-16:00ET+FULL_SESSION"
+                if virtue_simple_stack()
+                else "09:45-11:30&13:45-15:55+extreme"
+            ),
             "entry_structure_ok": bool(getattr(session, "last_structure_ok", False)),
             "entry_structure_reason": str(
                 getattr(session, "last_structure_reason", "") or ""
