@@ -2,23 +2,22 @@
 
 Temporary handoff because the cloud agent cannot push to `chatnrent-jpg/vettedme-backend`.
 
-## Files
-- `vettedme-rlhf-changes.zip` — overlay onto a fresh `vettedme-backend` clone
-- `rlhf-calibration-analytics-8175.bundle` — optional git bundle
-- `apply-and-push-rlhf.ps1` — Windows helper
+## Latest — Supervisor Admin Analytics
 
-## Windows (PowerShell)
+- `vettedme-supervisor-analytics.zip` — overlay `controller.ts` + `routes.ts` (+ note)
+- Endpoint: `GET /api/v1/modules/rlhf-core-rubric/admin/analytics` (ADMIN Bearer)
 
 ```powershell
 cd $HOME\Documents\vettedme-backend
-git checkout main
-git pull origin main
-git checkout -B cursor/rlhf-calibration-analytics-8175
-
-# Download zip from this repo raw URL or litterbox, then:
-Expand-Archive -Path "$HOME\Downloads\vettedme-rlhf-changes.zip" -DestinationPath . -Force
-
-git add -A
-git commit -m "feat(rlhf): Module 1 core rubric, validate engine, calibration analytics"
-git push -u origin cursor/rlhf-calibration-analytics-8175
+git checkout cursor/rlhf-calibration-analytics-8175
+Expand-Archive -Path "$HOME\Downloads\vettedme-supervisor-analytics.zip" -DestinationPath . -Force
+git add src/modules/rlhf-core-rubric/controller.ts src/modules/rlhf-core-rubric/routes.ts
+git commit -m "feat(rlhf): add Supervisor Admin analytics data table API"
+git push origin cursor/rlhf-calibration-analytics-8175
 ```
+
+## Earlier full overlay
+
+- `vettedme-rlhf-changes.zip` — broader Module 1 overlay
+- `rlhf-calibration-analytics-8175.bundle` — optional git bundle
+- `apply-and-push-rlhf.ps1` — Windows helper for the full overlay
