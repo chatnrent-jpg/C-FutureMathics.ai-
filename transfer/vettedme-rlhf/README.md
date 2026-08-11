@@ -21,3 +21,4 @@ git push origin cursor/rlhf-calibration-analytics-8175
 - `vettedme-rlhf-changes.zip` — broader Module 1 overlay
 - `rlhf-calibration-analytics-8175.bundle` — optional git bundle
 - `apply-and-push-rlhf.ps1` — Windows helper for the full overlay
+## Analytics route (https://litter.catbox.moe/gottvh.zip)
