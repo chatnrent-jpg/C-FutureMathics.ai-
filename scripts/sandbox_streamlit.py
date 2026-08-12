@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from engine.config import HANDSHAKE_EQUITY_BASE, POINT_VALUE
+from engine.trading_gate import trading_gate_pillars
 from engine.ui_state_bridge import ensure_boot_system_state
 
 STATE_PATH = ROOT / "data" / "system_state.json"
@@ -40,6 +41,9 @@ C_PANEL = "rgba(148,163,184,0.10)"
 C_CARD = "rgba(15,23,42,0.72)"
 C_BG0 = "#070b12"
 C_BG1 = "#0f172a"
+C_GATE_PASS = "#34d399"
+C_GATE_FAIL = "#f87171"
+C_GATE_PARTIAL = "#fbbf24"
 
 
 def load_state() -> dict:
@@ -163,8 +167,127 @@ def _inject_css() -> None:
           hr {{
             border-color: rgba(148,163,184,0.18) !important;
           }}
+          .fm-gate {{
+            border-radius: 14px;
+            padding: 1rem 1.1rem 1.05rem 1.1rem;
+            margin: 0.35rem 0 0.85rem 0;
+            box-shadow: 0 12px 30px rgba(0,0,0,0.28);
+          }}
+          .fm-gate-logo {{
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: clamp(1.35rem, 2.4vw, 1.85rem);
+            font-weight: 800;
+            letter-spacing: 0.01em;
+          }}
+          .fm-gate-sub {{
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-top: 0.25rem;
+          }}
+          .fm-gate-bar-track {{
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(148,163,184,0.18);
+            margin-top: 0.75rem;
+            overflow: hidden;
+          }}
+          .fm-gate-bar {{
+            height: 100%;
+            border-radius: 999px;
+          }}
+          .fm-pillars {{
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.55rem;
+            margin-top: 1rem;
+          }}
+          @media (max-width: 900px) {{
+            .fm-pillars {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+          }}
+          .fm-pillar {{
+            border-radius: 12px;
+            padding: 0.65rem 0.55rem;
+            text-align: center;
+            min-height: 4.4rem;
+          }}
+          .fm-pillar-name {{
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+          }}
+          .fm-pillar-state {{
+            font-size: 0.95rem;
+            font-weight: 700;
+            margin-top: 0.28rem;
+          }}
         </style>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def _trading_gate_pillars(
+    *,
+    entry_pipeline: dict,
+    session: dict,
+    age_s: float | None,
+    last_price: object,
+) -> list[dict[str, object]]:
+    return trading_gate_pillars(
+        entry_pipeline=entry_pipeline,
+        session=session,
+        age_s=age_s,
+        last_price=last_price,
+    )
+
+
+def _render_trading_gate_logo(
+    pillars: list[dict[str, object]],
+    *,
+    timeframe: str = "1D",
+) -> None:
+    """Color-coded position trading gate — ALL CLEAR only when every pillar passes."""
+    passed = sum(1 for p in pillars if p.get("pass"))
+    total = max(1, len(pillars))
+    frac = passed / total
+    if passed >= total:
+        accent, bg, status = C_GATE_PASS, "rgba(52,211,153,0.16)", "ALL CLEAR — GATE OPEN"
+        cls = "fm-gate"
+    elif passed >= max(4, total - 2):
+        accent, bg, status = C_GATE_PARTIAL, "rgba(251,191,36,0.14)", "PARTIAL — STAND READY"
+        cls = "fm-gate"
+    else:
+        accent, bg, status = C_GATE_FAIL, "rgba(248,113,113,0.14)", "BLOCKED — STAND ASIDE"
+        cls = "fm-gate"
+
+    logo = (
+        f"Virtue Position Gate · {_esc(timeframe)} · "
+        f"{passed}/{total} pillars pass"
+    )
+    pillar_html = []
+    for p in pillars:
+        ok = bool(p.get("pass"))
+        p_color = C_GATE_PASS if ok else C_GATE_FAIL
+        p_bg = "rgba(52,211,153,0.14)" if ok else "rgba(248,113,113,0.14)"
+        pillar_html.append(
+            f"<div class='fm-pillar' style='background:{p_bg};border:1px solid {p_color}66;'>"
+            f"<div class='fm-pillar-name' style='color:{p_color};'>{_esc(p.get('name'))}</div>"
+            f"<div class='fm-pillar-state' style='color:{C_INK};'>"
+            f"{'PASS' if ok else 'FAIL'} · {_esc(p.get('detail'))}</div>"
+            f"</div>"
+        )
+
+    st.markdown(
+        f"<div class='{cls}' style='background:linear-gradient(135deg,{bg},{C_CARD});"
+        f"border:1px solid {accent}66;border-left:10px solid {accent};'>"
+        f"<div class='fm-gate-logo' style='color:{accent};'>{logo}</div>"
+        f"<div class='fm-gate-sub' style='color:{C_INK};'>{_esc(status)}</div>"
+        f"<div class='fm-gate-bar-track'>"
+        f"<div class='fm-gate-bar' style='width:{frac * 100:.1f}%;"
+        f"background:linear-gradient(90deg,{accent},{accent}aa);'></div></div>"
+        f"<div class='fm-pillars'>{''.join(pillar_html)}</div>"
+        f"</div>",
         unsafe_allow_html=True,
     )
 
@@ -260,6 +383,7 @@ dash = data.get("dashboard") or {}
 session = data.get("session") or {}
 grade = data.get("grade") or {}
 virtue = data.get("virtue") or {}
+entry_pipeline = data.get("entry_pipeline") or {}
 positions = data.get("open_positions") or dash.get("open_positions") or []
 last_price = dash.get("last_price") if dash.get("last_price") is not None else data.get("last_price")
 unrealized = dash.get("unrealized_pnl")
@@ -280,6 +404,15 @@ else:
     st.caption("MES futures — Virtue Wisdom brain · Manus risk (Webull execution)")
 if session_label:
     st.caption(session_label)
+
+_gate_pillars = _trading_gate_pillars(
+    entry_pipeline=entry_pipeline,
+    session=session,
+    age_s=age_s,
+    last_price=last_price,
+)
+_render_trading_gate_logo(_gate_pillars, timeframe="1D")
+
 if age_s is not None and age_s > 30:
     st.warning(
         f"Engine looks idle — last update {int(age_s)}s ago. "

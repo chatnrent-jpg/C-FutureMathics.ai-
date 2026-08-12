@@ -210,25 +210,12 @@ def virtue_entries_allowed(
     Requires session open AND (primary RTH windows OR extreme-trend override
     OR clear below-VWAP short structure).
     CME overnight mode additionally blocks 16:45–17:00 ET pre-maintenance.
-    
-    Simple stack mode: allow entries ANY time session is open (full RTH / Globex).
+
+    Quality policy: never FULL_SESSION spray — even if simple_stack is enabled.
     """
     if not virtue_session_open(now):
         return False
-    
-    # Simple stack: full session trading (no window restrictions)
-    from engine.config import virtue_simple_stack
-    if virtue_simple_stack():
-        dt = _et_now(now)
-        if virtue_session_mode() == "cme" and live_allow_overnight():
-            if dt.weekday() < 5:
-                t = dt.time()
-                cut = time(VIRTUE_CME_NO_NEW_ENTRY_HOUR, VIRTUE_CME_NO_NEW_ENTRY_MINUTE)
-                maint_start = time(17, 0)
-                if cut <= t < maint_start:
-                    return False
-        return True
-    
+
     # Standard mode: strict entry windows + overrides
     in_window = allow_new_entries(now)
     if not in_window:
@@ -257,7 +244,7 @@ def virtue_session_label() -> str:
     src = primary_data_source()
     from engine.config import virtue_simple_stack
     if virtue_simple_stack():
-        windows = "entries=FULL_SESSION (simple_stack)"
+        windows = "entries=09:45-11:30&13:45-15:55ET+extreme (simple_stack+quality)"
     else:
         windows = "entries=09:45-11:30&13:45-15:55ET+extreme"
     if mode == "cme":

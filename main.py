@@ -156,7 +156,10 @@ from engine.config import (
     fixed_fractional_risk_pct,
     forward_test_force_paper,
     primary_data_source,
+    virtue_max_tactical_trades_per_day,
     virtue_session_mode,
+    virtue_simple_stack,
+    virtue_soft_loss_blocks_entries,
 )
 
 _ET = ZoneInfo(FORWARD_TEST_TIMEZONE)
@@ -186,6 +189,30 @@ logging.basicConfig(
 logger = logging.getLogger("virtue.main")
 
 
+def _block_new_entry(
+    session: "VirtueSession",
+    block_reason: str,
+    *,
+    wisdom_reason: str | None = None,
+) -> None:
+    """
+    Temperance/Justice: Courage does not fire.
+
+    Surfaces an honest STAND ASIDE reason so the dashboard cannot show
+    SHORT SETUP + Signal FLAT with GATE OPEN and no explanation.
+    """
+    session.last_action = "FLAT"
+    session.last_entry_block_reason = str(block_reason or "entry_blocked")
+    prior = str(wisdom_reason or session.last_signal_reason or "").strip()
+    tag = str(block_reason or "entry_blocked")
+    if prior and not prior.upper().startswith("STAND ASIDE"):
+        session.last_signal_reason = (
+            f"STAND ASIDE | {tag} — prior setup: {prior[:140]}"
+        )
+    elif not prior.upper().startswith("STAND ASIDE"):
+        session.last_signal_reason = f"STAND ASIDE | {tag}"
+
+
 @dataclass
 class VirtueSession:
     cycle: int = 0
@@ -201,6 +228,7 @@ class VirtueSession:
     last_risk_reason: str = ""
     last_regime: str = ""
     last_signal_reason: str = ""
+    last_entry_block_reason: str = ""  # Temperance/Justice gate that blocked Courage
     last_adx: float = 0.0
     last_atr_pct: float = 0.0
     last_vwap_score: float = 50.0
@@ -2321,23 +2349,24 @@ async def run_cycle(
     )
     from engine.config import virtue_simple_stack
 
-    if virtue_simple_stack():
-        structure_ok, structure_reason = True, "simple_stack:structure_waived"
-    else:
-        structure_ok, structure_reason = evaluate_entry_structure_gates(
-            session,
-            atr=float(decision.atr),
-            adx=float(decision.adx),
-            vwap=float(decision.vwap),
-            twap=float(decision.twap),
-            price=float(price),
-            adx_min=(
-                float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
-                if below_vwap_short_structure
-                else None
-            ),
-            below_vwap_short=below_vwap_short_structure,
-        )
+    # Quality policy: never waive structure memory — simple_stack only simplifies
+    # signal family, not Justice structure / ATR-rise checks.
+    structure_ok, structure_reason = evaluate_entry_structure_gates(
+        session,
+        atr=float(decision.atr),
+        adx=float(decision.adx),
+        vwap=float(decision.vwap),
+        twap=float(decision.twap),
+        price=float(price),
+        adx_min=(
+            float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
+            if below_vwap_short_structure
+            else None
+        ),
+        below_vwap_short=below_vwap_short_structure,
+    )
+    if virtue_simple_stack() and structure_ok:
+        structure_reason = f"simple_stack+structure:{structure_reason}"
     session.last_structure_ok = bool(structure_ok)
     session.last_structure_reason = str(structure_reason)
     commit_entry_structure_memory(
@@ -2358,11 +2387,11 @@ async def run_cycle(
     # Temperance + velocity: widen bands after losses / course_correct / low ADX.
     # Enables same-cycle flip when opposite streak is already ready (Courage).
     base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
+    # Quality: keep velocity / temperance friction even in band-first mode.
+    vel_penalty = velocity_blend_penalty(adx=float(decision.adx))
     if virtue_simple_stack():
-        blend_buffer_raw = 0.0
-        vel_penalty = 0.0
-    else:
-        vel_penalty = velocity_blend_penalty(adx=float(decision.adx))
+        # Soften temperance blend widen slightly, never zero the ADX velocity gate.
+        blend_buffer_raw = min(float(blend_buffer_raw), 2.0)
     update_macro_bias(
         session,
         regime=decision.regime.value,
@@ -2546,11 +2575,7 @@ async def run_cycle(
     # ============================================================
     # PHASE 2 — TACTICAL IN-FLIGHT ESCAPES (core uses structural invalidation)
     # ============================================================
-    if (
-        bool(session.tactical_active)
-        and int(session.tactical_size) > 0
-        and not virtue_simple_stack()
-    ):
+    if bool(session.tactical_active) and int(session.tactical_size) > 0:
         tac_side = str(session.tactical_side or "FLAT").upper()
         cc_hit, cc_reason = check_course_correct(
             tac_side, float(decision.blended_score)
@@ -2833,30 +2858,54 @@ async def run_cycle(
         return
 
     # Temperance: hard daily tactical round-trip cap (counted on close).
-    if int(session.trades_today) >= int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY):
+    day_cap = int(virtue_max_tactical_trades_per_day())
+    if int(session.trades_today) >= day_cap:
         logger.info(
             "CYCLE %s tactical_day_cap trades_today=%s >= %s — stand aside "
             "(Temperance; no more satellite entries today)",
             session.cycle,
             session.trades_today,
-            int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
+            day_cap,
         )
-        session.last_action = "FLAT"
+        _block_new_entry(
+            session,
+            f"tactical_day_cap_{session.trades_today}/{day_cap}",
+            wisdom_reason=decision.reason,
+        )
         return
 
-    # Wisdom: freeze tactical satellite in weak ADX — except below-VWAP shorts
-    # (proxy ADX under-reads; SHORT SETUP already cleared the soft floor).
+    # Temperance: soft daily loss → no new entries (Courage stays flat).
+    if virtue_soft_loss_blocks_entries():
+        try:
+            soft_cap = float(session.risk.max_daily_loss_soft)
+        except Exception:
+            soft_cap = 0.0
+        if soft_cap > 0 and float(session.realized_pnl_today) <= -soft_cap:
+            logger.warning(
+                "CYCLE %s soft_daily_loss_no_new_entries pnl=%.2f soft=%.2f — "
+                "stand aside (Temperance; manage/exit only)",
+                session.cycle,
+                float(session.realized_pnl_today),
+                soft_cap,
+            )
+            session.last_risk_verdict = RiskVerdict.REDUCE_SIZE.value
+            session.last_risk_reason = "soft_daily_loss_no_new_entries"
+            _block_new_entry(
+                session,
+                "soft_daily_loss_no_new_entries",
+                wisdom_reason=decision.reason,
+            )
+            return
+
+    # Wisdom: freeze tactical satellite in weak ADX — always (simple_stack included).
+    # Below-VWAP shorts may use the softer floor, never a free pass below it.
     below_vwap_short = (
         str(decision.action.value).upper() == "SHORT"
         and float(decision.vwap or 0.0) > 0
         and float(price) < float(decision.vwap)
         and float(decision.adx) >= float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN)
     )
-    if (
-        not virtue_simple_stack()
-        and float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN)
-        and not below_vwap_short
-    ):
+    if float(decision.adx) < float(VIRTUE_TACTICAL_ADX_MIN) and not below_vwap_short:
         logger.info(
             "CYCLE %s tactical_adx_freeze adx=%.1f < %.1f — no satellite entry "
             "(stand aside micro; core may still manage structurally)",
@@ -2864,7 +2913,11 @@ async def run_cycle(
             float(decision.adx),
             float(VIRTUE_TACTICAL_ADX_MIN),
         )
-        session.last_action = "FLAT"
+        _block_new_entry(
+            session,
+            f"tactical_adx_freeze_{decision.adx:.1f}",
+            wisdom_reason=decision.reason,
+        )
         return
 
     # Temperance: Virtue Balance hard floor + circuit breaker — no new entries.
@@ -2956,7 +3009,7 @@ async def run_cycle(
     # Temperance sizing / blend friction from last_trade_outcome (side-aware waiver).
     base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
     if virtue_simple_stack():
-        blend_buffer_raw = 0.0
+        blend_buffer_raw = min(float(blend_buffer_raw), 2.0)
     side_buf = effective_temperance_blend_buffer(
         blend_buffer_raw,
         side=decision.action.value,
@@ -3003,8 +3056,7 @@ async def run_cycle(
         need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
     if float(decision.adx) >= float(VIRTUE_EXTREME_ADX_OVERRIDE):
         need_streak = 1
-    if virtue_simple_stack():
-        need_streak = 1
+    # Quality: never collapse confirmation streak to 1 just because simple_stack is on.
     side = decision.action.value
     if side == "LONG":
         if session.long_streak < need_streak:
@@ -3040,54 +3092,54 @@ async def run_cycle(
     blend = float(decision.blended_score)
 
     if virtue_simple_stack():
-        # Simple stack: band signal already cleared — skip velocity/chase/pullback/bias gates.
-        session.require_tp_pullback = False
+        # Band-first signal family — still run pipeline / chase / ADX short floor.
         logger.info(
-            "CYCLE %s SIMPLE_STACK_ENTRY side=%s blend=%.1f streak=%s — "
-            "bands only (pipeline/chase/pullback/bias waived)",
+            "CYCLE %s SIMPLE_STACK_ENTRY side=%s blend=%.1f streak=%s adx=%.1f — "
+            "bands + ADX/pipeline quality gates",
             session.cycle,
             side,
             blend,
             session.long_streak if side == "LONG" else session.short_streak,
+            float(decision.adx),
         )
-    else:
-        # Pipeline validation — Temperance + ADX velocity gate + bull-day short asymmetry.
-        pipe_ok, pipe_reason = verify_pipeline_entry(
-            side,
-            pipeline_system_state(
-                session, blend=blend, adx=float(decision.adx)
-            ),
-        )
-        if not pipe_ok:
-            logger.info(
-                "CYCLE %s LAYER2_pipeline_entry_denied %s — stand aside",
-                session.cycle,
-                pipe_reason,
-            )
-            session.last_action = "FLAT"
-            return
 
-        if side == "LONG" and blend >= float(VIRTUE_SCORE_LONG_CHASE_MAX):
-            logger.info(
-                "CYCLE %s chase_filter LONG blend=%.1f >= %.1f — stand aside (move already extended)",
-                session.cycle,
-                blend,
-                VIRTUE_SCORE_LONG_CHASE_MAX,
-            )
-            session.last_action = "FLAT"
-            return
-        if side == "SHORT" and blend <= float(VIRTUE_SCORE_SHORT_CHASE_MIN):
-            logger.info(
-                "CYCLE %s chase_filter SHORT blend=%.1f <= %.1f — stand aside (move already extended)",
-                session.cycle,
-                blend,
-                VIRTUE_SCORE_SHORT_CHASE_MIN,
-            )
-            session.last_action = "FLAT"
-            return
+    # Pipeline validation — Temperance + ADX velocity gate + bull-day short asymmetry.
+    pipe_ok, pipe_reason = verify_pipeline_entry(
+        side,
+        pipeline_system_state(
+            session, blend=blend, adx=float(decision.adx)
+        ),
+    )
+    if not pipe_ok:
+        logger.info(
+            "CYCLE %s LAYER2_pipeline_entry_denied %s — stand aside",
+            session.cycle,
+            pipe_reason,
+        )
+        _block_new_entry(session, f"pipeline:{pipe_reason}", wisdom_reason=decision.reason)
+        return
+
+    if side == "LONG" and blend >= float(VIRTUE_SCORE_LONG_CHASE_MAX):
+        logger.info(
+            "CYCLE %s chase_filter LONG blend=%.1f >= %.1f — stand aside (move already extended)",
+            session.cycle,
+            blend,
+            VIRTUE_SCORE_LONG_CHASE_MAX,
+        )
+        _block_new_entry(session, "chase_filter_long", wisdom_reason=decision.reason)
+        return
+    if side == "SHORT" and blend <= float(VIRTUE_SCORE_SHORT_CHASE_MIN):
+        logger.info(
+            "CYCLE %s chase_filter SHORT blend=%.1f <= %.1f — stand aside (move already extended)",
+            session.cycle,
+            blend,
+            VIRTUE_SCORE_SHORT_CHASE_MIN,
+        )
+        _block_new_entry(session, "chase_filter_short", wisdom_reason=decision.reason)
+        return
 
     # Temperance: after multi-TP streak, require blend pullback before re-entering.
-    if (not virtue_simple_stack()) and session.require_tp_pullback:
+    if session.require_tp_pullback:
         if side == "LONG" and blend > float(VIRTUE_POST_TP_PULLBACK_BLEND_LONG):
             logger.info(
                 "CYCLE %s post_tp_pullback LONG blend=%.1f > %.1f — wait for cool-off "
@@ -3123,7 +3175,7 @@ async def run_cycle(
         )
 
     # Wisdom: shorts — standard ADX floor, or softer when price < session VWAP.
-    if (not virtue_simple_stack()) and side == "SHORT":
+    if side == "SHORT":
         px_now = float(price)
         vwap_now = float(decision.vwap or 0.0)
         below_vwap = vwap_now > 0 and px_now < vwap_now
@@ -3141,7 +3193,11 @@ async def run_cycle(
                 short_adx_need,
                 below_vwap,
             )
-            session.last_action = "FLAT"
+            _block_new_entry(
+                session,
+                f"short_adx_too_weak_{decision.adx:.1f}",
+                wisdom_reason=decision.reason,
+            )
             return
 
     # Layer 2b — hard bull-day short extremes (ADX + blend) after pipeline blend gate.
@@ -3153,21 +3209,22 @@ async def run_cycle(
         adx=float(decision.adx),
         vwap_score=float(decision.vwap_score),
     )
-    if not virtue_simple_stack():
-        gate_ok, gate_reason = evaluate_directional_gate(
-            side,
-            macro_bias=session.macro_bias,
-            blend=blend,
-            adx=float(decision.adx),
+    gate_ok, gate_reason = evaluate_directional_gate(
+        side,
+        macro_bias=session.macro_bias,
+        blend=blend,
+        adx=float(decision.adx),
+    )
+    if not gate_ok:
+        logger.info(
+            "CYCLE %s LAYER2_directional_gate_denied %s — stand aside",
+            session.cycle,
+            gate_reason,
         )
-        if not gate_ok:
-            logger.info(
-                "CYCLE %s LAYER2_directional_gate_denied %s — stand aside",
-                session.cycle,
-                gate_reason,
-            )
-            session.last_action = "FLAT"
-            return
+        _block_new_entry(
+            session, f"directional:{gate_reason}", wisdom_reason=decision.reason
+        )
+        return
 
     # Net Exposure Rule — tactical may fire only when aligned with core (or core flat).
     tac_ok, tac_reason = tactical_entry_allowed(
@@ -3334,6 +3391,19 @@ async def run_cycle(
         return
 
     if verdict == RiskVerdict.REDUCE_SIZE:
+        # Temperance quality: soft daily loss blocks new entries entirely.
+        if virtue_soft_loss_blocks_entries() and "soft_daily_loss" in str(reason):
+            logger.warning(
+                "CYCLE %s MANUS_SOFT_LOSS_BLOCK reason=%s — no new entries",
+                session.cycle,
+                reason,
+            )
+            _block_new_entry(
+                session,
+                "soft_daily_loss_no_new_entries",
+                wisdom_reason=decision.reason,
+            )
+            return
         if contracts <= 1:
             logger.warning(
                 "CYCLE %s MANUS_REDUCE_MIN_LOT reason=%s — keep 1 MES (cannot shrink further)",
@@ -3510,12 +3580,15 @@ async def run_loop(
 
     if _boot_simple_stack():
         logger.info(
-            "BOOT SIMPLE_STACK_ENABLED bands+stop+tp+peak_lock+time_decay — "
-            "ADX/EMA/macro/structure/velocity/streak/course_correct/chase/pullback waived"
+            "BOOT SIMPLE_STACK_ENABLED band-first signal family — "
+            "ADX>=tactical_min + structure + pipeline + windows still enforced (quality)"
         )
     else:
-        logger.warning(
-            "BOOT SIMPLE_STACK_DISABLED — full MacroMathics indicator stack active"
+        logger.info(
+            "BOOT QUALITY_STACK — full Wisdom ADX/EMA/macro/structure/velocity; "
+            "day_cap=%s soft_loss_blocks_entries=%s",
+            int(virtue_max_tactical_trades_per_day()),
+            bool(virtue_soft_loss_blocks_entries()),
         )
 
     # Absolute pipeline_resume from a prior process is meaningless after cycle→0.

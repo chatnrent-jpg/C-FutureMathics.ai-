@@ -614,15 +614,39 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Simple stack: one signal family — VWAP+TWAP bands only (chaos already handled).
-        # Skips EMA / ADX / lift / vol participation so indicators cannot veto each other.
+        # Quality stack: band signal still requires ADX (Wisdom — no chop as trend).
+        # Skips EMA/lift/vol veto pile-up only when ADX clears the tactical floor.
         try:
-            from engine.config import virtue_simple_stack as _virtue_simple_stack
+            from engine.config import (
+                virtue_simple_stack as _virtue_simple_stack,
+                VIRTUE_TACTICAL_ADX_MIN as _adx_floor,
+            )
 
             _simple = bool(_virtue_simple_stack())
+            _adx_need = float(_adx_floor)
         except Exception:
             _simple = False
+            _adx_need = float(self.adx_trend_min)
         if _simple:
+            if (enter_long or enter_short) and float(adx) < _adx_need:
+                return self._empty(
+                    regime=Regime.CHOP_NO_TRADE,
+                    action=SignalAction.FLAT,
+                    reason=(
+                        f"STAND ASIDE | SIMPLE STACK — "
+                        f"ADX {adx:.1f} < {_adx_need:.0f} (Wisdom: no band trade in weak trend) "
+                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f}"
+                    ),
+                    ema_fast=ema_fast,
+                    ema_slow=ema_slow,
+                    adx=adx,
+                    atr=atr,
+                    atr_pct=atr_pct,
+                    vwap=vwap,
+                    twap=twap,
+                    vwap_score=vwap_score,
+                    twap_score=twap_score,
+                )
             if enter_long:
                 return self._empty(
                     regime=Regime.TREND_BULL,
@@ -630,7 +654,7 @@ class WisdomStrategy:
                     reason=(
                         f"LONG SETUP | SIMPLE STACK — "
                         f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                        f"≥ enter {self.long_enter:.0f} (ADX/EMA/macro waived)"
+                        f"≥ enter {self.long_enter:.0f} (ADX {adx:.1f}≥{_adx_need:.0f})"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -649,7 +673,7 @@ class WisdomStrategy:
                     reason=(
                         f"SHORT SETUP | SIMPLE STACK — "
                         f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                        f"≤ enter {self.short_enter:.0f} (ADX/EMA/macro waived)"
+                        f"≤ enter {self.short_enter:.0f} (ADX {adx:.1f}≥{_adx_need:.0f})"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -681,7 +705,6 @@ class WisdomStrategy:
             )
 
         # Structural short: price below session VWAP + short scores + dead/low lift.
-        # Proxy ADX often stays <20 while day VWAP is clearly bear (VolumeWatch-aligned).
         price_below_vwap = price < vwap
         structural_short = bool(
             enter_short

@@ -411,7 +411,9 @@ def build_virtue_system_state(
         EXECUTION_SYMBOL,
         VIRTUE_POSITION_STOP_DOLLARS,
         forward_test_force_paper,
+        virtue_max_tactical_trades_per_day,
         virtue_session_mode,
+        virtue_soft_loss_blocks_entries,
     )
     from scripts.run_daily_session import virtue_session_label
 
@@ -546,6 +548,26 @@ def build_virtue_system_state(
             "virtue_pnl_lock_active": bool(
                 getattr(session, "virtue_pnl_lock_active", False)
             ),
+            "trades_today": int(getattr(session, "trades_today", 0) or 0),
+            "max_tactical_trades_per_day": int(virtue_max_tactical_trades_per_day()),
+            "day_cap_clear": int(getattr(session, "trades_today", 0) or 0)
+            < int(virtue_max_tactical_trades_per_day()),
+            "soft_loss_clear": not (
+                bool(virtue_soft_loss_blocks_entries())
+                and float(getattr(session, "realized_pnl_today", 0.0) or 0.0)
+                <= -float(
+                    getattr(getattr(session, "risk", None), "max_daily_loss_soft", 0.0)
+                    or 0.0
+                )
+                and float(
+                    getattr(getattr(session, "risk", None), "max_daily_loss_soft", 0.0)
+                    or 0.0
+                )
+                > 0
+            ),
+            "last_entry_block_reason": str(
+                getattr(session, "last_entry_block_reason", "") or ""
+            ),
             **_time_decay_pipeline_fields(session),
             **_temperance_pipeline_fields(session),
         },
@@ -575,6 +597,15 @@ def build_virtue_system_state(
             "session_date_et": str(getattr(session, "session_date_et", "") or ""),
             "open_risk_notional": open_risk,
             "trades_today": int(getattr(session, "trades_today", 0) or 0),
+            "max_tactical_trades_per_day": int(virtue_max_tactical_trades_per_day()),
+            "soft_daily_loss_blocks_entries": bool(virtue_soft_loss_blocks_entries()),
+            "soft_daily_loss_cap": round(
+                float(getattr(getattr(session, "risk", None), "max_daily_loss_soft", 0.0) or 0.0),
+                2,
+            ),
+            "last_entry_block_reason": str(
+                getattr(session, "last_entry_block_reason", "") or ""
+            ),
             "halted": bool(getattr(session, "halted", False)),
             "cycle_count": int(getattr(session, "cycle", 0) or 0),
             "last_risk_verdict": last_risk_verdict,

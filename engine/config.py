@@ -98,12 +98,14 @@ MAX_ACCOUNT_CONTRACT_CEILING = 1
 # Override at runtime: FM_VIRTUE_CORE_ENABLED=1|0
 VIRTUE_CORE_ENABLED = False
 VIRTUE_CORE_SIZE = 1  # structural anchor sleeve (ignored when core disabled)
-# MacroMathics simple stack — strip overlapping indicators that confuse the hot path.
-# Keep: VWAP+TWAP bands, chaos ATR, stop/TP, peak lock, time decay, hours/halt.
-# Kill: EMA/ADX/macro participation, structure rise, velocity, streak>1, course_correct,
-# chase, post-TP pullback, bull-day directional gate, temperance blend widening.
-# Override: FM_VIRTUE_SIMPLE_STACK=0 to restore the full indicator stack.
-VIRTUE_SIMPLE_STACK = True
+# MacroMathics simple stack — OPTIONAL (default OFF).
+# When ON: VWAP+TWAP bands still require ADX >= VIRTUE_TACTICAL_ADX_MIN (Wisdom).
+# Full stack is the quality default — ADX/EMA/macro/structure/velocity stay active.
+# Override: FM_VIRTUE_SIMPLE_STACK=1 to enable band-first mode (ADX floor still enforced).
+VIRTUE_SIMPLE_STACK = False
+# Temperance: soft daily loss blocks NEW entries (not merely REDUCE_SIZE).
+# Override: FM_VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES=0 to restore shrink-only soft loss.
+VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES = True
 VIRTUE_CORE_CONFIRM_CYCLES = 5  # HTF bias+ADX confirm before opening core
 VIRTUE_CORE_STRUCTURAL_ADX_MIN = 22.0
 # Slow Invalidation depth from the long edge (sticky through NEUTRAL).
@@ -242,8 +244,8 @@ DATABENTO_MAX_QUOTE_AGE_S = 5.0
 VIRTUE_ENTRY_ADX_MIN = 20.0
 VIRTUE_ADX_ENTER_MIN = 20.0      # flat long entries need trend strength (Wisdom)
 VIRTUE_ADX_SHORT_ENTER_MIN = 20.0  # default short floor when not below session VWAP
-# Proxy ADX under-reads: allow shorts when price < session VWAP + short scores.
-VIRTUE_ADX_SHORT_BELOW_VWAP_MIN = 8.0
+# Below-VWAP shorts still need real trend — was 8.0 (chop magnet); align nearer enter floor.
+VIRTUE_ADX_SHORT_BELOW_VWAP_MIN = 18.0
 VIRTUE_TACTICAL_ADX_MIN = 20.0
 VIRTUE_VELOCITY_ADX_FLOOR = 20.0
 # Latch day bias BEAR when session VWAP score stays at/below this (tape > sticky BULL).
@@ -263,7 +265,9 @@ VIRTUE_VOL_CONVICTION_SHORT_MIN = 40.0
 VIRTUE_MARKET_LIFT_SHORT_MAX = 45.0  # shorts need lift in bear/neutral zone
 VIRTUE_VOL_DEAD_MAX = 35.0  # below → stand aside both ways (no participation)
 # Hard daily round-trip cap for tactical sleeve (Temperance).
-VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 12
+# Quality policy: few high-conviction trades — was 12 (death-by-scratch).
+# Override: FM_VIRTUE_MAX_TACTICAL_TRADES_PER_DAY=<n>
+VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 3
 # Bull-day asymmetric short filter — counter-trend shorts need confirmation.
 # Lowered from 25: sticky BULL bias must not hard-block clear below-VWAP bears.
 VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
@@ -546,11 +550,31 @@ def _env_bool_override(name: str, default: bool) -> bool:
 
 def virtue_simple_stack() -> bool:
     """
-    MacroMathics simple stack (Wisdom: one signal family).
+    MacroMathics simple stack (band-first signal family).
 
-    Default True. Override: FM_VIRTUE_SIMPLE_STACK=0|1.
+    Default False (full Wisdom stack). Override: FM_VIRTUE_SIMPLE_STACK=0|1.
+    Even when True, live entries still require ADX >= VIRTUE_TACTICAL_ADX_MIN.
     """
     return _env_bool_override("FM_VIRTUE_SIMPLE_STACK", bool(VIRTUE_SIMPLE_STACK))
+
+
+def virtue_soft_loss_blocks_entries() -> bool:
+    """Temperance: soft daily loss → no new entries (not just shrink size)."""
+    return _env_bool_override(
+        "FM_VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES",
+        bool(VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES),
+    )
+
+
+def virtue_max_tactical_trades_per_day() -> int:
+    """Temperance day-trade cap (round-trips counted on close)."""
+    raw = os.getenv("FM_VIRTUE_MAX_TACTICAL_TRADES_PER_DAY", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(1, int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY))
 
 
 def account_contract_ceiling_limit() -> int:

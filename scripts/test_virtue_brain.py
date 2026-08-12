@@ -135,11 +135,11 @@ def test_hold_path_ignores_chaos_atr_spike() -> None:
 
 
 def test_simple_stack_blend_only_entry() -> None:
-    """Simple stack: hot VWAP/TWAP prints LONG even with dead macro participation."""
+    """Simple stack: hot VWAP/TWAP prints LONG when ADX clears the tactical floor."""
     import os
     from engine.config import virtue_simple_stack
 
-    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)  # default True
+    os.environ["FM_VIRTUE_SIMPLE_STACK"] = "1"
     assert virtue_simple_stack() is True
     s = WisdomStrategy(
         atr_pct_chaos_max=50.0,
@@ -155,6 +155,33 @@ def test_simple_stack_blend_only_entry() -> None:
     d = s.evaluate()
     assert d.action == SignalAction.LONG
     assert "SIMPLE STACK" in d.reason
+    assert d.adx >= 20.0
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+
+
+def test_simple_stack_adx_stand_aside() -> None:
+    """Quality: simple stack must STAND ASIDE when ADX is weak (no chop as trend)."""
+    import os
+    from engine.config import virtue_simple_stack
+
+    os.environ["FM_VIRTUE_SIMPLE_STACK"] = "1"
+    assert virtue_simple_stack() is True
+    s = WisdomStrategy(
+        atr_pct_chaos_max=50.0,
+        adx_trend_min=20.0,
+        vol_dead_max=35.0,
+    )
+    # Sideways → weak ADX, but force enter bands via synthetic scores path:
+    # seed mild oscillation around mean so scores may enter while ADX stays soft.
+    s.seed(_trending_bars(80, bull=True, step=0.05))
+    d = s.evaluate()
+    # Either flat for bands OR flat for ADX — never a waived-ADX long/short.
+    if d.action in (SignalAction.LONG, SignalAction.SHORT):
+        assert d.adx >= 20.0
+        assert "waived" not in d.reason.lower()
+    else:
+        assert d.action == SignalAction.FLAT
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
 
 
 def test_market_lift_and_vol_conviction_scores() -> None:
@@ -647,7 +674,18 @@ def test_session_uses_timely_entry_band() -> None:
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 3
+    from engine.config import (
+        VIRTUE_ADX_SHORT_BELOW_VWAP_MIN,
+        VIRTUE_SIMPLE_STACK,
+        virtue_simple_stack,
+        virtue_soft_loss_blocks_entries,
+    )
+
+    assert float(VIRTUE_ADX_SHORT_BELOW_VWAP_MIN) == 18.0
+    assert VIRTUE_SIMPLE_STACK is False
+    assert virtue_simple_stack() is False
+    assert virtue_soft_loss_blocks_entries() is True
     assert int(VIRTUE_POST_TP_STREAK_PULLBACK_AFTER) == 2
     assert int(VIRTUE_REQUIRED_STREAK) == 2
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 85.0
@@ -1589,7 +1627,7 @@ def test_anti_churn_temperance_gates() -> None:
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 3
 
     # Mid-band must not flatten
     assert check_course_correct("LONG", 50.0)[0] is False
@@ -2031,6 +2069,70 @@ def test_sleeve_pnl_uses_sleeve_entry_not_broker_avg() -> None:
     asyncio.run(_run())
 
 
+def test_quality_policy_soft_loss_and_day_cap_helpers() -> None:
+    """Temperance quality defaults: day cap 3, soft loss blocks entries, honest block reason."""
+    import os
+    from engine.config import (
+        virtue_max_tactical_trades_per_day,
+        virtue_soft_loss_blocks_entries,
+    )
+    from main import VirtueSession, _block_new_entry
+    from manus.capital_protection import CapitalProtectionMatrix
+
+    os.environ.pop("FM_VIRTUE_MAX_TACTICAL_TRADES_PER_DAY", None)
+    os.environ.pop("FM_VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES", None)
+    assert int(virtue_max_tactical_trades_per_day()) == 3
+    assert virtue_soft_loss_blocks_entries() is True
+
+    s = VirtueSession()
+    s.risk = CapitalProtectionMatrix(account_nav=15_574.01, starting_nav=15_574.01)
+    soft = float(s.risk.max_daily_loss_soft)
+    assert soft > 0
+    # Soft ≈ 60% of hard; hard ≈ 2% NAV on paper
+    assert soft < float(s.risk.max_daily_loss_hard)
+
+    _block_new_entry(
+        s,
+        "soft_daily_loss_no_new_entries",
+        wisdom_reason="SHORT SETUP | SIMPLE STACK — blend 40",
+    )
+    assert s.last_action == "FLAT"
+    assert s.last_entry_block_reason == "soft_daily_loss_no_new_entries"
+    assert s.last_signal_reason.startswith("STAND ASIDE")
+    assert "SHORT SETUP" in s.last_signal_reason
+
+
+def test_trading_gate_includes_day_cap_and_soft_loss() -> None:
+    from engine.trading_gate import trading_gate_pillars
+
+    pillars = trading_gate_pillars(
+        entry_pipeline={
+            "layer1_streak_clear": True,
+            "allow_new_entries": True,
+            "entry_structure_ok": True,
+            "sleeve_reconcile_ok": True,
+            "day_cap_clear": False,
+            "soft_loss_clear": False,
+            "trades_today": 3,
+            "max_tactical_trades_per_day": 3,
+        },
+        session={
+            "trades_today": 3,
+            "max_tactical_trades_per_day": 3,
+            "realized_pnl_today": -200.0,
+            "soft_daily_loss_cap": 180.0,
+            "halted": False,
+        },
+        age_s=5.0,
+        last_price=6400.0,
+    )
+    by_key = {p["key"]: p for p in pillars}
+    assert by_key["day_cap"]["pass"] is False
+    assert by_key["soft_loss"]["pass"] is False
+    assert by_key["tape"]["pass"] is True
+    assert sum(1 for p in pillars if p["pass"]) < len(pillars)
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -2040,6 +2142,9 @@ if __name__ == "__main__":
     test_macro_participation_blocks_fake_long()
     test_hold_path_ignores_chaos_atr_spike()
     test_simple_stack_blend_only_entry()
+    test_simple_stack_adx_stand_aside()
+    test_quality_policy_soft_loss_and_day_cap_helpers()
+    test_trading_gate_includes_day_cap_and_soft_loss()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()
