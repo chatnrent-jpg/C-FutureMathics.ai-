@@ -39,8 +39,10 @@ try {
         "FM_VIRTUE_CORE_ENABLED=0",
         "FM_MAX_ACCOUNT_CONTRACT_CEILING=1",
         "FM_PAPER_MAX_MES_CONTRACTS=1",
-        # MacroMathics: bands + stop/TP/lock only (kill overlapping indicator gates)
-        "FM_VIRTUE_SIMPLE_STACK=1"
+        # Quality policy: full Wisdom stack (not simple_stack chop spray)
+        "FM_VIRTUE_SIMPLE_STACK=0",
+        "FM_VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES=1",
+        "FM_VIRTUE_MAX_TACTICAL_TRADES_PER_DAY=3"
     )
     if ($dbKey) {
         $envLines += "DATABENTO_API_KEY=$dbKey"
@@ -79,6 +81,7 @@ scp @ssh `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `
     "$Root\engine\ui_state_bridge.py" `
+    "$Root\engine\trading_gate.py" `
     "${Remote}:/home/ubuntu/FutureMathics.ai/engine/"
 
 scp @ssh `

@@ -39,11 +39,30 @@ scp -i "$KEY" -o StrictHostKeyChecking=no \
   "$ROOT_LOCAL/engine/futures_broker_adapter.py" \
   "$ROOT_LOCAL/engine/env_loader.py" \
   "$ROOT_LOCAL/engine/ui_state_bridge.py" \
+  "$ROOT_LOCAL/engine/trading_gate.py" \
   "$REMOTE:/home/ubuntu/FutureMathics.ai/engine/"
 
 scp -i "$KEY" -o StrictHostKeyChecking=no \
   "$ROOT_LOCAL/scripts/run_daily_session.py" \
+  "$ROOT_LOCAL/scripts/sandbox_streamlit.py" \
   "$REMOTE:/home/ubuntu/FutureMathics.ai/scripts/"
+
+# Quality policy env (full Wisdom; soft-loss blocks; day cap 3)
+cat > /tmp/fm_quality_env.txt <<'ENV'
+FM_VIRTUE_SIMPLE_STACK=0
+FM_VIRTUE_SOFT_LOSS_BLOCKS_ENTRIES=1
+FM_VIRTUE_MAX_TACTICAL_TRADES_PER_DAY=3
+FM_VIRTUE_CORE_ENABLED=0
+FM_MAX_ACCOUNT_CONTRACT_CEILING=1
+FM_PAPER_MAX_MES_CONTRACTS=1
+ENV
+scp -i "$KEY" -o StrictHostKeyChecking=no \
+  /tmp/fm_quality_env.txt \
+  "$ROOT_LOCAL/scripts/merge_remote_env_keys.py" \
+  "$REMOTE:/tmp/"
+ssh -i "$KEY" -o StrictHostKeyChecking=no "$REMOTE" \
+  "python3 /tmp/merge_remote_env_keys.py --src /tmp/fm_quality_env.txt --envf /home/ubuntu/FutureMathics.ai/.env.local; rm -f /tmp/merge_remote_env_keys.py /tmp/fm_quality_env.txt"
+rm -f /tmp/fm_quality_env.txt
 
 scp -i "$KEY" -o StrictHostKeyChecking=no \
   "$ROOT_LOCAL/requirements.txt" \
