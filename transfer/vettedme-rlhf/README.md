@@ -22,3 +22,5 @@ git push origin cursor/rlhf-calibration-analytics-8175
 - `rlhf-calibration-analytics-8175.bundle` — optional git bundle
 - `apply-and-push-rlhf.ps1` — Windows helper for the full overlay
 ## Analytics route (https://litter.catbox.moe/gottvh.zip)
+
+## NICTM viva Zod (https://litter.catbox.moe/5zjq4v.zip)
