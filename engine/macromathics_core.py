@@ -165,7 +165,7 @@ def phase3_short_gate_with_bias(
 def cooldown_cycles_for_reason(reason: str, *, tp_streak: int = 0) -> int:
     """Map exit reason → absolute-cycle cooldown length (production template)."""
     r = (reason or "").strip().lower()
-    if "take_profit" in r:
+    if "take_profit" in r or "trailing_stop" in r:
         return int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) + (
             max(0, int(tp_streak)) * int(VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES)
         )

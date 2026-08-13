@@ -99,6 +99,9 @@ from engine.config import (
     VIRTUE_MIN_PRICE_MOVE_TICKS,
     VIRTUE_POSITION_STOP_DOLLARS,
     VIRTUE_POSITION_TP_DOLLARS,
+    VIRTUE_TRAIL_ARM_DOLLARS,
+    VIRTUE_TRAIL_DISTANCE_DOLLARS,
+    VIRTUE_TRAIL_FLOOR_DOLLARS,
     VIRTUE_BASE_TP_COOLDOWN_CYCLES,
     VIRTUE_HARD_STOP_COOLDOWN_CYCLES,
     VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES,
@@ -258,6 +261,9 @@ class VirtueSession:
     tactical_size: int = 0
     tactical_entry_price: float = 0.0
     tactical_realized_pnl_today: float = 0.0
+    # Trailing stop state (tactical sleeve; dollars scale with size = per contract × size)
+    tactical_peak_open_pnl: float = 0.0
+    tactical_trail_armed: bool = False
     is_running: bool = True  # False stops background state writer (run.py pattern)
     cycles_since_heartbeat: int = 0
     last_heartbeat_ok: bool = True
@@ -794,7 +800,7 @@ def verify_cooldown_validity(
 def target_ticks_from_atr(atr: float) -> int:
     """
     Legacy ATR take-profit helper (compat/tests).
-    Virtue live exits use VIRTUE_POSITION_TP_DOLLARS via take_profit_dollars_hit.
+    Virtue live winners exit via trailing stop; fixed TP is disabled (0).
     """
     from engine.config import VIRTUE_TP_ATR_MULT, VIRTUE_TP_MIN_TICKS
 
@@ -805,21 +811,72 @@ def target_ticks_from_atr(atr: float) -> int:
 
 
 def position_tp_ticks(contracts: int) -> int:
-    """Ticks of favorable move so position PnL ≈ VIRTUE_POSITION_TP_DOLLARS."""
-    n = max(1, int(contracts))
+    """
+    Legacy ticks for fixed dollar TP. Returns 0 when fixed TP is disabled
+    (trail mode). contracts kept for call-site compat.
+    """
+    del contracts  # per-contract trail; size scales dollars, not tick geometry here
     tv = float(TICK_VALUE)
-    if tv <= 0:
-        return 1
-    return max(1, int(math.ceil(float(VIRTUE_POSITION_TP_DOLLARS) / (tv * n))))
+    tp = float(VIRTUE_POSITION_TP_DOLLARS)
+    if tv <= 0 or tp <= 0:
+        return 0
+    return max(1, int(math.ceil(tp / tv)))
 
 
 def position_stop_ticks(contracts: int) -> int:
-    """Ticks of adverse move so position PnL ≈ -VIRTUE_POSITION_STOP_DOLLARS."""
-    n = max(1, int(contracts))
+    """
+    Ticks of adverse move so ONE contract ≈ -VIRTUE_POSITION_STOP_DOLLARS.
+    Position dollar stop scales as stop × size (Temperance per contract).
+    """
+    del contracts
     tv = float(TICK_VALUE)
     if tv <= 0:
         return 1
-    return max(1, int(math.ceil(float(VIRTUE_POSITION_STOP_DOLLARS) / (tv * n))))
+    return max(1, int(math.ceil(float(VIRTUE_POSITION_STOP_DOLLARS) / tv)))
+
+
+def _tactical_dollar_limits(size: int) -> tuple[float, float, float, float]:
+    """Per-contract knobs × size → (stop, arm, trail_dist, floor) dollars."""
+    n = max(1, int(size))
+    return (
+        float(VIRTUE_POSITION_STOP_DOLLARS) * n,
+        float(VIRTUE_TRAIL_ARM_DOLLARS) * n,
+        float(VIRTUE_TRAIL_DISTANCE_DOLLARS) * n,
+        float(VIRTUE_TRAIL_FLOOR_DOLLARS) * n,
+    )
+
+
+def update_tactical_trail(
+    session: VirtueSession, open_pnl: float
+) -> tuple[bool, float]:
+    """
+    Arm / advance tactical trailing stop from open PnL (per-contract scaled).
+
+    Returns (hit, trail_level). trail_level is -inf when not armed.
+    """
+    size = max(1, int(getattr(session, "tactical_size", 0) or 1))
+    _, arm_at, trail_dist, floor = _tactical_dollar_limits(size)
+    pnl = float(open_pnl)
+    peak = float(getattr(session, "tactical_peak_open_pnl", 0.0) or 0.0)
+    if pnl > peak:
+        peak = pnl
+        session.tactical_peak_open_pnl = peak
+    armed = bool(getattr(session, "tactical_trail_armed", False))
+    if not armed and pnl >= arm_at:
+        session.tactical_trail_armed = True
+        armed = True
+        logger.info(
+            "CYCLE %s TRAIL_ARMED open_pnl=%.2f arm=$%.0f peak=%.2f size=%s",
+            int(getattr(session, "cycle", 0) or 0),
+            pnl,
+            arm_at,
+            peak,
+            size,
+        )
+    if not armed:
+        return False, float("-inf")
+    trail_level = max(peak - trail_dist, floor)
+    return pnl <= trail_level + 1e-9, trail_level
 
 
 def et_session_date(now: datetime | None = None) -> str:
@@ -904,6 +961,8 @@ def _normalize_outcome_reason(reason: str) -> str:
     r = (reason or "").strip().lower()
     if r.startswith("take_profit") or "take_profit" in r:
         return "take_profit"
+    if "trailing_stop" in r:
+        return "trailing_stop"
     if r.startswith("stop_") or r.startswith("stop$") or r == "stop":
         return "stop"
     if "course_correct" in r:
@@ -1006,7 +1065,7 @@ def update_outcome_state(
 
     tp_streak_for_cd = int(session.consecutive_tp_streak)
 
-    if tag == "take_profit":
+    if tag == "take_profit" or (tag == "trailing_stop" and delta > 0):
         session.last_result = "WIN"
         session.consecutive_wins = int(session.consecutive_wins) + 1
         session.consecutive_losses = 0
@@ -1019,6 +1078,15 @@ def update_outcome_state(
             VIRTUE_POST_TP_STREAK_PULLBACK_AFTER
         ):
             session.require_tp_pullback = True
+
+    elif tag == "trailing_stop":
+        # Armed trail that somehow exits red — treat as stop (Temperance).
+        session.last_result = "LOSS"
+        session.consecutive_losses = int(session.consecutive_losses) + 1
+        session.consecutive_wins = 0
+        session.consecutive_tp_streak = 0
+        session.last_tp_timestamp = 0.0
+        session.require_tp_pullback = False
 
     elif tag == "course_correct":
         # Thesis broke — always LOSS friction even if exit printed green.
@@ -1087,6 +1155,7 @@ def update_outcome_state(
     )
     if tag not in {
         "take_profit",
+        "trailing_stop",
         "course_correct",
         "stop",
         "time_decay",
@@ -1182,6 +1251,8 @@ def _mark_tactical_open(
     session.tactical_size = max(1, int(size))
     session.tactical_entry_price = float(price)
     session.entry_cycle_marker = int(cycle)
+    session.tactical_peak_open_pnl = 0.0
+    session.tactical_trail_armed = False
 
 
 def _mark_tactical_flat(session: VirtueSession) -> None:
@@ -1190,6 +1261,8 @@ def _mark_tactical_flat(session: VirtueSession) -> None:
     session.tactical_size = 0
     session.tactical_entry_price = 0.0
     session.entry_cycle_marker = None
+    session.tactical_peak_open_pnl = 0.0
+    session.tactical_trail_armed = False
 
 
 def _mark_core_open(
@@ -1249,11 +1322,15 @@ def _persist_virtue_trade(
         trade_id = f"{sleeve_tag}-{uuid.uuid4().hex[:12].upper()}"
         pos_id = f"POS-{sleeve_tag}-{int(session.cycle)}"
         risk = abs(float(VIRTUE_POSITION_STOP_DOLLARS))
-        reward = abs(
-            float(VIRTUE_CORE_TP_DOLLARS)
-            if sleeve_tag == "CORE"
-            else float(VIRTUE_POSITION_TP_DOLLARS)
-        )
+        if sleeve_tag == "CORE":
+            reward = abs(float(VIRTUE_CORE_TP_DOLLARS))
+        else:
+            # Fixed TP off — log trail arm as expected reward per contract.
+            reward = abs(
+                float(VIRTUE_POSITION_TP_DOLLARS)
+                if float(VIRTUE_POSITION_TP_DOLLARS) > 0
+                else float(VIRTUE_TRAIL_ARM_DOLLARS)
+            )
         r_mult = (float(pnl) / risk) if risk > 1e-9 else 0.0
         nav = float(getattr(session.broker, "equity", 0.0) or 0.0)
         TradeHistoryDB().insert_trade(
@@ -2431,7 +2508,8 @@ async def run_cycle(
         "CYCLE %s regime=%s action=%s vwap=%.1f%% twap=%.1f%% blend=%.1f%% "
         "lift=%.1f%% vol_conv=%.1f%% "
         "px=%.2f vwap_px=%.2f twap_px=%.2f adx=%.1f atr=%.2f atr_pct=%.2f "
-        "tp=$%.0f (~%st) sl=$%.0f (~%st) open_pnl=%.2f long_streak=%s short_streak=%s "
+        "trail_arm=$%.0f trail=$%.0f floor=$%.0f (~tp%st) sl=$%.0f (~%st) "
+        "open_pnl=%.2f trail_armed=%s peak_pnl=%.2f long_streak=%s short_streak=%s "
         "macro_bias=%s temperance_buf=%.1f velocity=%.1f reason=%s exposure=%s",
         session.cycle,
         decision.regime.value,
@@ -2447,11 +2525,15 @@ async def run_cycle(
         decision.adx,
         decision.atr,
         decision.atr_pct,
-        float(VIRTUE_POSITION_TP_DOLLARS),
+        float(VIRTUE_TRAIL_ARM_DOLLARS),
+        float(VIRTUE_TRAIL_DISTANCE_DOLLARS),
+        float(VIRTUE_TRAIL_FLOOR_DOLLARS),
         tp_ticks,
         float(VIRTUE_POSITION_STOP_DOLLARS),
         sl_ticks,
         open_pnl,
+        bool(getattr(session, "tactical_trail_armed", False)),
+        float(getattr(session, "tactical_peak_open_pnl", 0.0) or 0.0),
         session.long_streak,
         session.short_streak,
         session.macro_bias,
@@ -2589,23 +2671,26 @@ async def run_cycle(
             return
 
     tactical_pnl = _tactical_open_pnl(session, price)
+    tac_size = max(1, int(session.tactical_size or 1))
+    stop_limit, trail_arm, trail_dist, trail_floor = _tactical_dollar_limits(tac_size)
 
-    # Dollar stop — tactical sleeve only (Temperance). Core ignores $ stop.
-    if bool(session.tactical_active) and tactical_pnl <= -float(
-        VIRTUE_POSITION_STOP_DOLLARS
-    ):
+    # Dollar stop — tactical sleeve only (Temperance). Per contract × size.
+    if bool(session.tactical_active) and tactical_pnl <= -stop_limit:
         ok, pnl = await _close_tactical_sleeve(
             session,
             price=price,
             stop_ticks=stop_ticks,
-            reason=f"stop_${float(VIRTUE_POSITION_STOP_DOLLARS):.0f}",
+            reason=f"stop_${float(VIRTUE_POSITION_STOP_DOLLARS):.0f}_x{tac_size}",
         )
         if ok:
             logger.info(
-                "CYCLE %s STOP_EXIT tactical pnl≈%.2f stop=$%.0f resume_cycle=%s",
+                "CYCLE %s STOP_EXIT tactical pnl≈%.2f stop=$%.0f (per_ct=$%.0f×%s) "
+                "resume_cycle=%s",
                 session.cycle,
                 pnl,
+                stop_limit,
                 float(VIRTUE_POSITION_STOP_DOLLARS),
+                tac_size,
                 session.pipeline_resume_cycle,
             )
         else:
@@ -2613,16 +2698,75 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Take-profit — tactical sleeve only.
-    if bool(session.tactical_active) and tactical_pnl >= float(
-        VIRTUE_POSITION_TP_DOLLARS
+    # Trailing stop — tactical sleeve only (no fixed TP when TP dollars <= 0).
+    if bool(session.tactical_active) and float(VIRTUE_POSITION_TP_DOLLARS) <= 0:
+        trail_hit, trail_level = update_tactical_trail(session, tactical_pnl)
+        if trail_hit:
+            tac_dir = str(session.tactical_side or "FLAT").upper()
+            peak_before = float(session.tactical_peak_open_pnl or 0.0)
+            ok, pnl = await _close_tactical_sleeve(
+                session,
+                price=price,
+                stop_ticks=stop_ticks,
+                reason=(
+                    f"trailing_stop_arm${float(VIRTUE_TRAIL_ARM_DOLLARS):.0f}"
+                    f"_trail${float(VIRTUE_TRAIL_DISTANCE_DOLLARS):.0f}"
+                ),
+            )
+            if ok:
+                if session.require_tp_pullback or int(
+                    session.consecutive_tp_streak
+                ) >= int(VIRTUE_MULTI_TP_COOLDOWN_STREAK):
+                    session.long_streak = 0
+                    session.short_streak = 0
+                elif tac_dir == "LONG":
+                    session.long_streak = 1
+                    session.short_streak = 0
+                elif tac_dir == "SHORT":
+                    session.short_streak = 1
+                    session.long_streak = 0
+                if tac_dir == "LONG":
+                    session.long_tps_today = int(session.long_tps_today) + 1
+                elif tac_dir == "SHORT":
+                    session.short_tps_today = int(session.short_tps_today) + 1
+                update_macro_bias(session, banked_side=tac_dir)
+                _, pipe_rem = pipeline_lock_remaining(session)
+                logger.info(
+                    "CYCLE %s TRAILING_STOP_EXIT tactical %s pnl≈%.2f "
+                    "trail_lvl=$%.2f peak=$%.2f arm=$%.0f dist=$%.0f floor=$%.0f "
+                    "size=%s resume_cycle=%s pipe_rem=%s tp_streak=%s",
+                    session.cycle,
+                    tac_dir,
+                    pnl,
+                    trail_level,
+                    peak_before,
+                    trail_arm,
+                    trail_dist,
+                    trail_floor,
+                    tac_size,
+                    session.pipeline_resume_cycle,
+                    pipe_rem,
+                    session.consecutive_tp_streak,
+                )
+            else:
+                logger.error(
+                    "CYCLE %s TRAILING_STOP_EXIT_FAILED — tactical may remain",
+                    session.cycle,
+                )
+            session.last_action = "FLAT"
+            return
+    elif (
+        bool(session.tactical_active)
+        and float(VIRTUE_POSITION_TP_DOLLARS) > 0
+        and tactical_pnl >= float(VIRTUE_POSITION_TP_DOLLARS) * tac_size
     ):
+        # Compat path if fixed TP re-enabled via config.
         tac_dir = str(session.tactical_side or "FLAT").upper()
         ok, pnl = await _close_tactical_sleeve(
             session,
             price=price,
             stop_ticks=stop_ticks,
-            reason=f"take_profit_${float(VIRTUE_POSITION_TP_DOLLARS):.0f}",
+            reason=f"take_profit_${float(VIRTUE_POSITION_TP_DOLLARS):.0f}_x{tac_size}",
         )
         if ok:
             if session.require_tp_pullback or int(session.consecutive_tp_streak) >= int(
@@ -2641,21 +2785,17 @@ async def run_cycle(
             elif tac_dir == "SHORT":
                 session.short_tps_today = int(session.short_tps_today) + 1
             update_macro_bias(session, banked_side=tac_dir)
-            multi_lock = int(session.consecutive_tp_streak) >= int(
-                VIRTUE_MULTI_TP_COOLDOWN_STREAK
-            )
             _, pipe_rem = pipeline_lock_remaining(session)
             logger.info(
                 "CYCLE %s TAKE_PROFIT_FULL tactical %s pnl≈%.2f target=$%.0f "
-                "resume_cycle=%s pipe_rem=%s tp_streak=%s core_remains=%s",
+                "resume_cycle=%s pipe_rem=%s tp_streak=%s",
                 session.cycle,
                 tac_dir,
                 pnl,
-                float(VIRTUE_POSITION_TP_DOLLARS),
+                float(VIRTUE_POSITION_TP_DOLLARS) * tac_size,
                 session.pipeline_resume_cycle,
                 pipe_rem,
                 session.consecutive_tp_streak,
-                bool(session.core_active),
             )
         else:
             logger.error("CYCLE %s TAKE_PROFIT_FULL_FAILED — tactical may remain", session.cycle)
@@ -3510,7 +3650,7 @@ async def run_loop(
 
     if _boot_simple_stack():
         logger.info(
-            "BOOT SIMPLE_STACK_ENABLED bands+stop+tp+peak_lock+time_decay — "
+            "BOOT SIMPLE_STACK_ENABLED bands+stop+trail+peak_lock+time_decay — "
             "ADX/EMA/macro/structure/velocity/streak/course_correct/chase/pullback waived"
         )
     else:
@@ -3601,7 +3741,8 @@ async def run_loop(
         )
     logger.info(
         "VIRTUE LOOP start equity=%.2f symbol=%s session_mode=%s data_source=%s "
-        "position_tp=$%.0f position_sl=$%.0f day_lock=$%.0f "
+        "fixed_tp=$%.0f trail_arm=$%.0f trail=$%.0f floor=$%.0f sl=$%.0f/ct "
+        "day_cap=%s day_lock=$%.0f "
         "tp_cool=%s cc_cool=%s stop_cool=%s "
         "long_enter=%.1f short_enter=%.1f long_exit=%.1f short_exit=%.1f "
         "streak=%s anchor_div_atr=%.1f network_timeout=%.1fs | %s",
@@ -3610,7 +3751,11 @@ async def run_loop(
         virtue_session_mode().upper(),
         primary_data_source(),
         float(VIRTUE_POSITION_TP_DOLLARS),
+        float(VIRTUE_TRAIL_ARM_DOLLARS),
+        float(VIRTUE_TRAIL_DISTANCE_DOLLARS),
+        float(VIRTUE_TRAIL_FLOOR_DOLLARS),
         float(VIRTUE_POSITION_STOP_DOLLARS),
+        int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
         float(GRADE_DAILY_PROFIT_LOCK),
         int(VIRTUE_BASE_TP_COOLDOWN_CYCLES),
         int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES),

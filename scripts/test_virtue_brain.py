@@ -290,19 +290,18 @@ def test_target_ticks_from_atr_floor_and_scale() -> None:
 
 
 def test_position_tp_ticks_for_dollar_target() -> None:
-    """$100 position TP → 40 ticks on 2 MES, 80 ticks on 1 MES."""
+    """Fixed TP disabled (0); stop is $50/contract → same ticks at any size."""
     from main import position_stop_ticks, position_tp_ticks
     from engine.config import TICK_VALUE, VIRTUE_POSITION_STOP_DOLLARS, VIRTUE_POSITION_TP_DOLLARS
 
-    assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
-    assert float(VIRTUE_POSITION_STOP_DOLLARS) == 75.0
-    assert position_tp_ticks(2) == 40
-    assert position_tp_ticks(1) == 80
-    assert abs(position_tp_ticks(2) * float(TICK_VALUE) * 2 - 100.0) < 1e-9
-    # $75 stop → 30 ticks on 2 MES, 60 ticks on 1 MES
-    assert position_stop_ticks(2) == 30
-    assert position_stop_ticks(1) == 60
-    assert abs(position_stop_ticks(2) * float(TICK_VALUE) * 2 - 75.0) < 1e-9
+    assert float(VIRTUE_POSITION_TP_DOLLARS) == 0.0
+    assert float(VIRTUE_POSITION_STOP_DOLLARS) == 50.0
+    assert position_tp_ticks(2) == 0
+    assert position_tp_ticks(1) == 0
+    # $50/ct stop → 40 ticks (price move); size scales dollars, not tick distance
+    assert position_stop_ticks(2) == 40
+    assert position_stop_ticks(1) == 40
+    assert abs(position_stop_ticks(1) * float(TICK_VALUE) - 50.0) < 1e-9
 
 
 def test_save_state_throttled_stops_cleanly() -> None:
@@ -577,35 +576,37 @@ def test_stop_hit_and_flat_exit_helpers() -> None:
     assert b.stop_hit(price=9269.12 + 60 * TICK_SIZE, stop_ticks=60) is True
     b.open_positions = [{"direction": "LONG", "size": 2, "price": 9200.0}]
     assert b.stop_hit(price=9200.0 - 60 * TICK_SIZE, stop_ticks=60) is True
-    # Dollar stop: -$75 on whole 2 MES book (~7.5 points)
+    # Dollar stop: $50/contract × 2 = $100 on the book (~10 points)
     entry = 9200.0
     b.open_positions = [{"direction": "LONG", "size": 2, "price": entry}]
-    assert b.stop_dollars_hit(price=entry, stop_dollars=VIRTUE_POSITION_STOP_DOLLARS) is False
-    stop_px = entry - (float(VIRTUE_POSITION_STOP_DOLLARS) / (POINT_VALUE * 2))
-    assert b.unrealized_position_pnl(price=stop_px) <= -float(VIRTUE_POSITION_STOP_DOLLARS) + 1e-9
-    assert b.stop_dollars_hit(price=stop_px, stop_dollars=VIRTUE_POSITION_STOP_DOLLARS) is True
+    stop_limit = float(VIRTUE_POSITION_STOP_DOLLARS) * 2
+    assert b.stop_dollars_hit(price=entry, stop_dollars=stop_limit) is False
+    stop_px = entry - (stop_limit / (POINT_VALUE * 2))
+    assert b.unrealized_position_pnl(price=stop_px) <= -stop_limit + 1e-9
+    assert b.stop_dollars_hit(price=stop_px, stop_dollars=stop_limit) is True
 
 
 def test_take_profit_dollars_full_position() -> None:
-    """Bank $100 on the whole position (2 MES ≈ 40 ticks), not a distant per-contract target."""
+    """Fixed TP disabled (0) — helper stays inert; tick geometry still works."""
     from broker import VirtueBroker
     from engine.config import POINT_VALUE, TICK_SIZE, VIRTUE_POSITION_TP_DOLLARS
 
     b = VirtueBroker()
     entry = 9200.0
     b.open_positions = [{"direction": "LONG", "size": 2, "price": entry}]
+    assert float(VIRTUE_POSITION_TP_DOLLARS) == 0.0
     assert b.take_profit_dollars_hit(price=entry, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is False
-    # 10 points × $5 × 2 = $100
     hit_px = entry + (100.0 / (POINT_VALUE * 2))
     assert abs(b.unrealized_position_pnl(price=hit_px) - 100.0) < 1e-9
-    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is True
-    # Short book
+    # Disabled fixed TP must not fire even when PnL is large.
+    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is False
+    # Explicit positive target still supported for broker helper tests.
+    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=100.0) is True
     b.open_positions = [{"direction": "SHORT", "size": 2, "price": entry}]
     assert b.take_profit_dollars_hit(
         price=entry - (100.0 / (POINT_VALUE * 2)),
-        target_dollars=VIRTUE_POSITION_TP_DOLLARS,
+        target_dollars=100.0,
     )
-    # Still supports tick helper for geometry checks
     b.open_positions = [{"direction": "LONG", "size": 1, "price": entry}]
     assert b.take_profit_hit(price=entry + 80 * TICK_SIZE, target_ticks=80) is True
     assert b.scale_out_close_qty(leave=0) == 1
@@ -647,7 +648,7 @@ def test_session_uses_timely_entry_band() -> None:
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 5
     assert int(VIRTUE_POST_TP_STREAK_PULLBACK_AFTER) == 2
     assert int(VIRTUE_REQUIRED_STREAK) == 2
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 85.0
@@ -761,17 +762,81 @@ def test_paper_book_survives_system_state_wipe_to_starting_nav(tmp_path, monkeyp
     assert ledger["book_equity"] == 15_531.40
 
 
+def test_tactical_trailing_stop_arms_and_exits() -> None:
+    """Arm at +$40/ct, trail $25 behind peak, floor +$15/ct (1 MES)."""
+    from main import VirtueSession, update_tactical_trail
+    from engine.config import (
+        VIRTUE_TRAIL_ARM_DOLLARS,
+        VIRTUE_TRAIL_DISTANCE_DOLLARS,
+        VIRTUE_TRAIL_FLOOR_DOLLARS,
+    )
+
+    assert float(VIRTUE_TRAIL_ARM_DOLLARS) == 40.0
+    assert float(VIRTUE_TRAIL_DISTANCE_DOLLARS) == 25.0
+    assert float(VIRTUE_TRAIL_FLOOR_DOLLARS) == 15.0
+
+    s = VirtueSession()
+    s.cycle = 1
+    s.tactical_active = True
+    s.tactical_size = 1
+    s.tactical_side = "LONG"
+
+    hit, level = update_tactical_trail(s, 20.0)
+    assert hit is False
+    assert s.tactical_trail_armed is False
+    assert s.tactical_peak_open_pnl == 20.0
+
+    hit, level = update_tactical_trail(s, 40.0)
+    assert hit is False  # armed; trail = max(40-25, 15) = 15; pnl 40 > 15
+    assert s.tactical_trail_armed is True
+    assert abs(level - 15.0) < 1e-9
+
+    hit, level = update_tactical_trail(s, 80.0)
+    assert hit is False
+    assert abs(level - 55.0) < 1e-9  # max(80-25, 15)
+
+    hit, level = update_tactical_trail(s, 55.0)
+    assert hit is True
+    assert abs(level - 55.0) < 1e-9
+
+    # 2 MES: dollars scale with size
+    s2 = VirtueSession()
+    s2.tactical_active = True
+    s2.tactical_size = 2
+    hit, _ = update_tactical_trail(s2, 70.0)  # arm needs 80
+    assert s2.tactical_trail_armed is False
+    hit, level = update_tactical_trail(s2, 80.0)
+    assert s2.tactical_trail_armed is True
+    assert hit is False
+    assert abs(level - 30.0) < 1e-9  # max(80-50, 30)
+
+
+def test_trailing_stop_outcome_counts_as_banked_win() -> None:
+    """Profitable trail exit updates TP streak / trades_today like a banked win."""
+    from main import VirtueSession, update_outcome_state
+
+    s = VirtueSession()
+    s.cycle = 5
+    update_outcome_state(s, 55.0, "trailing_stop_arm$40_trail$25", current_engine_cycle=5)
+    assert s.trades_today == 1
+    assert s.last_result == "WIN"
+    assert s.last_reason == "trailing_stop"
+    assert s.consecutive_tp_streak == 1
+    assert s.consecutive_wins == 1
+
+
 def test_take_profit_independent_of_signal_side() -> None:
-    """TP must fire from open PnL even if signal has flipped opposite."""
+    """Broker dollar-TP helper fires from open PnL (compat path; live uses trail)."""
     from broker import VirtueBroker
-    from engine.config import POINT_VALUE, VIRTUE_POSITION_TP_DOLLARS
+    from engine.config import POINT_VALUE
 
     b = VirtueBroker()
     entry = 9200.0
+    target = 100.0
     b.open_positions = [{"direction": "SHORT", "size": 1, "price": entry}]
-    hit_px = entry - (float(VIRTUE_POSITION_TP_DOLLARS) / POINT_VALUE)
-    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is True
-    assert b.take_profit_dollars_hit(price=entry - 2.0, target_dollars=VIRTUE_POSITION_TP_DOLLARS) is False
+    hit_px = entry - (target / POINT_VALUE)
+    assert b.take_profit_dollars_hit(price=hit_px, target_dollars=target) is True
+    assert b.take_profit_dollars_hit(price=entry - 2.0, target_dollars=target) is False
 
 
 def test_required_streak_is_three_for_structure() -> None:
@@ -1406,8 +1471,8 @@ def test_profit_lock_stands_aside_at_500() -> None:
 
     assert float(GRADE_DAILY_PROFIT_LOCK) == 500.0
     assert int(PROFIT_LOCK_MAX_CONTRACTS) == 0
-    assert float(VIRTUE_POSITION_TP_DOLLARS) == 100.0
-    assert float(VIRTUE_POSITION_STOP_DOLLARS) == 75.0
+    assert float(VIRTUE_POSITION_TP_DOLLARS) == 0.0
+    assert float(VIRTUE_POSITION_STOP_DOLLARS) == 50.0
     assert int(VIRTUE_BASE_TP_COOLDOWN_CYCLES) == 8
     assert int(VIRTUE_STREAK_BONUS_COOLDOWN_CYCLES) == 5
     assert int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES) == 12
@@ -1589,7 +1654,7 @@ def test_anti_churn_temperance_gates() -> None:
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 12
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 5
 
     # Mid-band must not flatten
     assert check_course_correct("LONG", 50.0)[0] is False
@@ -2066,6 +2131,8 @@ if __name__ == "__main__":
     test_forward_test_paper_nav_allows_sizing()
     test_stop_hit_and_flat_exit_helpers()
     test_take_profit_dollars_full_position()
+    test_tactical_trailing_stop_arms_and_exits()
+    test_trailing_stop_outcome_counts_as_banked_win()
     test_session_uses_timely_entry_band()
     test_profit_lock_stands_aside_at_500()
     test_take_profit_independent_of_signal_side()

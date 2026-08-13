@@ -262,8 +262,9 @@ VIRTUE_MARKET_LIFT_LONG_MIN = 40.0
 VIRTUE_VOL_CONVICTION_SHORT_MIN = 40.0
 VIRTUE_MARKET_LIFT_SHORT_MAX = 45.0  # shorts need lift in bear/neutral zone
 VIRTUE_VOL_DEAD_MAX = 35.0  # below → stand aside both ways (no participation)
-# Hard daily round-trip cap for tactical sleeve (Temperance).
-VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 12
+# Hard daily round-trip cap for tactical sleeve (Temperance). Per-contract book:
+# with 1 MES tactical this is 5 round-trips/day; counters increment on close.
+VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 5
 # Bull-day asymmetric short filter — counter-trend shorts need confirmation.
 # Lowered from 25: sticky BULL bias must not hard-block clear below-VWAP bears.
 VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
@@ -271,18 +272,22 @@ VIRTUE_BULL_DAY_SHORT_ADX_MIN = 18.0    # with below-VWAP path; was 25 (proxy ne
 # COURSE_CORRECT hysteresis — aligned with strategy exits (not mid-50 scalp).
 VIRTUE_COURSE_CORRECT_SHORT_BLEND = 55.0  # SHORT + blend >= 55 → force flatten
 VIRTUE_COURSE_CORRECT_LONG_BLEND = 45.0   # LONG + blend <= 45 → force flatten
-# Chase: block only extreme late entries. 72 was freezing re-entry after $100 TP in bulls.
+# Chase: block only extreme late entries. 72 was freezing re-entry after fixed TP in bulls.
 VIRTUE_SCORE_LONG_CHASE_MAX = 85.0
 VIRTUE_SCORE_SHORT_CHASE_MIN = 15.0
 # Legacy linear score scale (Wisdom now uses sticky bps vs session VWAP; kept for compat).
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
 VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
-# Bank ~$100 per open position (full flatten), then cool down for the next clean signal.
-# Fixes “up $300 → back to $19 with nothing taken” (Temperance).
-VIRTUE_POSITION_TP_DOLLARS = 100.0
-# Cut losers at ~$75 on the whole position (full flatten) — ~1.33:1 vs $100 TP.
-VIRTUE_POSITION_STOP_DOLLARS = 75.0
+# Fixed dollar TP disabled (0) — winners run under trailing stop (Courage + Temperance).
+VIRTUE_POSITION_TP_DOLLARS = 0.0
+# Hard stop per contract (full flatten when open PnL <= -stop × size).
+VIRTUE_POSITION_STOP_DOLLARS = 50.0
+# Trailing stop (per contract): arm after open profit, then trail peak open PnL.
+VIRTUE_TRAIL_ARM_DOLLARS = 40.0
+VIRTUE_TRAIL_DISTANCE_DOLLARS = 25.0
+# Once armed, trail exit never worse than this per-contract open PnL floor.
+VIRTUE_TRAIL_FLOOR_DOLLARS = 15.0
 # --- MACROMATHICS ENGINE PERFORMANCE CONFIGURATION ---
 # Post-exit cool-offs must outlast mid-band noise (Temperance > scalp Courage).
 VIRTUE_BASE_TP_COOLDOWN_CYCLES = 8
@@ -323,11 +328,11 @@ VIRTUE_PIPELINE_BULL_SHORT_PENALTY = 5.0
 # VIRTUE_VELOCITY_ADX_FLOOR set above with canonical ADX ladder (= 20.0)
 VIRTUE_VELOCITY_PENALTY_PER_ADX = 0.5  # points added/subtracted per ADX unit below floor
 # Time-decay: tactical SCALP only — cut dead/red holds, never knife a green trade.
-# Green tactical waits for $100 TP / course-correct / $75 stop (Courage).
+# Green tactical waits for trail / course-correct / $50 stop (Courage).
 MAX_STAGNATION_CYCLES = 36  # ~3 min at 5s — enough to see if a scalp is alive
 VIRTUE_TIME_DECAY_MAX_CYCLES = MAX_STAGNATION_CYCLES
 VIRTUE_TIME_DECAY_MIN_OPEN_PNL = 0.0  # cut only if open_pnl <= 0 (flat/red stagnation)
-# Legacy ATR TP helpers (Virtue exits use VIRTUE_POSITION_TP_DOLLARS; kept for tests/compat)
+# Legacy ATR TP helpers (fixed TP off; trail owns winners; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS
 # Rebase when |VWAP − TWAP| exceeds this many ATRs (anchor disagreement)
