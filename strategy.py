@@ -614,7 +614,9 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Simple stack: one signal family — VWAP+TWAP bands only (chaos already handled).
+        # Simple stack: one signal family — blend band only (chaos already handled).
+        # Enter on blend so VWAP/TWAP disagreement cannot freeze a clear edge
+        # (e.g. VWAP 52.5 / TWAP 64 / blend 58.2 → LONG). Holds still use dual-score exit.
         # Skips EMA / ADX / lift / vol participation so indicators cannot veto each other.
         try:
             from engine.config import virtue_simple_stack as _virtue_simple_stack
@@ -623,14 +625,17 @@ class WisdomStrategy:
         except Exception:
             _simple = False
         if _simple:
-            if enter_long:
+            blend_long = blended >= float(self.long_enter)
+            blend_short = blended <= float(self.short_enter)
+            if blend_long:
                 return self._empty(
                     regime=Regime.TREND_BULL,
                     action=SignalAction.LONG,
                     reason=(
                         f"LONG SETUP | SIMPLE STACK — "
-                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                        f"≥ enter {self.long_enter:.0f} (ADX/EMA/macro waived)"
+                        f"blend {blended:.1f} ≥ enter {self.long_enter:.0f} "
+                        f"(VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}; "
+                        f"ADX/EMA/macro + dual-score enter waived)"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -642,14 +647,15 @@ class WisdomStrategy:
                     vwap_score=vwap_score,
                     twap_score=twap_score,
                 )
-            if enter_short:
+            if blend_short:
                 return self._empty(
                     regime=Regime.TREND_BEAR,
                     action=SignalAction.SHORT,
                     reason=(
                         f"SHORT SETUP | SIMPLE STACK — "
-                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                        f"≤ enter {self.short_enter:.0f} (ADX/EMA/macro waived)"
+                        f"blend {blended:.1f} ≤ enter {self.short_enter:.0f} "
+                        f"(VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}; "
+                        f"ADX/EMA/macro + dual-score enter waived)"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -666,8 +672,9 @@ class WisdomStrategy:
                 action=SignalAction.FLAT,
                 reason=(
                     f"STAND ASIDE | SIMPLE STACK — "
-                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                    f"inside enter bands (long≥{self.long_enter:.0f} / short≤{self.short_enter:.0f})"
+                    f"blend {blended:.1f} inside enter bands "
+                    f"(long≥{self.long_enter:.0f} / short≤{self.short_enter:.0f}) "
+                    f"· VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}"
                 ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,

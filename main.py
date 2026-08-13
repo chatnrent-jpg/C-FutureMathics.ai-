@@ -2469,8 +2469,14 @@ async def run_cycle(
     )
     v_score = float(decision.vwap_score)
     t_score = float(decision.twap_score)
-    is_raw_long = v_score >= long_enter_thr and t_score >= long_enter_thr
-    is_raw_short = v_score <= short_enter_thr and t_score <= short_enter_thr
+    blend_now = float(decision.blended_score)
+    # Simple stack: streak follows blend (matches strategy enter). Full stack: both scores.
+    if virtue_simple_stack():
+        is_raw_long = blend_now >= long_enter_thr
+        is_raw_short = blend_now <= short_enter_thr
+    else:
+        is_raw_long = v_score >= long_enter_thr and t_score >= long_enter_thr
+        is_raw_short = v_score <= short_enter_thr and t_score <= short_enter_thr
     # Temperance: do not build confirmation streaks during pipeline lock
     # (prevents instant re-fire the moment cool-off ends).
     pipe_resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)

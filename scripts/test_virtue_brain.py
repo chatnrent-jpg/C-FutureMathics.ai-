@@ -157,6 +157,34 @@ def test_simple_stack_blend_only_entry() -> None:
     assert "SIMPLE STACK" in d.reason
 
 
+def test_simple_stack_enters_on_blend_when_anchors_disagree() -> None:
+    """VWAP 52.5 / TWAP 64 / blend 58.25 must LONG — dual-score enter was freezing."""
+    import os
+    import strategy as strategy_mod
+    from strategy import SignalAction, WisdomStrategy
+
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5, long_enter=58.0)
+    s.seed(_trending_bars(40, bull=True, step=0.5))
+
+    real_score = strategy_mod.score_vs_anchor
+    calls = {"n": 0}
+
+    def _fake_score(price, anchor, **kwargs):
+        calls["n"] += 1
+        return 52.5 if calls["n"] % 2 == 1 else 64.0
+
+    strategy_mod.score_vs_anchor = _fake_score  # type: ignore[assignment]
+    try:
+        d = s.evaluate()
+    finally:
+        strategy_mod.score_vs_anchor = real_score  # type: ignore[assignment]
+
+    assert d.action == SignalAction.LONG
+    assert abs(float(d.blended_score) - 58.25) < 1e-9
+    assert "blend" in d.reason.lower()
+
+
 def test_market_lift_and_vol_conviction_scores() -> None:
     s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
     s.seed(_trending_bars(40, bull=True, step=1.0))
@@ -2105,6 +2133,7 @@ if __name__ == "__main__":
     test_macro_participation_blocks_fake_long()
     test_hold_path_ignores_chaos_atr_spike()
     test_simple_stack_blend_only_entry()
+    test_simple_stack_enters_on_blend_when_anchors_disagree()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()
