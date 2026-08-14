@@ -676,7 +676,7 @@ def test_session_uses_timely_entry_band() -> None:
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 5
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 10
     assert int(VIRTUE_POST_TP_STREAK_PULLBACK_AFTER) == 2
     assert int(VIRTUE_REQUIRED_STREAK) == 2
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 85.0
@@ -1682,7 +1682,7 @@ def test_anti_churn_temperance_gates() -> None:
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 5
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 10
 
     # Mid-band must not flatten
     assert check_course_correct("LONG", 50.0)[0] is False

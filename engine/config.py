@@ -263,8 +263,8 @@ VIRTUE_VOL_CONVICTION_SHORT_MIN = 40.0
 VIRTUE_MARKET_LIFT_SHORT_MAX = 45.0  # shorts need lift in bear/neutral zone
 VIRTUE_VOL_DEAD_MAX = 35.0  # below → stand aside both ways (no participation)
 # Hard daily round-trip cap for tactical sleeve (Temperance). Per-contract book:
-# with 1 MES tactical this is 5 round-trips/day; counters increment on close.
-VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 5
+# with 1 MES tactical this is 10 round-trips/day; counters increment on close.
+VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 10
 # Bull-day asymmetric short filter — counter-trend shorts need confirmation.
 # Lowered from 25: sticky BULL bias must not hard-block clear below-VWAP bears.
 VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
