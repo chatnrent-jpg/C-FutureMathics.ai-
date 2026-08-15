@@ -1,0 +1,1412 @@
+// ============================================================================
+// VETTED Platform - Production Database Schema
+// ============================================================================
+// Target: PostgreSQL
+// ORM: Prisma
+// Purpose: Biometric Identity Verification + Automated Escrow Settlement
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// CORE IDENTITY & USER MANAGEMENT
+// ============================================================================
+
+model User {
+  id                String    @id @default(uuid())
+  email             String    @unique
+  passwordHash      String
+  role              UserRole  @default(TALENT)
+  
+  // Profile
+  firstName         String
+  lastName          String
+  phoneNumber       String?
+  location          String?
+  timezone          String?
+  
+  // Status
+  isActive          Boolean   @default(true)
+  isVerified        Boolean   @default(false)
+  lastLoginAt       DateTime?
+
+  // VettedME AI Training Tracking Fields
+  aiStatus          AIStatus  @default(NOT_STARTED)
+  aiScore           Int       @default(0) // Blended score 0-100
+  aiTier1Score       Int       @default(0)
+  aiTier2Score       Int       @default(0)
+  aiTier3Score       Int       @default(0)
+  aiSessionId       String?   // Links to the active assessment/viva session
+  aiLastAttemptAt   DateTime?
+  aiCompletedAt     DateTime?
+  aiFailureReason   String?   // Records critical fail causes (e.g. safety bypass)
+  
+  // Relations
+  vettedMEPassport         VettedMEPassport?
+  contractsAsTalent        Contract[]              @relation("TalentContracts")
+  contractsAsBusiness      Contract[]              @relation("BusinessContracts")
+  biometricVerifications   BiometricVerification[]
+  leadsCreated             Lead[]
+  dealsCreated             Deal[]
+  auditLogs                AuditLog[]
+  
+  // Timestamps
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // 🎯 TOKOKA / UHRS SIMULATOR SUITE
+  uhrsSpamScore         Float    @default(1.0)  // Starts at 100% (1.0). Under 0.80 = Flagged
+  totalControlQuestions Int      @default(0)    // Total hidden control check questions faced
+  correctControlAnswers Int      @default(0)    // Total correct control choices made
+
+  speedViolations       Int      @default(0)    // Tracks hyper-fast click patterns
+  lastSubmissionTime    DateTime?               // Measures time delta between actions
+
+  isSimulatedBanned     Boolean  @default(false) // Triggers a safe educational teaching moment
+  
+  @@index([email])
+  @@index([role])
+  @@index([isActive])
+  @@index([aiStatus])
+  @@map("users")
+}
+
+enum UserRole {
+  TALENT
+  BUSINESS
+  ADMIN
+}
+
+// ============================================================================
+// VETTEDME: IDENTITY VERIFICATION CORE
+// ============================================================================
+
+model VettedMEPassport {
+  id                    String              @id @default(uuid())
+  userId                String              @unique
+  passportId            String              @unique // Public-facing ID: vettedme-abc123xyz
+  
+  // Developer Onboarding Journey (Beta Launch)
+  onboardingStatus      DeveloperOnboardingStatus @default(INVITED)
+  inviteToken           String?             @unique // Unique invite token from GitHub scraper
+  inviteSource          String?             // github_scraper, manual, referral
+  
+  // Onboarding Timestamps (State Machine)
+  invitedAt             DateTime?           // When invite was sent
+  profileCreatedAt      DateTime?           // When profile completed
+  portfolioAuditedAt    DateTime?           // When Tier 1 GitHub audit passed
+  sandboxPassedAt       DateTime?           // When Tier 2 code lab passed
+  biometricClearedAt    DateTime?           // When Tier 3 biometric verification passed
+  passportIssuedAt      DateTime?           // When final passport minted
+  
+  // Verification Status
+  verificationStatus    VerificationStatus  @default(PENDING)
+  trustScore            Int                 @default(0) // 0-100
+  
+  // Smile ID Integration
+  smileIdUserId         String?             @unique
+  smileIdJobId          String?
+  biometricHash         String?             // Encrypted face matching token
+  
+  // Government Registry Data
+  kycData               Json?               // Raw NIN/BVN validation from Smile ID
+  governmentIdType      String?             // NIN, BVN, PASSPORT
+  governmentIdNumber    String?
+  governmentIdVerified  Boolean             @default(false)
+  
+  // Biometric Data
+  faceMatchScore        Float?              // 0.0 - 1.0 (Smile ID confidence)
+  livenessCheckPassed   Boolean             @default(false)
+  lastBiometricScanAt   DateTime?
+  
+  // Public Profile
+  publicProfileUrl      String?             // vettedme.com/passport/[passportId]
+  linkedinUrl           String?
+  githubUrl             String?
+  portfolioUrl          String?
+  
+  // Skills & Experience
+  primarySkills         String[]            @default([])
+  yearsOfExperience     Int                 @default(0)
+  hourlyRateUSD         Decimal?            @db.Decimal(10, 2)
+  
+  // Performance Metrics
+  contractsCompleted    Int                 @default(0)
+  totalEarnedUSD        Decimal             @default(0) @db.Decimal(12, 2)
+  averageRating         Float               @default(0) // 0-5 stars
+  onTimeDeliveryRate    Float               @default(0) // 0-100%
+  
+  // Relations
+  user                  User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  skillAssessments      SkillAssessmentLog[]
+  milestoneHandshakes   MilestoneHandshake[]
+  
+  // Timestamps
+  verifiedAt            DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([passportId])
+  @@index([verificationStatus])
+  @@index([trustScore])
+  @@index([smileIdUserId])
+  @@map("vetted_me_passports")
+}
+
+enum VerificationStatus {
+  PENDING
+  BIOMETRIC_PASSED
+  FAILED
+  REVOKED
+}
+
+// ============================================================================
+// DEVELOPER ONBOARDING STATE MACHINE (Beta Launch)
+// ============================================================================
+// Tracks the complete developer verification journey from invite to passport
+
+enum DeveloperOnboardingStatus {
+  INVITED                 // Initial state: Developer invited from GitHub scraper
+  PROFILE_CREATED         // Developer signed up and completed profile
+  PORTFOLIO_AUDITED       // Tier 1: GitHub audit passed (70+ score)
+  SANDBOX_PASSED          // Tier 2: Code lab assessment passed (85+ score)
+  BIOMETRIC_CLEARED       // Tier 3: Live face verification passed (Smile ID/Persona)
+  PASSPORT_ISSUED         // Final state: VettedME Passport minted, ready for visibility
+}
+
+// ============================================================================
+// BIOMETRIC VERIFICATION LOGS
+// ============================================================================
+
+model BiometricVerification {
+  id                    String            @id @default(uuid())
+  userId                String
+  verificationType      VerificationType
+  
+  // Smile ID Session
+  smileIdSessionId      String            @unique
+  smileIdPartnerId      String
+  smileIdJobType        String            // biometric_kyc, document_verification
+  
+  // Verification Results
+  confidence            Float             // 0.0 - 1.0
+  livenessDetected      Boolean
+  faceMatch             FaceMatchStatus
+  
+  // Government ID Verification
+  idType                String            // NIN, BVN, PASSPORT, DRIVERS_LICENSE
+  idNumber              String
+  idCountry             String            @default("NG")
+  governmentPhotoUrl    String?
+  capturedPhotoUrl      String
+  
+  // Raw Response Data
+  smileIdResponse       Json              // Full Smile ID webhook payload
+  kycResult             Json?             // Government registry lookup result
+  
+  // Security Metadata
+  ipAddress             String?
+  userAgent             String?
+  deviceFingerprint     String?
+  location              Json?             // { lat, lng, city, country }
+  
+  // Fraud Detection
+  fraudSignals          Json?             // Suspicious patterns detected
+  fraudScore            Float             @default(0) // 0-100
+  manualReviewRequired  Boolean           @default(false)
+  reviewedBy            String?
+  reviewNotes           String?
+  
+  // Relations
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  initiatedAt           DateTime          @default(now())
+  completedAt           DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  
+  @@index([userId])
+  @@index([verificationType])
+  @@index([faceMatch])
+  @@index([smileIdSessionId])
+  @@map("biometric_verifications")
+}
+
+enum VerificationType {
+  ONBOARDING
+  MILESTONE_HANDSHAKE
+  ACCOUNT_RECOVERY
+  SECURITY_CHECK
+  PAYMENT_AUTHORIZATION
+}
+
+enum FaceMatchStatus {
+  VERIFIED
+  FAILED
+  REVIEW_REQUIRED
+  PENDING
+}
+
+// ============================================================================
+// SKILL ASSESSMENT ENGINE (3-TIER GAUNTLET)
+// ============================================================================
+
+model SkillAssessmentLog {
+  id                    String              @id @default(uuid())
+  passportId            String
+  assessmentType        AssessmentType      @default(FULL_STACK)
+  
+  // Tier 1: GitHub Portfolio Audit
+  tier1GithubScore      Float               @default(0) // 0-100
+  tier1RepoCount        Int                 @default(0)
+  tier1CommitCount      Int                 @default(0)
+  tier1CodeComplexity   Float               @default(0)
+  tier1FraudFlags       Json?               // AI-generated code, copy-paste patterns
+  tier1Status           TierStatus          @default(PENDING)
+  tier1CompletedAt      DateTime?
+  
+  // Tier 2: Sandboxed Code Lab
+  tier2SandboxCodeScore Float               @default(0) // 0-100
+  tier2TestsPassed      Int                 @default(0)
+  tier2TestsTotal       Int                 @default(0)
+  tier2ExecutionTime    Int                 @default(0) // seconds
+  tier2KeystrokeData    Json?               // Typing patterns, window switching
+  tier2FraudFlags       Json?               // Suspicious behavior
+  tier2Status           TierStatus          @default(PENDING)
+  tier2CompletedAt      DateTime?
+  
+  // Tier 3: AI Video Viva
+  tier3VideoVivaScore   Float               @default(0) // 0-100
+  tier3QuestionsAsked   Int                 @default(0)
+  tier3CorrectAnswers   Int                 @default(0)
+  tier3BiometricMatch   Float?              // Face consistency across session
+  tier3VoiceAnalysis    Json?               // Voice patterns, deepfake detection
+  tier3FraudFlags       Json?               // Third-party assistance signals
+  tier3Status           TierStatus          @default(PENDING)
+  tier3CompletedAt      DateTime?
+  
+  // Aggregate Results
+  aggregateScore        Float               @default(0) // 0-100
+  verificationState     AssessmentState     @default(PENDING)
+  overallFraudScore     Float               @default(0) // 0-100
+  
+  // Raw Data Storage
+  assessmentPayload     Json?               // Complete telemetry data
+  
+  // Relations
+  passport              VettedMEPassport    @relation(fields: [passportId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  startedAt             DateTime            @default(now())
+  completedAt           DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([passportId])
+  @@index([verificationState])
+  @@index([aggregateScore])
+  @@map("skill_assessment_logs")
+}
+
+enum AssessmentType {
+  FULL_STACK
+  BACKEND
+  FRONTEND
+  MOBILE
+  DEVOPS
+  DATA_SCIENCE
+}
+
+enum TierStatus {
+  PENDING
+  IN_PROGRESS
+  PASSED
+  FAILED
+  SKIPPED
+}
+
+enum AssessmentState {
+  PENDING
+  IN_PROGRESS
+  PASSED
+  FAILED
+  UNDER_REVIEW
+}
+
+// ============================================================================
+// CONTRACT & ESCROW MANAGEMENT
+// ============================================================================
+
+model Contract {
+  id                      String            @id @default(uuid())
+  contractNumber          String            @unique // CTR-2026-001
+  
+  // Parties
+  businessId              String
+  talentId                String
+  
+  // Contract Details
+  projectName             String
+  projectDescription      String            @db.Text
+  totalContractValueUSD   Decimal           @db.Decimal(12, 2)
+  currency                String            @default("USD")
+  
+  // Status
+  status                  ContractStatus    @default(DRAFT)
+  
+  // Timeline
+  startDate               DateTime?
+  expectedEndDate         DateTime?
+  actualEndDate           DateTime?
+  
+  // Escrow Details
+  escrowFundedAt          DateTime?
+  escrowReleasedAt        DateTime?
+  
+  // Relations
+  business                User                    @relation("BusinessContracts", fields: [businessId], references: [id])
+  talent                  User                    @relation("TalentContracts", fields: [talentId], references: [id])
+  airwallexSubAccount     AirwallexSubAccount?
+  milestones              Milestone[]
+  invoices                Invoice[]
+  transactions            PaymentTransaction[]
+  webhookEvents           WebhookEvent[]
+  auditLogs               AuditLog[]
+  
+  // Timestamps
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+  
+  @@index([contractNumber])
+  @@index([businessId])
+  @@index([talentId])
+  @@index([status])
+  @@map("contracts")
+}
+
+enum ContractStatus {
+  DRAFT
+  AWAITING_FUNDS
+  CAPITAL_ESCROWED
+  IN_PROGRESS
+  COMPLETED
+  DISPUTED
+  CANCELLED
+}
+
+// ============================================================================
+// AIRWALLEX PAYMENT INFRASTRUCTURE
+// ============================================================================
+
+model AirwallexSubAccount {
+  id                              String      @id @default(uuid())
+  contractId                      String      @unique
+  
+  // Airwallex Account IDs
+  airwallexAccountId              String      @unique
+  airwallexVirtualAccountId       String      @unique
+  airwallexBeneficiaryId          String?
+  
+  // Funding Instructions (Displayed to Business Clients)
+  fundingAccountRoutingNumber     String      // For ACH transfers
+  fundingAccountAccountNumber     String      // Virtual account number
+  fundingAccountSwiftCode         String?     // For international wires
+  fundingAccountIban              String?     // For SEPA transfers
+  
+  // Bank Details
+  bankName                        String
+  bankAddress                     String?
+  bankCountry                     String      @default("US")
+  
+  // Account Status
+  currency                        String      @default("USD")
+  currentBalanceUSD               Decimal     @default(0) @db.Decimal(12, 2)
+  availableBalanceUSD             Decimal     @default(0) @db.Decimal(12, 2)
+  lockedBalanceUSD                Decimal     @default(0) @db.Decimal(12, 2)
+  
+  // Metadata
+  airwallexMetadata               Json?       // Full Airwallex account object
+  
+  // Relations
+  contract                        Contract    @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  transactions                    PaymentTransaction[]
+  
+  // Timestamps
+  provisionedAt                   DateTime    @default(now())
+  activatedAt                     DateTime?
+  createdAt                       DateTime    @default(now())
+  updatedAt                       DateTime    @updatedAt
+  
+  @@index([airwallexAccountId])
+  @@index([airwallexVirtualAccountId])
+  @@index([contractId])
+  @@map("airwallex_sub_accounts")
+}
+
+// ============================================================================
+// MILESTONE PAYMENT CHECKPOINTS
+// ============================================================================
+
+model Milestone {
+  id                        String            @id @default(uuid())
+  contractId                String
+  milestoneNumber           Int               // 1, 2, 3, etc.
+  
+  // Details
+  title                     String
+  description               String            @db.Text
+  amountUSD                 Decimal           @db.Decimal(12, 2)
+  
+  // Timeline
+  dueDate                   DateTime
+  submittedAt               DateTime?
+  approvedAt                DateTime?
+  paidAt                    DateTime?
+  
+  // Status
+  status                    MilestoneStatus   @default(LOCKED)
+  
+  // Deliverables
+  deliverables              Json?             // Array of deliverable items
+  submissionNotes           String?           @db.Text
+  approvalNotes             String?           @db.Text
+  
+  // Compliance
+  complianceTaxFormSigned   Boolean           @default(false)
+  taxFormUrl                String?           // W-8BEN document link
+  
+  // Biometric Handshake
+  handshakeRequired         Boolean           @default(true)
+  handshakeCompletedAt      DateTime?
+  
+  // Relations
+  contract                  Contract                @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  handshakes                MilestoneHandshake[]
+  transactions              PaymentTransaction[]
+  invoices                  Invoice[]
+  
+  // Timestamps
+  createdAt                 DateTime          @default(now())
+  updatedAt                 DateTime          @updatedAt
+  
+  @@unique([contractId, milestoneNumber])
+  @@index([contractId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("milestones")
+}
+
+enum MilestoneStatus {
+  LOCKED
+  IN_PROGRESS
+  WORK_SUBMITTED
+  UNDER_REVIEW
+  AWAITING_HANDSHAKE
+  HANDSHAKE_VERIFIED
+  PAYMENT_PROCESSING
+  PAID
+  DISPUTED
+}
+
+// ============================================================================
+// BIOMETRIC HANDSHAKE FOR PAYMENT RELEASE
+// ============================================================================
+
+model MilestoneHandshake {
+  id                    String              @id @default(uuid())
+  milestoneId           String
+  passportId            String
+  
+  // Handshake Flow
+  status                HandshakeStatus     @default(PENDING)
+  notificationSentAt    DateTime?
+  
+  // Biometric Verification
+  biometricSessionId    String?             @unique
+  faceMatchScore        Float?
+  livenessCheckPassed   Boolean             @default(false)
+  verificationAttempts  Int                 @default(0)
+  
+  // Security
+  ipAddress             String?
+  deviceFingerprint     String?
+  location              Json?
+  
+  // Relations
+  milestone             Milestone           @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+  passport              VettedMEPassport    @relation(fields: [passportId], references: [id])
+  
+  // Timestamps
+  initiatedAt           DateTime            @default(now())
+  completedAt           DateTime?
+  expiresAt             DateTime            // 7 days from initiation
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([milestoneId])
+  @@index([passportId])
+  @@index([status])
+  @@map("milestone_handshakes")
+}
+
+enum HandshakeStatus {
+  PENDING
+  NOTIFICATION_SENT
+  IN_PROGRESS
+  VERIFIED
+  FAILED
+  EXPIRED
+}
+
+// ============================================================================
+// PAYMENT TRANSACTIONS & SETTLEMENTS
+// ============================================================================
+
+model PaymentTransaction {
+  id                      String              @id @default(uuid())
+  transactionNumber       String              @unique // TXN-2026-001
+  
+  // Relations
+  contractId              String
+  milestoneId             String?
+  airwallexSubAccountId   String?
+  
+  // Transaction Type
+  transactionType         TransactionType
+  
+  // Amounts
+  grossAmount             Decimal             @db.Decimal(12, 2)
+  platformFee             Decimal             @db.Decimal(12, 2)
+  platformFeeRate         Float               // 0.15 (15%)
+  fxSpread                Decimal             @db.Decimal(12, 2)
+  fxSpreadRate            Float               // 0.005 (0.5%)
+  netAmount               Decimal             @db.Decimal(12, 2)
+  
+  // Currency Conversion
+  sourceCurrency          String              @default("USD")
+  targetCurrency          String              @default("NGN")
+  exchangeRate            Float
+  
+  // Airwallex Integration
+  airwallexTransferId     String?             @unique
+  airwallexReference      String?
+  airwallexFee            Decimal             @default(0) @db.Decimal(10, 2)
+  airwallexResponse       Json?
+  
+  // Status
+  status                  PaymentStatus       @default(PENDING)
+  
+  // Metadata
+  paymentMethod           String?             // ACH, WIRE, CARD
+  failureReason           String?
+  retryCount              Int                 @default(0)
+  
+  // Relations
+  contract                Contract            @relation(fields: [contractId], references: [id])
+  milestone               Milestone?          @relation(fields: [milestoneId], references: [id])
+  airwallexSubAccount     AirwallexSubAccount? @relation(fields: [airwallexSubAccountId], references: [id])
+  invoice                 Invoice?
+  ledgerTransactions      LedgerTransaction[]
+  
+  // Timestamps
+  initiatedAt             DateTime            @default(now())
+  processedAt             DateTime?
+  completedAt             DateTime?
+  failedAt                DateTime?
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+  
+  @@index([transactionNumber])
+  @@index([contractId])
+  @@index([milestoneId])
+  @@index([status])
+  @@index([transactionType])
+  @@map("payment_transactions")
+}
+
+enum TransactionType {
+  ESCROW_DEPOSIT
+  MILESTONE_PAYOUT
+  PLATFORM_FEE
+  FX_SPREAD
+  REFUND
+  ADJUSTMENT
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+// ============================================================================
+// INVOICING & FINANCIAL RECORDS
+// ============================================================================
+
+model Invoice {
+  id                      String              @id @default(uuid())
+  invoiceNumber           String              @unique // INV-2026-001
+  
+  // Relations
+  contractId              String
+  milestoneId             String?
+  paymentTransactionId    String?             @unique
+  
+  // Parties
+  businessName            String
+  businessAddress         String?
+  businessTaxId           String?
+  businessEmail           String
+  
+  contractorName          String
+  contractorPassportId    String
+  contractorLocation      String
+  
+  // Financial Details
+  milestoneAmount         Decimal             @db.Decimal(12, 2)
+  platformFee             Decimal             @db.Decimal(12, 2)
+  platformFeeRate         Float
+  fxSpread                Decimal             @db.Decimal(12, 2)
+  fxSpreadRate            Float
+  contractorPayout        Decimal             @db.Decimal(12, 2)
+  
+  // Currency Conversion
+  sourceCurrency          String              @default("USD")
+  targetCurrency          String              @default("NGN")
+  exchangeRate            Float
+  contractorReceivesLocal Decimal             @db.Decimal(12, 2)
+  airwallexFee            Decimal             @db.Decimal(10, 2)
+  
+  // Status
+  status                  InvoiceStatus       @default(DRAFT)
+  
+  // Dates
+  invoiceDate             DateTime            @default(now())
+  dueDate                 DateTime?
+  paymentDate             DateTime?
+  
+  // Documents
+  pdfUrl                  String?
+  pdfGeneratedAt          DateTime?
+  
+  // Email Tracking
+  emailedTo               String[]            @default([])
+  lastEmailedAt           DateTime?
+  
+  // Relations
+  contract                Contract            @relation(fields: [contractId], references: [id])
+  milestone               Milestone?          @relation(fields: [milestoneId], references: [id])
+  paymentTransaction      PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id])
+  
+  // Timestamps
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+  
+  @@index([invoiceNumber])
+  @@index([contractId])
+  @@index([milestoneId])
+  @@index([status])
+  @@map("invoices")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+  REFUNDED
+}
+
+// ============================================================================
+// REVENUE MANAGEMENT & LEDGER
+// ============================================================================
+
+model MultiCurrencyWallet {
+  id                    String              @id @default(uuid())
+  walletType            WalletType
+  ownerId               String              // User ID or Contract ID
+  
+  // Balances by Currency
+  balances              Json                // { "USD": 1000.00, "NGN": 1650500.00 }
+  
+  // Metadata
+  isActive              Boolean             @default(true)
+  
+  // Relations
+  ledgerTransactions    LedgerTransaction[]
+  revenueEntries        RevenueEntry[]
+  
+  // Timestamps
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([walletType])
+  @@index([ownerId])
+  @@map("multi_currency_wallets")
+}
+
+enum WalletType {
+  CLIENT_ESCROW
+  TALENT_PAYOUT
+  PLATFORM_TREASURY
+}
+
+model LedgerTransaction {
+  id                    String              @id @default(uuid())
+  walletId              String
+  paymentTransactionId  String?
+  
+  // Transaction Details
+  amount                Decimal             @db.Decimal(12, 2)
+  currency              String
+  transactionType       LedgerTransactionType
+  
+  // Balances
+  balanceBefore         Decimal             @db.Decimal(12, 2)
+  balanceAfter          Decimal             @db.Decimal(12, 2)
+  
+  // Metadata
+  description           String?
+  metadata              Json?
+  
+  // Relations
+  wallet                MultiCurrencyWallet @relation(fields: [walletId], references: [id])
+  paymentTransaction    PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id])
+  
+  // Timestamps
+  transactionDate       DateTime            @default(now())
+  createdAt             DateTime            @default(now())
+  
+  @@index([walletId])
+  @@index([paymentTransactionId])
+  @@index([transactionType])
+  @@map("ledger_transactions")
+}
+
+enum LedgerTransactionType {
+  DEPOSIT
+  WITHDRAWAL
+  PLATFORM_FEE
+  FX_SPREAD
+  TRANSFER
+  REFUND
+  ADJUSTMENT
+}
+
+model RevenueEntry {
+  id                    String              @id @default(uuid())
+  walletId              String
+  
+  // Revenue Breakdown
+  platformFee           Decimal             @db.Decimal(12, 2)
+  fxSpread              Decimal             @db.Decimal(12, 2)
+  totalRevenue          Decimal             @db.Decimal(12, 2)
+  
+  // Source
+  contractId            String
+  milestoneId           String?
+  
+  // Metadata
+  revenueDate           DateTime            @default(now())
+  
+  // Relations
+  wallet                MultiCurrencyWallet @relation(fields: [walletId], references: [id])
+  
+  // Timestamps
+  createdAt             DateTime            @default(now())
+  
+  @@index([walletId])
+  @@index([contractId])
+  @@index([revenueDate])
+  @@map("revenue_entries")
+}
+
+// ============================================================================
+// B2B CLIENT ACQUISITION (GTM)
+// ============================================================================
+
+model Lead {
+  id                    String              @id @default(uuid())
+  
+  // Lead Information
+  companyName           String
+  contactName           String
+  contactEmail          String              @unique
+  contactLinkedin       String?
+  jobTitle              String?
+  companySize           String?             // 10-50, 51-200, etc.
+  industry              String?
+  
+  // Lead Source
+  source                LeadSource
+  sourceDetails         String?
+  
+  // Lead Scoring
+  leadScore             Int                 @default(0) // 0-100
+  qualificationStatus   QualificationStatus @default(UNQUALIFIED)
+  
+  // Engagement
+  lastContactedAt       DateTime?
+  nextFollowUpAt        DateTime?
+  touchCount            Int                 @default(0)
+  
+  // Relations
+  createdBy             String
+  creator               User                @relation(fields: [createdBy], references: [id])
+  outreachSequences     OutreachSequence[]
+  deals                 Deal[]
+  
+  // Timestamps
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([contactEmail])
+  @@index([leadScore])
+  @@index([qualificationStatus])
+  @@map("leads")
+}
+
+enum LeadSource {
+  LINKEDIN
+  COLD_EMAIL
+  REFERRAL
+  INBOUND
+  CONFERENCE
+  OTHER
+}
+
+enum QualificationStatus {
+  UNQUALIFIED
+  MARKETING_QUALIFIED
+  SALES_QUALIFIED
+  OPPORTUNITY
+  CUSTOMER
+  LOST
+}
+
+model OutreachSequence {
+  id                    String              @id @default(uuid())
+  leadId                String
+  
+  // Sequence Details
+  sequenceType          String              // 4-TOUCH-LINKEDIN, 4-TOUCH-EMAIL
+  currentStep           Int                 @default(1)
+  totalSteps            Int                 @default(4)
+  
+  // Status
+  status                SequenceStatus      @default(ACTIVE)
+  
+  // Touches
+  touches               OutreachTouch[]
+  
+  // Relations
+  lead                  Lead                @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  startedAt             DateTime            @default(now())
+  completedAt           DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([leadId])
+  @@index([status])
+  @@map("outreach_sequences")
+}
+
+enum SequenceStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+model OutreachTouch {
+  id                    String              @id @default(uuid())
+  sequenceId            String
+  
+  // Touch Details
+  stepNumber            Int
+  channel               OutreachChannel
+  subject               String?
+  message               String              @db.Text
+  
+  // Status
+  status                TouchStatus         @default(PENDING)
+  
+  // Engagement
+  sentAt                DateTime?
+  openedAt              DateTime?
+  clickedAt             DateTime?
+  repliedAt             DateTime?
+  
+  // Relations
+  sequence              OutreachSequence    @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  
+  // Timestamps
+  scheduledFor          DateTime
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([sequenceId])
+  @@index([status])
+  @@map("outreach_touches")
+}
+
+enum OutreachChannel {
+  LINKEDIN_CONNECTION
+  LINKEDIN_INMAIL
+  EMAIL
+  PHONE
+  SMS
+}
+
+enum TouchStatus {
+  PENDING
+  SENT
+  OPENED
+  CLICKED
+  REPLIED
+  BOUNCED
+  FAILED
+}
+
+model Deal {
+  id                    String              @id @default(uuid())
+  leadId                String
+  
+  // Deal Details
+  dealName              String
+  dealValue             Decimal             @db.Decimal(12, 2)
+  currency              String              @default("USD")
+  stage                 DealStage           @default(DISCOVERY)
+  
+  // Timeline
+  expectedCloseDate     DateTime?
+  actualCloseDate       DateTime?
+  
+  // Metadata
+  notes                 String?             @db.Text
+  
+  // Relations
+  lead                  Lead                @relation(fields: [leadId], references: [id])
+  createdBy             String
+  creator               User                @relation(fields: [createdBy], references: [id])
+  
+  // Timestamps
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([leadId])
+  @@index([stage])
+  @@map("deals")
+}
+
+enum DealStage {
+  DISCOVERY
+  DEMO_SCHEDULED
+  DEMO_COMPLETED
+  PROPOSAL_SENT
+  NEGOTIATION
+  CLOSED_WON
+  CLOSED_LOST
+}
+
+// ============================================================================
+// WEBHOOKS & INTEGRATIONS
+// ============================================================================
+
+model WebhookEvent {
+  id                    String              @id @default(uuid())
+  
+  // Webhook Source
+  source                WebhookSource
+  eventType             String              // biometric.verified, transfer.completed
+  
+  // Payload
+  payload               Json                // Raw webhook payload
+  headers               Json?               // Request headers
+  
+  // Processing
+  status                WebhookStatus       @default(PENDING)
+  processedAt           DateTime?
+  failureReason         String?
+  retryCount            Int                 @default(0)
+  
+  // Relations
+  contractId            String?
+  contract              Contract?           @relation(fields: [contractId], references: [id])
+  
+  // Timestamps
+  receivedAt            DateTime            @default(now())
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  
+  @@index([source])
+  @@index([eventType])
+  @@index([status])
+  @@index([contractId])
+  @@map("webhook_events")
+}
+
+enum WebhookSource {
+  SMILE_ID
+  AIRWALLEX
+  SENDGRID
+  STRIPE
+  INTERNAL
+}
+
+enum WebhookStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+// ============================================================================
+// AUDIT LOGS & COMPLIANCE
+// ============================================================================
+
+model AuditLog {
+  id                    String              @id @default(uuid())
+  
+  // Actor (who triggered the event)
+  userId                String?             // Also referred to as actorId
+  userEmail             String?
+  ipAddress             String?
+  userAgent             String?
+  
+  // Action (what happened)
+  action                String              // user.created, contract.funded, milestone.paid
+  actionType            ActionType?         // Standardized compliance event type
+  resource              String              // User, Contract, Milestone, TaxDocument
+  resourceId            String?             // The affected resource ID
+  
+  // Changes & Metadata
+  changes               Json?               // { before: {}, after: {} }
+  metadata              Json?               // Additional context
+  
+  // CRITICAL: Cryptographic Hash for Immutability
+  // SHA-256 hash of the entire audit payload (action + resource + metadata + timestamp)
+  // This ensures the audit trail cannot be tampered with
+  payloadHash           String              // Cryptographic SHA-256 hash
+  previousHash          String?             // Hash of previous audit log (blockchain-like chain)
+  sequenceNumber        Int                 @default(autoincrement())
+  
+  // Relations
+  user                  User?               @relation(fields: [userId], references: [id])
+  contractId            String?
+  contract              Contract?           @relation(fields: [contractId], references: [id])
+  
+  // Timestamps
+  timestamp             DateTime            @default(now())
+  createdAt             DateTime            @default(now())
+  
+  @@index([userId])
+  @@index([action])
+  @@index([actionType])
+  @@index([resource])
+  @@index([resourceId])
+  @@index([timestamp])
+  @@index([sequenceNumber])
+  @@map("audit_logs")
+}
+
+// Standardized Action Types for Banking & Regulatory Compliance
+enum ActionType {
+  // Identity Verification (VettedME)
+  PASSPORT_VERIFICATION_SUCCESS
+  PASSPORT_VERIFICATION_FAILED
+  PASSPORT_REVOKED
+  BIOMETRIC_SCAN_SUCCESS
+  BIOMETRIC_SCAN_FAILED
+  KYC_DOCUMENT_UPLOADED
+  
+  // Financial Operations (VettedPay)
+  AIRWALLEX_SUBACCOUNT_PROVISIONED
+  CAPITAL_DEPOSIT_CONFIRMED
+  ESCROW_FUNDS_LOCKED
+  ESCROW_FUNDS_RELEASED
+  BIOMETRIC_HANDSHAKE_TRIGGERED
+  PAYOUT_DISBURSEMENT_EXECUTED
+  PAYOUT_DISBURSEMENT_FAILED
+  PLATFORM_FEE_CAPTURED
+  FX_SPREAD_CAPTURED
+  
+  // Tax Compliance
+  COMPLIANCE_TAX_FORM_VAULTED
+  W8BEN_GENERATED
+  W8BEN_DOWNLOADED
+  W8BEN_SIGNATURE_CAPTURED
+  
+  // Contract Lifecycle
+  CONTRACT_CREATED
+  CONTRACT_FUNDED
+  CONTRACT_ACTIVATED
+  CONTRACT_COMPLETED
+  CONTRACT_CANCELLED
+  
+  // Milestone Events
+  MILESTONE_CREATED
+  MILESTONE_WORK_SUBMITTED
+  MILESTONE_RELEASED
+  MILESTONE_PAID
+  MILESTONE_DISPUTED
+  
+  // Dispute & Fraud
+  CONTRACT_DISPUTE_RAISED
+  DISPUTE_RESOLVED
+  FRAUD_ALERT_TRIGGERED
+  SECURITY_INCIDENT
+  
+  // Authentication & Session
+  USER_LOGIN
+  USER_LOGOUT
+  SESSION_EXPIRED
+  PASSWORD_CHANGED
+  
+  // Administrative
+  ADMIN_ACTION
+  SYSTEM_CONFIGURATION_CHANGED
+  
+  // Lead Capture & Sales
+  LEAD_CAPTURED
+  LEAD_QUALIFIED
+  LEAD_CONVERTED
+}
+
+// ============================================================================
+// B2B ENTERPRISE LEAD CAPTURE (Landing Page)
+// ============================================================================
+
+model EnterpriseLead {
+  id                    String              @id @default(uuid())
+
+  // Contact Information
+  firstName             String?
+  lastName              String?
+  email                 String
+  phone                 String?
+  linkedinUrl           String?
+
+  // Company Information
+  companyName           String?
+  companySize           String?             // "50-100", "100-200", etc.
+  industry              String?
+  location              String?
+  companyWebsite        String?
+  fundingStage          String?
+  fundingAmount         String?
+  lastFundingDate       DateTime?
+
+  // Job Title & Role
+  jobTitle              String?
+
+  // Lead Details (from landing page form)
+  budget                String?             // 5k-10k, 10k-20k, etc.
+  techStack             String?             // typescript-react, python-django, etc.
+
+  // Lead Scoring & Status
+  leadScore             Int                 @default(0) // 0-100
+  leadTier              String              @default("Tier 4") // Tier 1, Tier 2, Tier 3, Tier 4
+  pipelineStatus        SalesPipelineStatus @default(COLD_OUTREACH)
+  source                String              @default("LANDING_PAGE") // LANDING_PAGE, APOLLO, LINKEDIN, MANUAL
+
+  // Sales Pipeline Timestamps (State Machine)
+  coldOutreachAt        DateTime?           // When first cold email sent
+  emailRepliedAt        DateTime?           // When lead replied to email
+  demoBookedAt          DateTime?           // When demo scheduled
+  demoCompletedAt       DateTime?           // When demo finished
+  contractPendingAt     DateTime?           // When contract sent for signature
+  enterpriseActiveAt    DateTime?           // When contract signed (converted)
+
+  // Engagement Tracking
+  contactAttempts       Int                 @default(0)
+  lastContactedAt       DateTime?
+  emailsSent            Int                 @default(0)
+  emailsOpened          Int                 @default(0)
+  emailsClicked         Int                 @default(0)
+  notes                 String?
+
+  // Demo Details
+  demoScheduledFor      DateTime?
+  demoAttendees         String[]            @default([])
+  demoNotes             String?
+
+  // Technical Metadata
+  ipAddress             String?
+  userAgent             String?
+  utmSource             String?
+  utmMedium             String?
+  utmCampaign           String?
+
+  // Timestamps
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  @@index([email])
+  @@index([leadScore])
+  @@index([pipelineStatus])
+  @@index([leadTier])
+  @@index([source])
+  @@index([createdAt])
+  @@index([companyName])
+  @@map("enterprise_leads")
+}
+
+// ============================================================================
+// SALES PIPELINE STATE MACHINE (B2B Client Acquisition)
+// ============================================================================
+// Tracks enterprise client journey from cold outreach to active contract
+
+enum SalesPipelineStatus {
+  COLD_OUTREACH         // Initial state: Cold email sent
+  EMAIL_REPLIED         // Lead replied to cold email
+  DEMO_BOOKED           // Demo call scheduled
+  DEMO_COMPLETED        // Demo call finished
+  CONTRACT_PENDING      // Contract sent, awaiting signature
+  ENTERPRISE_ACTIVE     // Contract signed, client is active
+  LOST                  // Lead went cold or disqualified
+}
+
+// ============================================================================
+// VETTEDME AI TRAINING STATUS
+// ============================================================================
+
+enum AIStatus {
+  NOT_STARTED
+  TIER1_IN_PROGRESS
+  TIER1_PASSED
+  TIER2_IN_PROGRESS
+  TIER2_PASSED
+  TIER3_IN_PROGRESS
+  TIER3_PASSED
+  COMPLETED
+  FAILED
+}
+
+// ============================================================================
+// UROMI / NICTM TALENT PIPELINE (Ugboha Road facility)
+// Physical workstations + candidate viva evaluations + telemetry audit
+// ============================================================================
+
+/// Specialized academic pipelines from NICTM (+ diaspora / non-NICTM locals)
+enum NictmDepartment {
+  MECHATRONICS_ENGINEERING
+  COMPUTER_SCIENCE
+  CYBER_SECURITY_DATA_PROTECTION
+  CIVIL_ENGINEERING
+  QUANTITY_SURVEYING
+  BUILDING_TECHNOLOGY
+  EXTERNAL_TALENT
+}
+
+/// Track status through the 3 validation tiers
+enum EvaluationTier {
+  TIER_1_CALIBRATION
+  TIER_2_INTERACTIVE_VIVA
+  TIER_3_PRODUCTION_READY
+}
+
+/// Physical workstations tracking hardware telemetry on Ugboha Road
+model Workstation {
+  id               String                @id @default(uuid())
+  stationNumber    Int                   @unique
+  rowLocation      String // e.g., "ROW_A", "ROW_B"
+  starlinkStreamId String // Identifies the active routing pipe
+  isActive         Boolean               @default(true)
+  createdAt        DateTime              @default(now())
+
+  evaluations CandidateEvaluation[]
+
+  @@index([isActive])
+  @@map("workstations")
+}
+
+/// Core profile tracking the local Uromi talent pipeline
+model Candidate {
+  id          String @id @default(uuid())
+  fullName    String
+  email       String @unique
+  phoneNumber String
+  hometown    String @default("Uromi")
+
+  // Academic anchoring
+  isNictmStudent Boolean         @default(true)
+  department     NictmDepartment
+  matricNumber   String?         @unique // Nullable if EXTERNAL_TALENT / diaspora
+
+  // Current pipeline status
+  currentTier EvaluationTier @default(TIER_1_CALIBRATION)
+  isCertified Boolean         @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  evaluations   CandidateEvaluation[]
+  telemetryLogs RaterTelemetry[]
+
+  @@index([department])
+  @@index([currentTier])
+  @@index([isCertified])
+  @@map("candidates")
+}
+
+/// Tier 2 tracking — how candidates defend their logic to the AI Auditor
+model CandidateEvaluation {
+  id            String   @id @default(uuid())
+  candidateId   String
+  workstationId String
+  sessionDate   DateTime @default(now())
+
+  // Performance metas
+  rollingMaeScore    Float // Mean Absolute Error delta from Tier 1
+  defenseScore       Float // How well they stood their ground (0.0 - 100.0)
+  logicalConsistency Float // Audit tracking consistency score
+
+  // Transcripts & AI state
+  vivaAudioUrl        String? // Saved stream path on local secure storage
+  aiAuditorTranscript Json // Step-by-step back-and-forth log matrix
+  supervisorNotes     String? // Manual ToT sign-off notes
+
+  candidate   Candidate   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  workstation Workstation @relation(fields: [workstationId], references: [id])
+
+  @@index([candidateId])
+  @@index([workstationId])
+  @@index([sessionDate])
+  @@map("candidate_evaluations")
+}
+
+/// Historical streaming telemetry for audit compliance
+model RaterTelemetry {
+  id          String   @id @default(uuid())
+  candidateId String
+  tier        String   @default("TIER_2")
+  actionType  String // e.g., "CRITIQUE_PUSHBACK", "LOGIC_REVISION"
+  metricDelta Float // Variance recording
+  timestamp   DateTime @default(now())
+
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([candidateId])
+  @@index([tier])
+  @@index([timestamp])
+  @@map("rater_telemetry")
+}
+
+// ============================================================================
+// END OF SCHEMA
+// ============================================================================
