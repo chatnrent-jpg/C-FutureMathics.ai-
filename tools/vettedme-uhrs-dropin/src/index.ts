@@ -73,13 +73,21 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 
-// Rate Limiting
+// Rate Limiting — generous in development so UHRS / viva local practice is not blocked.
+const isDev = (process.env.NODE_ENV || 'development') !== 'production';
 const limiter = rateLimit({
   windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
-  max: Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
+  max:
+    Number(process.env.RATE_LIMIT_MAX_REQUESTS) ||
+    (isDev ? 5000 : 100),
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    // Always allow UHRS liveness + simulator practice under /api/rlhf/uhrs/*
+    const p = req.path || '';
+    return p.startsWith('/rlhf/uhrs') || p.includes('/rlhf/uhrs');
+  },
 });
 
 app.use('/api/', limiter);
