@@ -40,8 +40,9 @@ function httpError(res: Response, json: any, fallback: string): Error {
   const msg =
     json?.error || json?.message || `${fallback} (${res.status})`;
   if (res.status === 404) {
+    const hit = json?.path ? ` (got 404 for ${json.path})` : "";
     return new Error(
-      `${msg} — backend missing UHRS routes. Apply the UHRS patches and restart: npx tsx watch src/index.ts`
+      `${msg}${hit} — backend process is still running WITHOUT UHRS files. In vettedme-backend run APPLY-UHRS-EMBEDDED.ps1, then kill port 8080 and restart: npx tsx watch src/index.ts`
     );
   }
   return new Error(msg);
