@@ -1,4 +1,4 @@
-# FETCH-UHRS-FILES.ps1 — pull each UHRS file from GitHub into THIS folder.
+# FETCH-UHRS-FILES.ps1 - pull each UHRS file from GitHub into THIS folder.
 # Run from: C:\Users\Henry Okojie\Documents\vettedme-backend
 #
 #   powershell -ExecutionPolicy Bypass -File .\FETCH-UHRS-FILES.ps1
@@ -6,12 +6,12 @@
 #   npx prisma db push
 #   npx tsx watch src\index.ts
 #
-# Boot log MUST show: "UHRS simulator MOUNTED"
-# Then: curl.exe http://localhost:8080/api/rlhf/uhrs/ping  → {"uhrs":true}
+# Boot log MUST show: UHRS simulator MOUNTED
+# Then: curl.exe http://localhost:8080/api/rlhf/uhrs/ping  -> {"uhrs":true}
 
 $ErrorActionPreference = "Stop"
 $Dest = (Get-Location).Path
-if (-not (Test-Path "$Dest\src\index.ts")) {
+if (-not (Test-Path (Join-Path $Dest "src\index.ts"))) {
   throw "Run this from vettedme-backend (src\index.ts not found). Current: $Dest"
 }
 
@@ -40,10 +40,15 @@ foreach ($rel in $Files) {
 }
 
 # Prove critical markers landed
-$idx = Get-Content "$Dest\src\index.ts" -Raw
-if ($idx -notmatch "uhrsRoutes") { throw "src\index.ts missing uhrsRoutes import — fetch failed" }
-if ($idx -notmatch "UHRS simulator MOUNTED") { throw "src\index.ts missing UHRS boot log" }
-if (-not (Test-Path "$Dest\src\modules\rlhf-core-rubric\uhrsRoutes.ts")) {
+$idx = Get-Content (Join-Path $Dest "src\index.ts") -Raw
+if ($idx -notmatch "uhrsRoutes") {
+  throw "src\index.ts missing uhrsRoutes import - fetch failed"
+}
+if ($idx -notmatch "UHRS simulator MOUNTED") {
+  throw "src\index.ts missing UHRS boot log"
+}
+$uhrsRoutesPath = Join-Path $Dest "src\modules\rlhf-core-rubric\uhrsRoutes.ts"
+if (-not (Test-Path $uhrsRoutesPath)) {
   throw "uhrsRoutes.ts missing"
 }
 Write-Host "OK: index.ts imports uhrsRoutes + boot banner present"
