@@ -10,7 +10,8 @@ $Files = @(
   "src/index.ts",
   "prisma/schema.prisma",
   "frontend/src/lib/uhrsApi.ts",
-  "frontend/src/app/uhrs/page.tsx"
+  "frontend/src/app/uhrs/page.tsx",
+  "scripts/check-db.ts"
 )
 foreach ($rel in $Files) {
   $out = Join-Path (Get-Location) ($rel -replace "/", "\")
