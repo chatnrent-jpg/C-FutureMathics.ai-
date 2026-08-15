@@ -60,8 +60,17 @@ RATE_LIMIT_MAX_REQUESTS=5000
 Get-Content ".\.env" | Select-String "DATABASE_URL|PORT="
 
 Write-Step "3) Stop conflicting Postgres containers"
-docker stop vetted-pg vetted-postgres 2>$null | Out-Null
-docker rm vetted-pg vetted-postgres 2>$null | Out-Null
+# PowerShell Stop mode treats "No such container" as fatal - ignore missing names.
+foreach ($name in @("vetted-pg", "vetted-postgres")) {
+  docker inspect $name 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "Stopping $name"
+    cmd /c "docker stop $name >nul 2>&1"
+    cmd /c "docker rm $name >nul 2>&1"
+  } else {
+    Write-Host "Skip $name (not present)"
+  }
+}
 
 Write-Step "4) Fetch docker-compose.yml (host port 5433)"
 Get-DropinFile "docker-compose.yml"
