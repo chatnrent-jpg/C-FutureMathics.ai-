@@ -18,6 +18,7 @@ import complianceRouter from './routes/compliance.routes';
 import auditRouter from './routes/audit.routes';
 import leadRouter from './routes/lead.routes';
 import rlhfRouter from './modules/rlhf-core-rubric/router';
+import uhrsRouter from './modules/rlhf-core-rubric/uhrsRoutes';
 import { initVivaSocketServer } from './modules/rlhf-core-rubric/vivaStreamController';
 
 dotenv.config();
@@ -188,6 +189,9 @@ app.use('/api/v1/leads', leadRouter);
 app.use('/api/v1/modules/rlhf-core-rubric', rlhfRouter);
 // Uromi Trust Infrastructure alias — Cloudflare tunnel / ToT terminals
 app.use('/api/rlhf', rlhfRouter);
+// UHRS / Tokoka simulator — dedicated mount (survives stale routes.ts)
+app.use('/api/v1/modules/rlhf-core-rubric', uhrsRouter);
+app.use('/api/rlhf', uhrsRouter);
 
 // ============================================================================
 // ERROR HANDLING
@@ -218,6 +222,7 @@ server.listen(PORT, () => {
   logger.info(`🔐 Security headers: ENABLED`);
   logger.info(`⚡ VettedME Engine: READY`);
   logger.info(`💰 VettedPay Engine: READY`);
+  logger.info(`🎯 UHRS simulator MOUNTED — GET /api/rlhf/uhrs/ping (expect 200)`);
   logger.info(`🌅 Ugboha Road Hub network pipeline fully hot-wired and listening.`);
 });
 
