@@ -30,6 +30,22 @@ import {
 } from "./validation";
 const router = Router();
 
+/** Guard against stale Windows controller.ts missing newer named exports */
+function requireHandler(
+  name: string,
+  handler: unknown
+): (req: Request, res: Response, next: NextFunction) => void {
+  if (typeof handler === "function") {
+    return handler as (req: Request, res: Response, next: NextFunction) => void;
+  }
+  return (_req, res) => {
+    res.status(501).json({
+      status: "error",
+      error: `Handler ${name} is missing from controller.ts — sync controller from repo`,
+    });
+  };
+}
+
 /**
  * Zod body validator — assigns parsed body (so .default() values apply).
  * Matches Uromi blueprint validate() middleware shape.
@@ -149,12 +165,16 @@ router.get(
   "/analytics/live-feed",
   authenticate,
   requireAdmin,
-  getLiveAnalyticsFeed
+  requireHandler("getLiveAnalyticsFeed", getLiveAnalyticsFeed)
 );
 
 // Administrative Endpoint: GET /api/v1/modules/rlhf-core-rubric/analytics
 // Auth middleware + ADMIN role check inside getSupervisorAnalytics
-router.get("/analytics", authenticate, getSupervisorAnalytics);
+router.get(
+  "/analytics",
+  authenticate,
+  requireHandler("getSupervisorAnalytics", getSupervisorAnalytics)
+);
 
 /**
  * POST /api/v1/modules/rlhf-core-rubric/viva/initialize
