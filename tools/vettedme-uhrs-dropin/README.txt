@@ -1,12 +1,21 @@
 UHRS drop-in for Windows (VettedME)
 
-PREFERRED (no zip / litterbox):
-  cd Documents\vettedme-backend
-  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/chatnrent-jpg/C-FutureMathics.ai-/cursor/uhrs-dropin-sync-8175/tools/vettedme-uhrs-dropin/APPLY-UHRS-EMBEDDED.ps1" -OutFile .\APPLY-UHRS-EMBEDDED.ps1
-  powershell -ExecutionPolicy Bypass -File .\APPLY-UHRS-EMBEDDED.ps1
-  npx tsx watch src/index.ts
+Your boot log MUST include this line after restart:
+  UHRS simulator MOUNTED — GET /api/rlhf/uhrs/ping (expect 200)
 
-VERIFY (must be 401, never 404):
+If that line is missing, index.ts was NOT updated — UHRS is not loaded.
+
+STEP 1 — from Documents\vettedme-backend:
+  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/chatnrent-jpg/C-FutureMathics.ai-/cursor/uhrs-dropin-sync-8175/tools/vettedme-uhrs-dropin/FETCH-UHRS-FILES.ps1" -OutFile .\FETCH-UHRS-FILES.ps1
+  powershell -ExecutionPolicy Bypass -File .\FETCH-UHRS-FILES.ps1
+  npx prisma generate
+  npx prisma db push
+  npx tsx watch src\index.ts
+
+STEP 2 — verify (second window):
+  curl.exe http://localhost:8080/api/rlhf/uhrs/ping
+  → must return {"uhrs":true,...}
   curl.exe -i http://localhost:8080/api/rlhf/uhrs/status
+  → must be 401 (not 404)
 
-If still 404: you are not running API from the folder where files were written.
+Then refresh http://localhost:3000/uhrs

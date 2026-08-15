@@ -220,6 +220,9 @@ export default function UhrsSimulatorPage() {
             </h1>
           </div>
           <nav className="flex gap-4 text-sm text-slate-400">
+            <Link href="/login?next=/uhrs" className="hover:text-white">
+              Login
+            </Link>
             <Link href="/viva" className="hover:text-white">
               Viva
             </Link>
@@ -241,16 +244,31 @@ export default function UhrsSimulatorPage() {
         </p>
 
         {bootError && (
-          <div className="rounded border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
-            {bootError}
-            <button
-              type="button"
-              className="ml-3 underline"
-              onClick={() => void boot()}
-            >
-              Retry
-            </button>
+          <div className="space-y-2 rounded border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+            <p>{bootError}</p>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                className="underline"
+                onClick={() => void boot()}
+              >
+                Retry
+              </button>
+              <Link href="/login?next=/uhrs" className="underline">
+                Login / Register
+              </Link>
+            </div>
           </div>
+        )}
+
+        {!bootError && !snapshot && (
+          <p className="text-sm text-slate-400">
+            Starting practice session... If this hangs,{" "}
+            <Link href="/login?next=/uhrs" className="underline text-slate-200">
+              create an account
+            </Link>
+            .
+          </p>
         )}
 
         {metrics && (
