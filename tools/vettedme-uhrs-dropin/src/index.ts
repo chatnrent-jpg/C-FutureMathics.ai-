@@ -225,6 +225,19 @@ initVivaSocketServer(server);
 server.listen(PORT, () => {
   logger.info(`🚀 VETTED Backend running on port ${PORT}`);
   logger.info(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  try {
+    const raw = process.env.DATABASE_URL || '';
+    const u = raw ? new URL(raw) : null;
+    const dbHint = u
+      ? `${u.hostname}:${u.port || '5432'}${u.pathname}`
+      : '(DATABASE_URL missing)';
+    logger.info(`🗄️  Database: ${dbHint}`);
+    if (u && (u.port === '5432' || !u.port) && (u.hostname === '127.0.0.1' || u.hostname === 'localhost')) {
+      logger.warn('⚠️  Local DB on 5432 — vetted-pg Docker is usually 5433. Check .env DATABASE_URL.');
+    }
+  } catch {
+    logger.warn('🗄️  Database: (DATABASE_URL unparseable)');
+  }
   logger.info(`🔐 Security headers: ENABLED`);
   logger.info(`⚡ VettedME Engine: READY`);
   logger.info(`💰 VettedPay Engine: READY`);
