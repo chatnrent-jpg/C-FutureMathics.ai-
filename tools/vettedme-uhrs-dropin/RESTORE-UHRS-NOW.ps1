@@ -60,9 +60,9 @@ RATE_LIMIT_MAX_REQUESTS=5000
 Get-Content ".\.env" | Select-String "DATABASE_URL|PORT="
 
 Write-Step "3) Stop conflicting Postgres containers"
-# PowerShell Stop mode treats "No such container" as fatal - ignore missing names.
+# IMPORTANT: use cmd /c so missing containers do not abort PowerShell Stop mode
 foreach ($name in @("vetted-pg", "vetted-postgres")) {
-  docker inspect $name 2>$null | Out-Null
+  cmd /c "docker inspect $name >nul 2>&1"
   if ($LASTEXITCODE -eq 0) {
     Write-Host "Stopping $name"
     cmd /c "docker stop $name >nul 2>&1"
@@ -76,8 +76,9 @@ Write-Step "4) Fetch docker-compose.yml (host port 5433)"
 Get-DropinFile "docker-compose.yml"
 
 Write-Step "5) Compose down -v and start postgres only"
-docker compose down -v
-docker compose up -d postgres
+cmd /c "docker compose down -v"
+cmd /c "docker compose up -d postgres"
+if ($LASTEXITCODE -ne 0) { throw "docker compose up failed" }
 
 Write-Step "6) Wait until Postgres is healthy"
 $deadline = (Get-Date).AddSeconds(120)
@@ -89,8 +90,10 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 3
     continue
   }
-  $health = docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" vetted-postgres 2>$null
-  docker exec vetted-postgres pg_isready -U vetted_user -d vetted_db 2>$null | Out-Null
+  $health = cmd /c "docker inspect --format {{.State.Health.Status}} vetted-postgres 2>nul"
+  if (-not $health) { $health = "none" }
+  $health = $health.Trim()
+  cmd /c "docker exec vetted-postgres pg_isready -U vetted_user -d vetted_db >nul 2>&1"
   if ($LASTEXITCODE -eq 0 -and ($health -eq "healthy" -or $health -eq "none")) {
     # accept healthy, or none if healthcheck lagging but pg_isready ok
     if ($health -eq "healthy" -or $LASTEXITCODE -eq 0) {
