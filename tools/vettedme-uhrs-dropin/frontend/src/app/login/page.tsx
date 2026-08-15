@@ -49,11 +49,11 @@ function AuthForm() {
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok || !json.token) {
-        throw new Error(
-          json.error ||
-            json.message ||
-            `${mode} failed (${res.status}). Is API on :8080?`
-        );
+        const detail =
+          (json.message && String(json.message)) ||
+          (json.error && String(json.error)) ||
+          `${mode} failed (${res.status}). Is API on :8080?`;
+        throw new Error(detail);
       }
 
       window.localStorage.setItem("vetted_token", String(json.token));

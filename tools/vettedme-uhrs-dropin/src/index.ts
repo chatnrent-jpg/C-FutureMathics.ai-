@@ -1,8 +1,8 @@
+import './env';
 import express, { Express } from 'express';
 import http from 'http';
 import cors from 'cors';
 import helmet from 'helmet';
-import dotenv from 'dotenv';
 import { rateLimit } from 'express-rate-limit';
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
@@ -20,8 +20,6 @@ import leadRouter from './routes/lead.routes';
 import rlhfRouter from './modules/rlhf-core-rubric/router';
 import uhrsRouter from './modules/rlhf-core-rubric/uhrsRoutes';
 import { initVivaSocketServer } from './modules/rlhf-core-rubric/vivaStreamController';
-
-dotenv.config();
 
 const app: Express = express();
 const PORT = process.env.PORT || 3000;

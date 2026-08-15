@@ -14,7 +14,7 @@ import { Pool } from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@prisma/client";
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const UHRS_COLUMNS = [
   "uhrsSpamScore",
