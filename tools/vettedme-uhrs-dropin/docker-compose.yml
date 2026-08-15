@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: vetted-postgres
+    environment:
+      POSTGRES_DB: vetted_db
+      POSTGRES_USER: vetted_user
+      POSTGRES_PASSWORD: vetted_password
+    ports:
+      # Host 5433 avoids clashing with a local/system Postgres on 5432
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vetted_user -d vetted_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: vetted-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: vetted-backend
+    environment:
+      DATABASE_URL: "postgresql://vetted_user:vetted_password@postgres:5432/vetted_db?schema=public"
+      NODE_ENV: development
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - ./prisma:/app/prisma
+    command: npm run dev
+
+volumes:
+  postgres_data:
+  redis_data:
