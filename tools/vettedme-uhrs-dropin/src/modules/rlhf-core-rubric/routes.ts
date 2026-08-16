@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { ZodTypeAny } from "zod";
-import { authenticate, requireAdmin } from "../../middleware/auth";
+import { authenticate as authenticateRaw, requireAdmin as requireAdminRaw } from "../../middleware/auth";
 import {
   getLessonBySlug,
   getModuleOverview,
@@ -30,7 +30,7 @@ import {
 } from "./validation";
 const router = Router();
 
-/** Guard against stale Windows controller.ts missing newer named exports */
+/** Guard against stale Windows files missing named exports (never crash boot). */
 function requireHandler(
   name: string,
   handler: unknown
@@ -41,10 +41,13 @@ function requireHandler(
   return (_req, res) => {
     res.status(501).json({
       status: "error",
-      error: `Handler ${name} is missing from controller.ts — sync controller from repo`,
+      error: `Handler ${name} is missing — sync that file from the drop-in pack`,
     });
   };
 }
+
+const authenticate = requireHandler("authenticate", authenticateRaw);
+const requireAdmin = requireHandler("requireAdmin", requireAdminRaw);
 
 /**
  * Zod body validator — assigns parsed body (so .default() values apply).
@@ -84,15 +87,21 @@ const validateBody = (schema: ZodTypeAny) => {
   };
 };
 
-router.get("/", getModuleOverview);
-router.get("/lessons", listLessons);
+router.get("/", requireHandler("getModuleOverview", getModuleOverview));
+router.get("/lessons", requireHandler("listLessons", listLessons));
 
 // Endpoint: GET /api/v1/modules/rlhf-core-rubric/lessons/:slug
-router.get("/lessons/:slug", getLessonBySlug);
+router.get("/lessons/:slug", requireHandler("getLessonBySlug", getLessonBySlug));
 
-router.get("/rubric", getRubric);
-router.get("/dataset/preference-pairs", getPreferencePairs);
-router.get("/dataset/preference-pairs/:pairId", getPreferencePair);
+router.get("/rubric", requireHandler("getRubric", getRubric));
+router.get(
+  "/dataset/preference-pairs",
+  requireHandler("getPreferencePairs", getPreferencePairs)
+);
+router.get(
+  "/dataset/preference-pairs/:pairId",
+  requireHandler("getPreferencePair", getPreferencePair)
+);
 
 // Browser GET helper — validate itself is POST-only
 router.get("/validate", (_req, res) => {
@@ -151,10 +160,14 @@ router.post(
   "/validate",
   authenticate,
   validateBody(validateAssessmentSchema),
-  validateAssessment
+  requireHandler("validateAssessment", validateAssessment)
 );
 
-router.post("/progress", authenticate, updateProgress);
+router.post(
+  "/progress",
+  authenticate,
+  requireHandler("updateProgress", updateProgress)
+);
 
 /**
  * GET /api/rlhf/analytics/live-feed
@@ -184,7 +197,7 @@ router.get(
 router.post(
   "/viva/initialize",
   validateBody(startVivaSessionSchema),
-  initializeVivaSession
+  requireHandler("initializeVivaSession", initializeVivaSession)
 );
 
 /**
@@ -195,7 +208,7 @@ router.get(
   "/viva/:id",
   authenticate,
   requireAdmin,
-  getVivaEvaluationDetail
+  requireHandler("getVivaEvaluationDetail", getVivaEvaluationDetail)
 );
 
 /**
@@ -207,7 +220,7 @@ router.post(
   authenticate,
   requireAdmin,
   validateBody(evaluateVivaSessionSchema),
-  evaluateVivaSession
+  requireHandler("evaluateVivaSession", evaluateVivaSession)
 );
 
 /**
