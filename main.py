@@ -28,7 +28,7 @@ import math
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as clock_time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -275,6 +275,10 @@ class VirtueSession:
     htf_close_date: str = ""
     htf_regime_samples: int = 0
     htf_regime_last_attempt_cycle: int = -10_000
+    # Session VWAP reclaim hold (Wisdom). False/0 until N consecutive in-band cycles.
+    vwap_reclaim_long_streak: int = 0
+    vwap_reclaim_short_streak: int = 0
+    auction_streaks_reset_date: str = ""
     is_running: bool = True  # False stops background state writer (run.py pattern)
     cycles_since_heartbeat: int = 0
     last_heartbeat_ok: bool = True
@@ -966,6 +970,9 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     session.htf_close_date = ""
     session.htf_regime_samples = 0
     session.htf_regime_last_attempt_cycle = -10_000
+    session.vwap_reclaim_long_streak = 0
+    session.vwap_reclaim_short_streak = 0
+    session.auction_streaks_reset_date = ""
     # Fresh RTH session VWAP/TWAP — sticky day anchor starts empty.
     try:
         session.strategy.reset_session_anchors()
@@ -1012,6 +1019,133 @@ def htf_regime_blocks_new_entry(session: VirtueSession, side: str) -> bool:
     return not regime_allows_side(str(session.htf_regime or ""), want)
 
 
+def vwap_disagrees_with_htf(
+    session: VirtueSession,
+    side: str,
+    *,
+    price: float,
+    vwap: float,
+    vwap_score: float,
+) -> bool:
+    """
+    True when yesterday's 20-SMA and today's session VWAP disagree.
+
+    BULLISH SMA + price/score below VWAP → do not long a VWAP loss.
+    BEARISH SMA + price/score above VWAP → do not short a VWAP hold.
+    """
+    want = str(side or "").strip().upper()
+    htf = str(session.htf_regime or "").upper()
+    if want not in {"LONG", "SHORT"}:
+        return False
+    try:
+        px = float(price or 0.0)
+        anchor = float(vwap or 0.0)
+        score = float(vwap_score)
+    except (TypeError, ValueError):
+        return True
+    if want == "LONG" and htf == "BULLISH":
+        if anchor > 0 and px < anchor:
+            return True
+        if score < 50.0:
+            return True
+    if want == "SHORT" and htf == "BEARISH":
+        if anchor > 0 and px > anchor:
+            return True
+        if score > 50.0:
+            return True
+    return False
+
+
+def update_vwap_reclaim_streaks(
+    session: VirtueSession, vwap_score: float, *, counting: bool
+) -> None:
+    """Count consecutive in-band VWAP cycles. A loss/mid-band print zeros that side."""
+    from engine.config import (
+        VIRTUE_SCORE_LONG_ENTER,
+        VIRTUE_SCORE_SHORT_ENTER,
+    )
+
+    try:
+        score = float(vwap_score)
+    except (TypeError, ValueError):
+        session.vwap_reclaim_long_streak = 0
+        session.vwap_reclaim_short_streak = 0
+        return
+    if not counting:
+        session.vwap_reclaim_long_streak = 0
+        session.vwap_reclaim_short_streak = 0
+        return
+    if score >= float(VIRTUE_SCORE_LONG_ENTER):
+        session.vwap_reclaim_long_streak = int(session.vwap_reclaim_long_streak) + 1
+    else:
+        session.vwap_reclaim_long_streak = 0
+    if score <= float(VIRTUE_SCORE_SHORT_ENTER):
+        session.vwap_reclaim_short_streak = int(session.vwap_reclaim_short_streak) + 1
+    else:
+        session.vwap_reclaim_short_streak = 0
+
+
+def vwap_reclaim_blocks_new_entry(session: VirtueSession, side: str) -> bool:
+    """True until session VWAP has held the entry band for VIRTUE_VWAP_RECLAIM_CYCLES."""
+    from engine.config import VIRTUE_VWAP_RECLAIM_CYCLES, virtue_simple_stack
+
+    if not virtue_simple_stack():
+        return False
+    want = str(side or "").strip().upper()
+    need = max(1, int(VIRTUE_VWAP_RECLAIM_CYCLES))
+    if want == "LONG":
+        return int(session.vwap_reclaim_long_streak) < need
+    if want == "SHORT":
+        return int(session.vwap_reclaim_short_streak) < need
+    return False
+
+
+def maybe_reset_auction_confirmation(
+    session: VirtueSession, now: datetime | None = None
+) -> bool:
+    """
+    At 09:45 ET, zero auction-preloaded streaks (Wisdom / Justice).
+
+    The 09:30–09:45 window is manage-only, but long_streak was still counting.
+    First legal second must not inherit that preload.
+    """
+    from engine.config import (
+        VIRTUE_SIMPLE_STACK_ENTRY_HOUR,
+        VIRTUE_SIMPLE_STACK_ENTRY_MINUTE,
+        virtue_session_mode,
+        virtue_simple_stack,
+    )
+    from scripts.run_daily_session import _et_now
+
+    if not virtue_simple_stack():
+        return False
+    if str(virtue_session_mode() or "").lower() == "cme":
+        return False
+    today = et_session_date(now)
+    if str(session.auction_streaks_reset_date or "") == today:
+        return False
+    dt = _et_now(now)
+    start = clock_time(
+        int(VIRTUE_SIMPLE_STACK_ENTRY_HOUR),
+        int(VIRTUE_SIMPLE_STACK_ENTRY_MINUTE),
+        0,
+    )
+    if dt.time() < start:
+        return False
+    session.long_streak = 0
+    session.short_streak = 0
+    session.vwap_reclaim_long_streak = 0
+    session.vwap_reclaim_short_streak = 0
+    session.auction_streaks_reset_date = today
+    logger.info(
+        "CYCLE %s AUCTION_STREAK_RESET et_date=%s — 09:45 confirmation starts at 0 "
+        "(do not inherit the open auction)",
+        session.cycle,
+        today,
+    )
+    return True
+
+
 def log_regime_filter_block(session: VirtueSession, side: str) -> None:
     logger.info(
         "CYCLE %s REGIME_FILTER_BLOCK side=%s regime=%s close=%.2f sma=%.2f "
@@ -1023,6 +1157,85 @@ def log_regime_filter_block(session: VirtueSession, side: str) -> None:
         float(session.htf_sma_200 or 0.0),
         session.htf_close_date or "",
     )
+
+
+def log_vwap_sma_disagree_block(
+    session: VirtueSession, side: str, *, price: float, vwap: float, vwap_score: float
+) -> None:
+    logger.info(
+        "CYCLE %s VWAP_SMA_DISAGREE side=%s regime=%s px=%.2f vwap=%.2f score=%.1f "
+        "— stand aside (do not trade a VWAP loss against the 20-SMA)",
+        session.cycle,
+        str(side or "").upper(),
+        session.htf_regime,
+        float(price or 0.0),
+        float(vwap or 0.0),
+        float(vwap_score or 0.0),
+    )
+
+
+def log_vwap_reclaim_block(session: VirtueSession, side: str) -> None:
+    from engine.config import VIRTUE_VWAP_RECLAIM_CYCLES
+
+    want = str(side or "").upper()
+    have = (
+        int(session.vwap_reclaim_long_streak)
+        if want == "LONG"
+        else int(session.vwap_reclaim_short_streak)
+    )
+    logger.info(
+        "CYCLE %s VWAP_RECLAIM_WAIT side=%s hold=%s/%s — "
+        "need a held VWAP, not a 10-second poke (Wisdom)",
+        session.cycle,
+        want,
+        have,
+        max(1, int(VIRTUE_VWAP_RECLAIM_CYCLES)),
+    )
+
+
+def tactical_wisdom_blocks_entry(
+    session: VirtueSession,
+    side: str,
+    *,
+    price: float,
+    vwap: float,
+    vwap_score: float,
+) -> str:
+    """Return a block tag, or empty if Wisdom allows this new entry."""
+    if htf_regime_blocks_new_entry(session, side):
+        return "sma"
+    if vwap_disagrees_with_htf(
+        session, side, price=price, vwap=vwap, vwap_score=vwap_score
+    ):
+        return "vwap_sma_disagree"
+    if vwap_reclaim_blocks_new_entry(session, side):
+        return "vwap_reclaim"
+    return ""
+
+
+def apply_tactical_wisdom_block(
+    session: VirtueSession,
+    side: str,
+    *,
+    price: float,
+    vwap: float,
+    vwap_score: float,
+) -> bool:
+    """Log and return True when a new tactical entry is blocked."""
+    tag = tactical_wisdom_blocks_entry(
+        session, side, price=price, vwap=vwap, vwap_score=vwap_score
+    )
+    if not tag:
+        return False
+    if tag == "sma":
+        log_regime_filter_block(session, side)
+    elif tag == "vwap_sma_disagree":
+        log_vwap_sma_disagree_block(
+            session, side, price=price, vwap=vwap, vwap_score=vwap_score
+        )
+    else:
+        log_vwap_reclaim_block(session, side)
+    return True
 
 
 async def refresh_htf_regime(session: VirtueSession, *, force: bool = False) -> str:
@@ -2562,6 +2775,16 @@ async def run_cycle(
     session.last_market_lift = float(decision.market_lift)
     # RTH windows (ET) + structure memory — compute before commit for this cycle's gates.
     session.allow_new_entries = bool(ignore_hours) or allow_new_entries()
+    if not ignore_hours:
+        maybe_reset_auction_confirmation(session)
+    entries_clock_open = bool(ignore_hours) or virtue_entries_allowed(
+        adx=float(decision.adx),
+        blend=float(decision.blended_score),
+        vwap_score=float(decision.vwap_score),
+    )
+    update_vwap_reclaim_streaks(
+        session, float(decision.vwap_score), counting=bool(entries_clock_open)
+    )
     # allow_new_entries flag is window-only; extreme override applied at fire time.
     # Below-VWAP SHORT: soft ADX floor + waive ATR/ADX-rise grind (Wisdom).
     below_vwap_short_structure = (
@@ -3149,11 +3372,15 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Wisdom: daily 20-SMA direction before Temperance budget (and before fills).
-    # Counter-trend 5s setups log REGIME_FILTER_BLOCK even on a spent day cap.
+    # Wisdom: 20-SMA + session VWAP agreement + reclaim hold, before Temperance budget.
     _htf_side = str(decision.action.value).upper()
-    if htf_regime_blocks_new_entry(session, _htf_side):
-        log_regime_filter_block(session, _htf_side)
+    if apply_tactical_wisdom_block(
+        session,
+        _htf_side,
+        price=float(price),
+        vwap=float(decision.vwap),
+        vwap_score=float(decision.vwap_score),
+    ):
         session.last_action = "FLAT"
         return
 
@@ -3322,10 +3549,14 @@ async def run_cycle(
 
     need_streak = max(1, int(VIRTUE_REQUIRED_STREAK))
     if virtue_simple_stack():
-        need_streak = 1
+        from engine.config import VIRTUE_VWAP_RECLAIM_CYCLES
+
+        need_streak = max(need_streak, int(VIRTUE_VWAP_RECLAIM_CYCLES))
     if int(session.consecutive_losses) >= 1:
         need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
-    if float(decision.adx) >= float(VIRTUE_EXTREME_ADX_OVERRIDE):
+    if (not virtue_simple_stack()) and float(decision.adx) >= float(
+        VIRTUE_EXTREME_ADX_OVERRIDE
+    ):
         need_streak = 1
     side = decision.action.value
     if side == "LONG":
@@ -3358,8 +3589,13 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    if htf_regime_blocks_new_entry(session, side):
-        log_regime_filter_block(session, side)
+    if apply_tactical_wisdom_block(
+        session,
+        side,
+        price=float(price),
+        vwap=float(decision.vwap),
+        vwap_score=float(decision.vwap_score),
+    ):
         session.last_action = "FLAT"
         return
 
@@ -3839,9 +4075,9 @@ async def run_loop(
 
     if _boot_simple_stack():
         logger.info(
-            "BOOT SIMPLE_STACK_ENABLED vwap-only+20sma+stop$50+trail$25+peak_lock+loss_halt "
+            "BOOT SIMPLE_STACK_ENABLED vwap-only+20sma+reclaim12+stop$50+trail$25 "
             "day_cap=%s loss_halt=%s time_decay=%s — "
-            "TWAP/ADX/EMA/macro/structure/velocity/course_correct/chase/pullback waived",
+            "auction streak reset 09:45; VWAP/SMA disagree stands aside",
             int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
             int(consecutive_loss_halt_limit()),
             bool(tactical_time_decay_enabled()),

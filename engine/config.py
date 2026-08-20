@@ -349,6 +349,9 @@ VIRTUE_SIMPLE_STACK_TIME_DECAY = False
 # 5s stack may only execute with-trend. Override: FM_VIRTUE_REGIME_FILTER=0
 VIRTUE_REGIME_FILTER_ENABLED = True
 VIRTUE_REGIME_SMA_PERIOD = 20
+# After a VWAP loss (or the 09:30 auction), require this many consecutive
+# in-band VWAP cycles before a new entry (~60s at 5s). Stops bounce-scalps.
+VIRTUE_VWAP_RECLAIM_CYCLES = 12
 # Retry UNKNOWN fetch this often (cycles) so a boot outage does not lock the day.
 VIRTUE_REGIME_RETRY_CYCLES = 60
 # Legacy ATR TP helpers (fixed TP off; trail owns winners; kept for tests/compat)

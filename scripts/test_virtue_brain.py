@@ -347,6 +347,58 @@ def test_apply_htf_regime_latch_session() -> None:
     assert htf_regime_blocks_new_entry(s, "LONG") is False
 
 
+def test_vwap_disagrees_with_bullish_sma_blocks_long() -> None:
+    """BULLISH 20-SMA + price below session VWAP → do not long the loss."""
+    from main import VirtueSession, vwap_disagrees_with_htf, vwap_reclaim_blocks_new_entry
+    from main import update_vwap_reclaim_streaks
+    from engine.config import VIRTUE_VWAP_RECLAIM_CYCLES
+
+    s = VirtueSession()
+    s.htf_regime = "BULLISH"
+    assert vwap_disagrees_with_htf(
+        s, "LONG", price=9584.0, vwap=9588.0, vwap_score=41.0
+    ) is True
+    assert vwap_disagrees_with_htf(
+        s, "LONG", price=9592.0, vwap=9588.0, vwap_score=64.0
+    ) is False
+
+    # Bounce after a VWAP loss: 2 in-band cycles is not a hold.
+    update_vwap_reclaim_streaks(s, 44.0, counting=True)
+    assert vwap_reclaim_blocks_new_entry(s, "LONG") is True
+    update_vwap_reclaim_streaks(s, 59.0, counting=True)
+    update_vwap_reclaim_streaks(s, 67.0, counting=True)
+    assert int(s.vwap_reclaim_long_streak) == 2
+    assert vwap_reclaim_blocks_new_entry(s, "LONG") is True
+    for _ in range(int(VIRTUE_VWAP_RECLAIM_CYCLES)):
+        update_vwap_reclaim_streaks(s, 64.0, counting=True)
+    assert vwap_reclaim_blocks_new_entry(s, "LONG") is False
+
+
+def test_auction_streak_reset_zeros_preload() -> None:
+    """09:45 must wipe auction-preloaded long_streak (today's 37-cycle fire)."""
+    import os
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from main import VirtueSession, maybe_reset_auction_confirmation
+
+    os.environ["VIRTUE_SESSION_MODE"] = "rth"
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+
+    tz = ZoneInfo("America/New_York")
+    s = VirtueSession()
+    s.cycle = 148
+    s.long_streak = 37
+    s.vwap_reclaim_long_streak = 20
+    before = datetime(2026, 8, 20, 9, 44, tzinfo=tz)
+    assert maybe_reset_auction_confirmation(s, now=before) is False
+    assert s.long_streak == 37
+    at_open = datetime(2026, 8, 20, 9, 45, tzinfo=tz)
+    assert maybe_reset_auction_confirmation(s, now=at_open) is True
+    assert s.long_streak == 0
+    assert s.vwap_reclaim_long_streak == 0
+    assert maybe_reset_auction_confirmation(s, now=at_open) is False
+
+
 def test_market_lift_and_vol_conviction_scores() -> None:
     s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5)
     s.seed(_trending_bars(40, bull=True, step=1.0))
@@ -2301,6 +2353,8 @@ if __name__ == "__main__":
     test_tactical_time_decay_off_in_simple_stack()
     test_daily_sma_regime_filter_math()
     test_apply_htf_regime_latch_session()
+    test_vwap_disagrees_with_bullish_sma_blocks_long()
+    test_auction_streak_reset_zeros_preload()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()
