@@ -127,10 +127,10 @@ class WisdomStrategy:
     score_price_pct: float = 0.004  # legacy linear score scale
     # Ghost/seed discontinuity only — real session distance is the signal (do not wipe).
     max_anchor_gap_pct: float = 0.01  # ≥100 bps + jump → rebase (Justice ghost)
-    long_enter: float = 58.0  # ENTER long from flat (both scores >=)
-    short_enter: float = 42.0  # ENTER short from flat (both scores <=)
-    long_exit: float = 45.0  # while LONG: flatten when both scores <= hysteresis
-    short_exit: float = 55.0  # while SHORT: flatten when both scores >= hysteresis
+    long_enter: float = 58.0  # ENTER long from flat (session VWAP score >=)
+    short_enter: float = 42.0  # ENTER short from flat (session VWAP score <=)
+    long_exit: float = 45.0  # while LONG: flatten when VWAP score <= hysteresis
+    short_exit: float = 55.0  # while SHORT: flatten when VWAP score >= hysteresis
     # 0 = session cumulative VWAP/TWAP (RTH day); >0 = rolling lookback (tests)
     anchor_window: int = 0
     min_anchor_samples: int = 20
@@ -506,12 +506,12 @@ class WisdomStrategy:
         self._eval_market_lift = lift
         hold = (holding or "").upper()
 
-        # Entry bands (from flat) vs invalidate bands (while holding) — real hysteresis.
-        enter_long = vwap_score >= self.long_enter and twap_score >= self.long_enter
-        enter_short = vwap_score <= self.short_enter and twap_score <= self.short_enter
+        # Session VWAP only (Wisdom). TWAP is logged, never a veto.
+        enter_long = vwap_score >= self.long_enter
+        enter_short = vwap_score <= self.short_enter
         # Thesis broken past hysteresis band (default 45/55) — not every mid-50 dip.
-        exit_long = vwap_score <= self.long_exit and twap_score <= self.long_exit
-        exit_short = vwap_score >= self.short_exit and twap_score >= self.short_exit
+        exit_long = vwap_score <= self.long_exit
+        exit_short = vwap_score >= self.short_exit
 
         # Chaos ATR blocks NEW entries only. Never knife an open trade on proxy ATR spikes —
         # open books exit via hysteresis bands / dollar stop / TP / time-decay (Temperance).
@@ -543,7 +543,7 @@ class WisdomStrategy:
                     action=SignalAction.FLAT,
                     reason=(
                         f"FLATTEN SIGNAL | LONG THESIS BROKEN — "
-                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                        f"VWAP {vwap_score:.1f} (TWAP {twap_score:.1f} obs) "
                         f"dropped to exit band ≤{self.long_exit:.0f}"
                     ),
                     ema_fast=ema_fast,
@@ -559,11 +559,11 @@ class WisdomStrategy:
             return self._empty(
                 regime=Regime.TREND_BULL,
                 action=SignalAction.LONG,
-                reason=(
-                    f"HOLDING LONG | THESIS STILL VALID — "
-                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                    f"(exit if both ≤{self.long_exit:.0f})"
-                ),
+                    reason=(
+                        f"HOLDING LONG | THESIS STILL VALID — "
+                        f"VWAP {vwap_score:.1f} (TWAP {twap_score:.1f} obs) "
+                        f"(exit if VWAP ≤{self.long_exit:.0f})"
+                    ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,
@@ -582,7 +582,7 @@ class WisdomStrategy:
                     action=SignalAction.FLAT,
                     reason=(
                         f"FLATTEN SIGNAL | SHORT THESIS BROKEN — "
-                        f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
+                        f"VWAP {vwap_score:.1f} (TWAP {twap_score:.1f} obs) "
                         f"rose to exit band ≥{self.short_exit:.0f}"
                     ),
                     ema_fast=ema_fast,
@@ -598,11 +598,11 @@ class WisdomStrategy:
             return self._empty(
                 regime=Regime.TREND_BEAR,
                 action=SignalAction.SHORT,
-                reason=(
-                    f"HOLDING SHORT | THESIS STILL VALID — "
-                    f"VWAP {vwap_score:.1f} / TWAP {twap_score:.1f} / blend {blended:.1f} "
-                    f"(exit if both ≥{self.short_exit:.0f})"
-                ),
+                    reason=(
+                        f"HOLDING SHORT | THESIS STILL VALID — "
+                        f"VWAP {vwap_score:.1f} (TWAP {twap_score:.1f} obs) "
+                        f"(exit if VWAP ≥{self.short_exit:.0f})"
+                    ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,
@@ -614,10 +614,8 @@ class WisdomStrategy:
                 twap_score=twap_score,
             )
 
-        # Simple stack: one signal family — blend band only (chaos already handled).
-        # Enter on blend so VWAP/TWAP disagreement cannot freeze a clear edge
-        # (e.g. VWAP 52.5 / TWAP 64 / blend 58.2 → LONG). Holds still use dual-score exit.
-        # Skips EMA / ADX / lift / vol participation so indicators cannot veto each other.
+        # Simple stack: session VWAP bands only (chaos already handled).
+        # TWAP / EMA / ADX / lift / vol are observational — they cannot veto a clean VWAP.
         try:
             from engine.config import virtue_simple_stack as _virtue_simple_stack
 
@@ -625,17 +623,14 @@ class WisdomStrategy:
         except Exception:
             _simple = False
         if _simple:
-            blend_long = blended >= float(self.long_enter)
-            blend_short = blended <= float(self.short_enter)
-            if blend_long:
+            if enter_long:
                 return self._empty(
                     regime=Regime.TREND_BULL,
                     action=SignalAction.LONG,
                     reason=(
                         f"LONG SETUP | SIMPLE STACK — "
-                        f"blend {blended:.1f} ≥ enter {self.long_enter:.0f} "
-                        f"(VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}; "
-                        f"ADX/EMA/macro + dual-score enter waived)"
+                        f"VWAP {vwap_score:.1f} ≥ enter {self.long_enter:.0f} "
+                        f"(TWAP {twap_score:.1f} obs; ADX/EMA/macro waived)"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -647,15 +642,14 @@ class WisdomStrategy:
                     vwap_score=vwap_score,
                     twap_score=twap_score,
                 )
-            if blend_short:
+            if enter_short:
                 return self._empty(
                     regime=Regime.TREND_BEAR,
                     action=SignalAction.SHORT,
                     reason=(
                         f"SHORT SETUP | SIMPLE STACK — "
-                        f"blend {blended:.1f} ≤ enter {self.short_enter:.0f} "
-                        f"(VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}; "
-                        f"ADX/EMA/macro + dual-score enter waived)"
+                        f"VWAP {vwap_score:.1f} ≤ enter {self.short_enter:.0f} "
+                        f"(TWAP {twap_score:.1f} obs; ADX/EMA/macro waived)"
                     ),
                     ema_fast=ema_fast,
                     ema_slow=ema_slow,
@@ -670,12 +664,11 @@ class WisdomStrategy:
             return self._empty(
                 regime=Regime.CHOP_NO_TRADE,
                 action=SignalAction.FLAT,
-                reason=(
-                    f"STAND ASIDE | SIMPLE STACK — "
-                    f"blend {blended:.1f} inside enter bands "
-                    f"(long≥{self.long_enter:.0f} / short≤{self.short_enter:.0f}) "
-                    f"· VWAP {vwap_score:.1f} / TWAP {twap_score:.1f}"
-                ),
+                    reason=(
+                        f"STAND ASIDE | SIMPLE STACK — "
+                        f"need VWAP ≥{self.long_enter:.0f} or ≤{self.short_enter:.0f} "
+                        f"· VWAP {vwap_score:.1f} (TWAP {twap_score:.1f} obs)"
+                    ),
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 adx=adx,

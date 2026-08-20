@@ -99,9 +99,9 @@ MAX_ACCOUNT_CONTRACT_CEILING = 1
 VIRTUE_CORE_ENABLED = False
 VIRTUE_CORE_SIZE = 1  # structural anchor sleeve (ignored when core disabled)
 # MacroMathics simple stack — strip overlapping indicators that confuse the hot path.
-# Keep: VWAP+TWAP bands, chaos ATR, stop/TP, peak lock, time decay, hours/halt.
-# Kill: EMA/ADX/macro participation, structure rise, velocity, streak>1, course_correct,
-# chase, post-TP pullback, bull-day directional gate, temperance blend widening.
+# Keep: session VWAP bands, 20-SMA daily bias, chaos ATR, stop/trail, peak lock, hours/halt.
+# Kill: TWAP as a veto, EMA/ADX/macro participation, structure rise, velocity, course_correct,
+# chase, post-TP pullback, bull-day directional gate. Time-decay OFF (trail/stop/thesis).
 # Override: FM_VIRTUE_SIMPLE_STACK=0 to restore the full indicator stack.
 VIRTUE_SIMPLE_STACK = True
 VIRTUE_CORE_CONFIRM_CYCLES = 5  # HTF bias+ADX confirm before opening core
@@ -213,8 +213,12 @@ FORWARD_TEST_TIMEZONE = "America/New_York"
 VIRTUE_RTH_ONLY = True  # used only when session mode resolves to RTH (Alpaca)
 VIRTUE_RTH_OPEN_HOUR = 9
 VIRTUE_RTH_OPEN_MINUTE = 30
-VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — flatten at/after 4:00 PM ET (RTH mode)
+VIRTUE_RTH_CLOSE_HOUR = 16  # exclusive — session ends 4:00 PM ET (RTH mode)
 VIRTUE_RTH_CLOSE_MINUTE = 0
+# Hard-kill residual risk 5s before cash close (Temperance). Reason: RTH_MARKET_CLOSE.
+VIRTUE_RTH_FLATTEN_HOUR = 15
+VIRTUE_RTH_FLATTEN_MINUTE = 59
+VIRTUE_RTH_FLATTEN_SECOND = 55
 # Legacy single cutoff (superseded by dual RTH entry windows).
 VIRTUE_NO_NEW_ENTRY_HOUR = 15
 VIRTUE_NO_NEW_ENTRY_MINUTE = 55
@@ -250,10 +254,10 @@ VIRTUE_VELOCITY_ADX_FLOOR = 20.0
 VIRTUE_MACRO_BEAR_VWAP_SCORE_MAX = 45.0
 VIRTUE_MACRO_BULL_VWAP_SCORE_MIN = 55.0
 # Enter on clear edge; exit with hysteresis so mid-band chop cannot scalp every dip.
-VIRTUE_SCORE_LONG_ENTER = 58.0   # both VWAP+TWAP >= this to ENTER long from flat
-VIRTUE_SCORE_SHORT_ENTER = 42.0  # both VWAP+TWAP <= this to ENTER short from flat
-VIRTUE_SCORE_LONG_EXIT = 45.0    # while LONG: flatten when both <= 45 (not mid-50)
-VIRTUE_SCORE_SHORT_EXIT = 55.0   # while SHORT: flatten when both >= 55 (not mid-50)
+VIRTUE_SCORE_LONG_ENTER = 58.0   # session VWAP score >= this to ENTER long from flat
+VIRTUE_SCORE_SHORT_ENTER = 42.0  # session VWAP score <= this to ENTER short from flat
+VIRTUE_SCORE_LONG_EXIT = 45.0    # while LONG: flatten when VWAP score <= 45 (not mid-50)
+VIRTUE_SCORE_SHORT_EXIT = 55.0   # while SHORT: flatten when VWAP score >= 55 (not mid-50)
 VIRTUE_REQUIRED_STREAK = 2       # 2 clear cycles — faster Courage on clean tape
 # Native MACRO participation gates (Wisdom) — no VolumeWatch dependency.
 # Dead lift / dead volume cannot print LONG SETUP even if VWAP score is high.
@@ -262,9 +266,12 @@ VIRTUE_MARKET_LIFT_LONG_MIN = 40.0
 VIRTUE_VOL_CONVICTION_SHORT_MIN = 40.0
 VIRTUE_MARKET_LIFT_SHORT_MAX = 45.0  # shorts need lift in bear/neutral zone
 VIRTUE_VOL_DEAD_MAX = 35.0  # below → stand aside both ways (no participation)
-# Hard daily round-trip cap for tactical sleeve (Temperance). Per-contract book:
-# with 1 MES tactical this is 20 round-trips/day; counters increment on close.
-VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 20
+# Hard daily round-trip cap for tactical sleeve (Temperance). Counters increment on close.
+# 3 MES round-trips / RTH session — do not raise to chase fills.
+VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 3
+# No new tactical entries after this many consecutive losses (Temperance). 0 = disabled.
+# Override: FM_VIRTUE_CONSECUTIVE_LOSS_HALT.
+VIRTUE_CONSECUTIVE_LOSS_HALT = 3
 # Bull-day asymmetric short filter — counter-trend shorts need confirmation.
 # Lowered from 25: sticky BULL bias must not hard-block clear below-VWAP bears.
 VIRTUE_BULL_DAY_SHORT_BLEND_MAX = 35.0  # blend must be <= this on BULL days
@@ -284,7 +291,7 @@ VIRTUE_POSITION_TP_DOLLARS = 0.0
 # Hard stop per contract (full flatten when open PnL <= -stop × size).
 VIRTUE_POSITION_STOP_DOLLARS = 50.0
 # Trailing stop (per contract): arm after open profit, then trail peak open PnL.
-VIRTUE_TRAIL_ARM_DOLLARS = 40.0
+VIRTUE_TRAIL_ARM_DOLLARS = 25.0
 VIRTUE_TRAIL_DISTANCE_DOLLARS = 25.0
 # Once armed, trail exit never worse than this per-contract open PnL floor.
 VIRTUE_TRAIL_FLOOR_DOLLARS = 15.0
@@ -327,11 +334,19 @@ VIRTUE_PIPELINE_BULL_SHORT_PENALTY = 5.0
 # Velocity gate: widen blend bands when ADX is weak (blocks slow-drift traps).
 # VIRTUE_VELOCITY_ADX_FLOOR set above with canonical ADX ladder (= 20.0)
 VIRTUE_VELOCITY_PENALTY_PER_ADX = 0.5  # points added/subtracted per ADX unit below floor
-# Time-decay: tactical SCALP only — cut dead/red holds, never knife a green trade.
-# Green tactical waits for trail / course-correct / $50 stop (Courage).
-MAX_STAGNATION_CYCLES = 36  # ~3 min at 5s — enough to see if a scalp is alive
+# Time-decay: full-stack scalp failsafe only. Simple stack is trail/stop/thesis —
+# 36 cycles (~3 min) was harvesting chop losses (17/17 red on 2026-08-17).
+MAX_STAGNATION_CYCLES = 36  # ~3 min at 5s — used only when time-decay is enabled
 VIRTUE_TIME_DECAY_MAX_CYCLES = MAX_STAGNATION_CYCLES
 VIRTUE_TIME_DECAY_MIN_OPEN_PNL = 0.0  # cut only if open_pnl <= 0 (flat/red stagnation)
+# Simple stack default: time-decay OFF. Override: FM_VIRTUE_SIMPLE_STACK_TIME_DECAY=1
+VIRTUE_SIMPLE_STACK_TIME_DECAY = False
+# Daily 20-SMA regime filter — latched once per ET session (Wisdom).
+# 5s stack may only execute with-trend. Override: FM_VIRTUE_REGIME_FILTER=0
+VIRTUE_REGIME_FILTER_ENABLED = True
+VIRTUE_REGIME_SMA_PERIOD = 20
+# Retry UNKNOWN fetch this often (cycles) so a boot outage does not lock the day.
+VIRTUE_REGIME_RETRY_CYCLES = 60
 # Legacy ATR TP helpers (fixed TP off; trail owns winners; kept for tests/compat)
 VIRTUE_TP_ATR_MULT = 1.5
 VIRTUE_TP_MIN_TICKS = DEFAULT_TARGET_TICKS
@@ -556,6 +571,34 @@ def virtue_simple_stack() -> bool:
     Default True. Override: FM_VIRTUE_SIMPLE_STACK=0|1.
     """
     return _env_bool_override("FM_VIRTUE_SIMPLE_STACK", bool(VIRTUE_SIMPLE_STACK))
+
+
+def tactical_time_decay_enabled() -> bool:
+    """
+    Tactical time-decay flatten. Simple stack default OFF (trail/stop/thesis).
+    Full stack keeps the 36-cycle failsafe. Override: FM_VIRTUE_SIMPLE_STACK_TIME_DECAY=1|0.
+    """
+    if virtue_simple_stack():
+        return _env_bool_override(
+            "FM_VIRTUE_SIMPLE_STACK_TIME_DECAY", bool(VIRTUE_SIMPLE_STACK_TIME_DECAY)
+        )
+    return True
+
+
+def consecutive_loss_halt_limit() -> int:
+    """Consecutive-loss entry halt. Override: FM_VIRTUE_CONSECUTIVE_LOSS_HALT (0=off)."""
+    raw = os.getenv("FM_VIRTUE_CONSECUTIVE_LOSS_HALT", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return max(0, int(VIRTUE_CONSECUTIVE_LOSS_HALT))
+
+
+def virtue_regime_filter_enabled() -> bool:
+    """Daily 20-SMA with-trend gate. Override: FM_VIRTUE_REGIME_FILTER=0|1."""
+    return _env_bool_override("FM_VIRTUE_REGIME_FILTER", bool(VIRTUE_REGIME_FILTER_ENABLED))
 
 
 def account_contract_ceiling_limit() -> int:

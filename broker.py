@@ -485,25 +485,37 @@ class VirtueBroker:
                         spy_quote.get("timestamp"),
                     )
                 else:
-                    tick = self.data.get_mes_proxy_tick(spy_quote)
-                    price = float(tick.get("price") or tick.get("last") or 0.0)
-                    if price > 0:
-                        self._last_price = price
-                        self._data_source = "alpaca_spy_mes_proxy"
-                        tick = {
-                            **tick,
-                            "symbol": self._contract,
-                            "source": "alpaca_spy_mes_proxy",
-                            "latency_ms": float(tick.get("latency_ms") or 45.0),
-                            "quote_age_s": age_s,
-                        }
-                        return {
-                            "tick": tick,
-                            "live_stream": True,
-                            "alpaca": True,
-                            "webull_contract": self._contract,
-                            "spy_quote": spy_quote,
-                        }
+                    from engine.rth_hours import timestamp_in_rth
+                    from engine.config import virtue_session_mode as _sess_mode
+
+                    if _sess_mode() != "cme" and not timestamp_in_rth(
+                        spy_quote.get("timestamp"), include_close=True
+                    ):
+                        logger.error(
+                            "alpaca_spy_quote_outside_rth ts=%s — Justice: reject "
+                            "extended-hours print (RTH 09:30-16:00 ET only)",
+                            spy_quote.get("timestamp"),
+                        )
+                    else:
+                        tick = self.data.get_mes_proxy_tick(spy_quote)
+                        price = float(tick.get("price") or tick.get("last") or 0.0)
+                        if price > 0:
+                            self._last_price = price
+                            self._data_source = "alpaca_spy_mes_proxy"
+                            tick = {
+                                **tick,
+                                "symbol": self._contract,
+                                "source": "alpaca_spy_mes_proxy",
+                                "latency_ms": float(tick.get("latency_ms") or 45.0),
+                                "quote_age_s": age_s,
+                            }
+                            return {
+                                "tick": tick,
+                                "live_stream": True,
+                                "alpaca": True,
+                                "webull_contract": self._contract,
+                                "spy_quote": spy_quote,
+                            }
             logger.warning("Alpaca quote unavailable/stale — trying Webull futures snapshot")
 
         # Tertiary: Webull (requires US_FUTURES subscription)

@@ -531,6 +531,14 @@ def build_virtue_system_state(
         "entry_pipeline": {
             **_entry_pipeline_layer1_fields(session),
             "layer2_macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
+            "htf_regime": str(getattr(session, "htf_regime", "UNKNOWN") or "UNKNOWN"),
+            "htf_regime_date": str(getattr(session, "htf_regime_date", "") or ""),
+            "htf_daily_close": round(float(getattr(session, "htf_daily_close", 0.0) or 0.0), 4),
+            "htf_sma_200": round(float(getattr(session, "htf_sma_200", 0.0) or 0.0), 4),
+            "allow_long_entries": str(getattr(session, "htf_regime", "") or "").upper()
+            == "BULLISH",
+            "allow_short_entries": str(getattr(session, "htf_regime", "") or "").upper()
+            == "BEARISH",
             "layer3_course_correct": "check_every_hold_cycle",
             "allow_new_entries": bool(getattr(session, "allow_new_entries", False)),
             "entry_windows_et": "09:45-11:30&13:45-15:55+extreme",
@@ -584,6 +592,12 @@ def build_virtue_system_state(
             "last_tp_timestamp": float(getattr(session, "last_tp_timestamp", 0.0) or 0.0),
             "require_tp_pullback": bool(getattr(session, "require_tp_pullback", False)),
             "macro_bias": str(getattr(session, "macro_bias", "NEUTRAL") or "NEUTRAL"),
+            "htf_regime": str(getattr(session, "htf_regime", "UNKNOWN") or "UNKNOWN"),
+            "htf_regime_date": str(getattr(session, "htf_regime_date", "") or ""),
+            "htf_daily_close": round(float(getattr(session, "htf_daily_close", 0.0) or 0.0), 4),
+            "htf_sma_200": round(float(getattr(session, "htf_sma_200", 0.0) or 0.0), 4),
+            "htf_close_date": str(getattr(session, "htf_close_date", "") or ""),
+            "htf_regime_samples": int(getattr(session, "htf_regime_samples", 0) or 0),
             "long_tps_today": int(getattr(session, "long_tps_today", 0) or 0),
             "short_tps_today": int(getattr(session, "short_tps_today", 0) or 0),
             "entry_cycle_marker": getattr(session, "entry_cycle_marker", None),
@@ -802,6 +816,11 @@ def load_persisted_day_bucket(
         "last_tp_timestamp": 0.0,
         "require_tp_pullback": False,
         "macro_bias": "NEUTRAL",
+        "htf_regime": "UNKNOWN",
+        "htf_daily_close": 0.0,
+        "htf_sma_200": 0.0,
+        "htf_close_date": "",
+        "htf_regime_samples": 0,
         "long_tps_today": 0,
         "short_tps_today": 0,
         "last_result": "FLAT",
@@ -855,6 +874,24 @@ def load_persisted_day_bucket(
         ).upper()
         if macro_bias not in {"BULL", "BEAR", "NEUTRAL"}:
             macro_bias = "NEUTRAL"
+        htf_regime = str(
+            sess.get("htf_regime") or raw.get("htf_regime") or "UNKNOWN"
+        ).upper()
+        if htf_regime not in {"BULLISH", "BEARISH", "UNKNOWN"}:
+            htf_regime = "UNKNOWN"
+        try:
+            htf_close = float(sess.get("htf_daily_close") or 0.0)
+        except (TypeError, ValueError):
+            htf_close = 0.0
+        try:
+            htf_sma = float(sess.get("htf_sma_200") or 0.0)
+        except (TypeError, ValueError):
+            htf_sma = 0.0
+        htf_close_date = str(sess.get("htf_close_date") or "")
+        try:
+            htf_samples = int(sess.get("htf_regime_samples") or 0)
+        except (TypeError, ValueError):
+            htf_samples = 0
         long_tps = int(sess.get("long_tps_today") or 0)
         short_tps = int(sess.get("short_tps_today") or 0)
         outcome = raw.get("last_trade_outcome") or {}
@@ -909,6 +946,11 @@ def load_persisted_day_bucket(
             "last_tp_timestamp": max(0.0, last_tp),
             "require_tp_pullback": require_pullback,
             "macro_bias": macro_bias,
+            "htf_regime": htf_regime,
+            "htf_daily_close": htf_close,
+            "htf_sma_200": htf_sma,
+            "htf_close_date": htf_close_date,
+            "htf_regime_samples": htf_samples,
             "long_tps_today": max(0, long_tps),
             "short_tps_today": max(0, short_tps),
             "last_result": last_result,

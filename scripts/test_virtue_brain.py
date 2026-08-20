@@ -135,7 +135,7 @@ def test_hold_path_ignores_chaos_atr_spike() -> None:
 
 
 def test_simple_stack_blend_only_entry() -> None:
-    """Simple stack: hot VWAP/TWAP prints LONG even with dead macro participation."""
+    """Simple stack: VWAP-only LONG even with dead macro participation."""
     import os
     from engine.config import virtue_simple_stack
 
@@ -157,8 +157,38 @@ def test_simple_stack_blend_only_entry() -> None:
     assert "SIMPLE STACK" in d.reason
 
 
-def test_simple_stack_enters_on_blend_when_anchors_disagree() -> None:
-    """VWAP 52.5 / TWAP 64 / blend 58.25 must LONG — dual-score enter was freezing."""
+def test_simple_stack_vwap_only_ignores_twap_veto() -> None:
+    """VWAP reclaim (64) is LONG even if TWAP is 52.5 — TWAP is not a veto."""
+    import os
+    import strategy as strategy_mod
+    from strategy import SignalAction, WisdomStrategy
+
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+    s = WisdomStrategy(atr_pct_chaos_max=50.0, min_anchor_samples=5, long_enter=58.0)
+    s.seed(_trending_bars(40, bull=True, step=0.5))
+
+    real_score = strategy_mod.score_vs_anchor
+    calls = {"n": 0}
+
+    def _fake_score(price, anchor, **kwargs):
+        calls["n"] += 1
+        # evaluate() scores VWAP first, then TWAP.
+        return 64.0 if calls["n"] % 2 == 1 else 52.5
+
+    strategy_mod.score_vs_anchor = _fake_score  # type: ignore[assignment]
+    try:
+        d = s.evaluate()
+    finally:
+        strategy_mod.score_vs_anchor = real_score  # type: ignore[assignment]
+
+    assert d.action == SignalAction.LONG
+    assert abs(float(d.vwap_score) - 64.0) < 1e-9
+    assert abs(float(d.twap_score) - 52.5) < 1e-9
+    assert "SIMPLE STACK" in d.reason
+
+
+def test_simple_stack_stands_aside_when_vwap_not_reclaimed() -> None:
+    """VWAP 52.5 must FLAT even if TWAP is 64 — entry is session VWAP only."""
     import os
     import strategy as strategy_mod
     from strategy import SignalAction, WisdomStrategy
@@ -180,9 +210,141 @@ def test_simple_stack_enters_on_blend_when_anchors_disagree() -> None:
     finally:
         strategy_mod.score_vs_anchor = real_score  # type: ignore[assignment]
 
-    assert d.action == SignalAction.LONG
-    assert abs(float(d.blended_score) - 58.25) < 1e-9
-    assert "blend" in d.reason.lower()
+    assert d.action == SignalAction.FLAT
+    assert abs(float(d.vwap_score) - 52.5) < 1e-9
+    assert abs(float(d.twap_score) - 64.0) < 1e-9
+    assert "STAND ASIDE" in d.reason
+    assert "VWAP" in d.reason
+
+
+def test_temperance_blocks_day_cap_and_loss_halt() -> None:
+    """Day cap 3 and 3-loss halt block new tactical entries (Temperance)."""
+    import os
+
+    from engine.config import VIRTUE_MAX_TACTICAL_TRADES_PER_DAY, consecutive_loss_halt_limit
+    from main import VirtueSession, temperance_blocks_new_tactical_entry
+
+    os.environ.pop("FM_VIRTUE_CONSECUTIVE_LOSS_HALT", None)
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 3
+    assert consecutive_loss_halt_limit() == 3
+
+    s = VirtueSession()
+    blocked, _ = temperance_blocks_new_tactical_entry(s)
+    assert blocked is False
+
+    s.trades_today = 3
+    blocked, reason = temperance_blocks_new_tactical_entry(s)
+    assert blocked is True
+    assert "day_cap" in reason
+
+    s.trades_today = 2
+    s.consecutive_losses = 3
+    blocked, reason = temperance_blocks_new_tactical_entry(s)
+    assert blocked is True
+    assert "consecutive_loss_halt" in reason
+
+
+def test_tactical_time_decay_off_in_simple_stack() -> None:
+    """Simple stack must not run the 3-minute time-decay scalp clock."""
+    import os
+
+    from engine.config import tactical_time_decay_enabled, virtue_simple_stack
+
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK_TIME_DECAY", None)
+    assert virtue_simple_stack() is True
+    assert tactical_time_decay_enabled() is False
+    os.environ["FM_VIRTUE_SIMPLE_STACK_TIME_DECAY"] = "1"
+    try:
+        assert tactical_time_decay_enabled() is True
+    finally:
+        os.environ.pop("FM_VIRTUE_SIMPLE_STACK_TIME_DECAY", None)
+    os.environ["FM_VIRTUE_SIMPLE_STACK"] = "0"
+    try:
+        assert tactical_time_decay_enabled() is True
+    finally:
+        os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+
+
+def test_daily_sma_regime_filter_math() -> None:
+    """Close vs 20-SMA: BULLISH longs only, BEARISH shorts only, equal unknown."""
+    from datetime import date, timedelta
+
+    from engine.regime_filter import (
+        classify_daily_sma_regime,
+        completed_daily_closes,
+        latch_from_daily_bars,
+        regime_allows_side,
+        sma,
+    )
+
+    closes = [float(i) for i in range(1, 21)]
+    assert abs(float(sma(closes, 20) or 0.0) - 10.5) < 1e-9
+    assert sma(closes[:19], 20) is None
+
+    assert classify_daily_sma_regime(101.0, 100.5) == "BULLISH"
+    assert classify_daily_sma_regime(100.0, 100.5) == "BEARISH"
+    assert classify_daily_sma_regime(100.5, 100.5) == "UNKNOWN"
+    assert classify_daily_sma_regime(0.0, 100.5) == "UNKNOWN"
+
+    assert regime_allows_side("BULLISH", "LONG") is True
+    assert regime_allows_side("BULLISH", "SHORT") is False
+    assert regime_allows_side("BEARISH", "SHORT") is True
+    assert regime_allows_side("BEARISH", "LONG") is False
+    assert regime_allows_side("UNKNOWN", "LONG") is False
+    assert regime_allows_side("UNKNOWN", "SHORT") is False
+
+    bars = [
+        {"timestamp": f"2026-01-{d:02d}T21:00:00Z", "close": float(100 + d)}
+        for d in range(1, 10)
+    ]
+    completed = completed_daily_closes(bars, today_et="2026-01-09")
+    assert completed[-1][0] == "2026-01-08"
+    assert completed[-1][1] == 108.0
+
+    from engine.regime_filter import close_date_is_fresh
+
+    assert close_date_is_fresh("2026-08-14", "2026-08-17") is True  # Friday → Monday
+    assert close_date_is_fresh("2026-06-22", "2026-08-17") is False
+
+    start = date(2025, 1, 1)
+    rising = [
+        {
+            "timestamp": (start + timedelta(days=i)).isoformat() + "T21:00:00Z",
+            "close": 400.0 + i,
+        }
+        for i in range(40)
+    ]
+    latch = latch_from_daily_bars(rising, today_et="2025-02-10", period=20)
+    assert latch["regime"] == "BULLISH"
+    assert int(latch["samples"]) >= 20
+    assert regime_allows_side(str(latch["regime"]), "SHORT") is False
+
+
+def test_apply_htf_regime_latch_session() -> None:
+    from engine.regime_filter import regime_allows_side
+    from main import VirtueSession, apply_htf_regime_latch
+
+    s = VirtueSession()
+    apply_htf_regime_latch(
+        s,
+        {
+            "regime": "BULLISH",
+            "daily_close": 640.0,
+            "sma": 610.0,
+            "samples": 20,
+            "close_date": "2026-08-14",
+        },
+        "2026-08-17",
+    )
+    assert s.htf_regime == "BULLISH"
+    assert s.htf_regime_date == "2026-08-17"
+    assert regime_allows_side(s.htf_regime, "LONG") is True
+    assert regime_allows_side(s.htf_regime, "SHORT") is False
+    from main import htf_regime_blocks_new_entry
+
+    assert htf_regime_blocks_new_entry(s, "SHORT") is True
+    assert htf_regime_blocks_new_entry(s, "LONG") is False
 
 
 def test_market_lift_and_vol_conviction_scores() -> None:
@@ -479,7 +641,7 @@ def test_nimble_short_invalidates_before_stop() -> None:
 
 
 def test_vwap_twap_agreement_required() -> None:
-    """Hard dump → clear SHORT band (<= short_enter)."""
+    """Hard dump → clear SHORT band (session VWAP <= short_enter)."""
     from strategy import score_vs_anchor
 
     assert score_vs_anchor(101.0, 100.0, scale=10.0) > 50.0
@@ -492,7 +654,7 @@ def test_vwap_twap_agreement_required() -> None:
         s.update(Bar(high=last + 0.2, low=last - 0.2, close=last))
     d = s.evaluate()
     assert d.action == SignalAction.SHORT
-    assert d.vwap_score <= s.short_enter and d.twap_score <= s.short_enter
+    assert d.vwap_score <= s.short_enter
 
 
 
@@ -676,7 +838,7 @@ def test_session_uses_timely_entry_band() -> None:
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 20
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 3
     assert int(VIRTUE_POST_TP_STREAK_PULLBACK_AFTER) == 2
     assert int(VIRTUE_REQUIRED_STREAK) == 2
     assert float(VIRTUE_SCORE_LONG_CHASE_MAX) == 85.0
@@ -791,7 +953,7 @@ def test_paper_book_survives_system_state_wipe_to_starting_nav(tmp_path, monkeyp
 
 
 def test_tactical_trailing_stop_arms_and_exits() -> None:
-    """Arm at +$40/ct, trail $25 behind peak, floor +$15/ct (1 MES)."""
+    """Arm at +$25/ct, trail $25 behind peak, floor +$15/ct (1 MES)."""
     from main import VirtueSession, update_tactical_trail
     from engine.config import (
         VIRTUE_TRAIL_ARM_DOLLARS,
@@ -799,7 +961,7 @@ def test_tactical_trailing_stop_arms_and_exits() -> None:
         VIRTUE_TRAIL_FLOOR_DOLLARS,
     )
 
-    assert float(VIRTUE_TRAIL_ARM_DOLLARS) == 40.0
+    assert float(VIRTUE_TRAIL_ARM_DOLLARS) == 25.0
     assert float(VIRTUE_TRAIL_DISTANCE_DOLLARS) == 25.0
     assert float(VIRTUE_TRAIL_FLOOR_DOLLARS) == 15.0
 
@@ -814,8 +976,8 @@ def test_tactical_trailing_stop_arms_and_exits() -> None:
     assert s.tactical_trail_armed is False
     assert s.tactical_peak_open_pnl == 20.0
 
-    hit, level = update_tactical_trail(s, 40.0)
-    assert hit is False  # armed; trail = max(40-25, 15) = 15; pnl 40 > 15
+    hit, level = update_tactical_trail(s, 25.0)
+    assert hit is False  # armed; trail = max(25-25, 15) = 15; pnl 25 > 15
     assert s.tactical_trail_armed is True
     assert abs(level - 15.0) < 1e-9
 
@@ -831,12 +993,12 @@ def test_tactical_trailing_stop_arms_and_exits() -> None:
     s2 = VirtueSession()
     s2.tactical_active = True
     s2.tactical_size = 2
-    hit, _ = update_tactical_trail(s2, 70.0)  # arm needs 80
+    hit, _ = update_tactical_trail(s2, 40.0)  # arm needs 50
     assert s2.tactical_trail_armed is False
-    hit, level = update_tactical_trail(s2, 80.0)
+    hit, level = update_tactical_trail(s2, 50.0)
     assert s2.tactical_trail_armed is True
     assert hit is False
-    assert abs(level - 30.0) < 1e-9  # max(80-50, 30)
+    assert abs(level - 30.0) < 1e-9  # max(50-50, 30)
 
 
 def test_trailing_stop_outcome_counts_as_banked_win() -> None:
@@ -845,7 +1007,7 @@ def test_trailing_stop_outcome_counts_as_banked_win() -> None:
 
     s = VirtueSession()
     s.cycle = 5
-    update_outcome_state(s, 55.0, "trailing_stop_arm$40_trail$25", current_engine_cycle=5)
+    update_outcome_state(s, 55.0, "trailing_stop_arm$25_trail$25", current_engine_cycle=5)
     assert s.trades_today == 1
     assert s.last_result == "WIN"
     assert s.last_reason == "trailing_stop"
@@ -1682,7 +1844,7 @@ def test_anti_churn_temperance_gates() -> None:
     assert float(VIRTUE_COURSE_CORRECT_LONG_BLEND) == 45.0
     assert float(VIRTUE_COURSE_CORRECT_SHORT_BLEND) == 55.0
     assert float(VIRTUE_TACTICAL_ADX_MIN) == 20.0
-    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 20
+    assert int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY) == 3
 
     # Mid-band must not flatten
     assert check_course_correct("LONG", 50.0)[0] is False
@@ -2133,7 +2295,12 @@ if __name__ == "__main__":
     test_macro_participation_blocks_fake_long()
     test_hold_path_ignores_chaos_atr_spike()
     test_simple_stack_blend_only_entry()
-    test_simple_stack_enters_on_blend_when_anchors_disagree()
+    test_simple_stack_vwap_only_ignores_twap_veto()
+    test_simple_stack_stands_aside_when_vwap_not_reclaimed()
+    test_temperance_blocks_day_cap_and_loss_halt()
+    test_tactical_time_decay_off_in_simple_stack()
+    test_daily_sma_regime_filter_math()
+    test_apply_htf_regime_latch_session()
     test_market_lift_and_vol_conviction_scores()
     test_score_vs_anchor_bounds()
     test_score_discontinuity_stands_aside()

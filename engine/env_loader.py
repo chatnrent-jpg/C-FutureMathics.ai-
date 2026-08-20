@@ -9,7 +9,12 @@ from pathlib import Path
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        raw = path.read_bytes().replace(b"\x00", b"")
+        text = raw.decode("utf-8", errors="replace")
+    except OSError:
+        return
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith(";"):
             continue
@@ -19,7 +24,10 @@ def load_env_file(path: Path) -> None:
         key = key.strip()
         val = val.strip().strip('"').strip("'")
         if key and key not in os.environ:
-            os.environ[key] = val
+            try:
+                os.environ[key] = val
+            except ValueError:
+                continue
 
 
 def load_project_env(root: Path | None = None) -> None:

@@ -39,6 +39,10 @@ from engine.config import (
     primary_data_source,
     virtue_session_mode,
 )
+from engine.rth_hours import (
+    in_rth_hours as _clock_in_rth_hours,
+    rth_cash_close_flatten_due as _clock_rth_flatten_due,
+)
 from engine.futures_broker_adapter import FuturesBrokerAdapter
 from engine.futures_orchestrator import FuturesOrchestrator, OrchestratorConfig
 from engine.ui_state_bridge import ensure_boot_system_state
@@ -84,12 +88,12 @@ def in_rth_hours(now: datetime | None = None) -> bool:
     US cash equity Regular Trading Hours (ET): Mon–Fri 9:30 AM – 4:00 PM.
     Used by virtue loop so Alpaca SPY decisions stay on live tape (no eve/weekend gaps).
     """
-    dt = (now or datetime.now(TZ)).astimezone(TZ)
-    if dt.weekday() >= 5:  # Sat/Sun
-        return False
-    open_t = time(VIRTUE_RTH_OPEN_HOUR, VIRTUE_RTH_OPEN_MINUTE)
-    close_t = time(VIRTUE_RTH_CLOSE_HOUR, VIRTUE_RTH_CLOSE_MINUTE)
-    return open_t <= dt.time() < close_t
+    return _clock_in_rth_hours(now)
+
+
+def rth_cash_close_flatten_due(now: datetime | None = None) -> bool:
+    """True at/after 15:59:55 ET on a weekday — flatten before cash close."""
+    return _clock_rth_flatten_due(now)
 
 
 def _live_cash_day_window(now: datetime | None = None) -> bool:
@@ -215,7 +219,10 @@ def virtue_entries_allowed(
     """
     if not virtue_session_open(now):
         return False
-    
+    # Temperance: do not open a new book into the cash-close knife.
+    if virtue_session_mode() != "cme" and rth_cash_close_flatten_due(now):
+        return False
+
     # Simple stack: full session trading (no window restrictions)
     from engine.config import virtue_simple_stack
     if virtue_simple_stack():
@@ -271,7 +278,8 @@ def virtue_session_label() -> str:
             f"{windows} overnight=OFF"
         )
     return (
-        f"RTH_CASH data={src} hours=Mon-Fri 09:30-16:00ET {windows}"
+        f"RTH_CASH data={src} hours=Mon-Fri 09:30-16:00ET "
+        f"flatten=15:59:55ET {windows}"
     )
 
 async def run_session(*, cycles: int | None = None, ignore_hours: bool = False) -> None:

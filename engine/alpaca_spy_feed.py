@@ -144,6 +144,16 @@ class AlpacaSPYFeed:
 
                     spy_size = max(trade_size, bid_size + ask_size, 1.0)
 
+                    ts = quote.get("t", datetime.now().isoformat())
+                    from engine.rth_hours import timestamp_in_rth
+
+                    if not timestamp_in_rth(ts, include_close=True):
+                        logger.warning(
+                            "alpaca_spy_quote_outside_rth ts=%s — Justice: drop extended-hours print",
+                            ts,
+                        )
+                        return None
+
                     self._last_spy_price = last_price
                     self._last_mes_proxy = round(last_price * SPY_TO_MES_SCALE, 2)
                     self._sequence += 1
@@ -153,7 +163,7 @@ class AlpacaSPYFeed:
                         "spy_ask": ask_price,
                         "spy_last": last_price,
                         "spy_size": spy_size,
-                        "timestamp": quote.get("t", datetime.now().isoformat()),
+                        "timestamp": ts,
                     }
         except Exception as e:
             logger.error("Failed to fetch SPY quote: %s", e)
@@ -247,9 +257,12 @@ class AlpacaSPYFeed:
                 "APCA-API-SECRET-KEY": self.api_secret,
             }
             end = datetime.now(timezone.utc)
+            et = ZoneInfo("America/New_York")
+            now_et = end.astimezone(et)
+            rth_close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            if now_et > rth_close_et:
+                end = rth_close_et.astimezone(timezone.utc)
             if session_rth:
-                et = ZoneInfo("America/New_York")
-                now_et = end.astimezone(et)
                 start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
                 if now_et < start:
                     # Pre-open: use prior RTH day open so seed is not empty.
@@ -259,11 +272,18 @@ class AlpacaSPYFeed:
                 start = start.astimezone(timezone.utc)
             else:
                 start = end - timedelta(days=max(1, int(lookback_days)))
+            tf = str(timeframe)
+            # Daily bars need a longer calendar window for 200 trading sessions.
+            if tf.lower() in {"1day", "1d", "day"}:
+                tf = "1Day"
+                params_limit = max(20, min(int(limit), 10000))
+            else:
+                params_limit = max(20, min(int(limit), 1000))
             params = {
-                "timeframe": timeframe,
+                "timeframe": tf,
                 "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "limit": str(max(20, min(int(limit), 1000))),
+                "limit": str(params_limit),
                 "adjustment": "raw",
                 "feed": "iex",
                 "sort": "asc",
@@ -306,7 +326,10 @@ class AlpacaSPYFeed:
                             params["start"],
                             params["end"],
                         )
-                    return out
+                        return []
+                    from engine.rth_hours import filter_intraday_bars_to_rth
+
+                    return filter_intraday_bars_to_rth(out, timeframe=tf)
         except Exception as exc:
             logger.exception("fetch_spy_bars_failed err=%s", exc)
             return []

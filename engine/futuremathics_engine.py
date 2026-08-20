@@ -95,9 +95,9 @@ class FutureMathicsEngine:
             self.state["cooldown_cycles"] -= 1
             return
 
-        v_score, t_score = self.state["vwap_score"], self.state["twap_score"]
-        is_raw_long = (v_score >= config.LONG_ENTER) and (t_score >= config.LONG_ENTER)
-        is_raw_short = (v_score <= config.SHORT_ENTER) and (t_score <= config.SHORT_ENTER)
+        v_score = self.state["vwap_score"]
+        is_raw_long = v_score >= config.LONG_ENTER
+        is_raw_short = v_score <= config.SHORT_ENTER
 
         self.long_streak = (self.long_streak + 1) if is_raw_long else 0
         self.short_streak = (self.short_streak + 1) if is_raw_short else 0
@@ -113,7 +113,7 @@ class FutureMathicsEngine:
         elif current_pos == "LONG":
             stop, tp = self.calculate_targets(self.state["entry_price"], "LONG", atr)
             if current_price <= stop or current_price >= tp or (
-                v_score <= config.LONG_EXIT and t_score <= config.LONG_EXIT
+                v_score <= config.LONG_EXIT
             ):
                 await self.execute_order("FLATTEN", current_price)
                 if self.short_streak >= config.REQUIRED_STREAK:
@@ -122,7 +122,7 @@ class FutureMathicsEngine:
         elif current_pos == "SHORT":
             stop, tp = self.calculate_targets(self.state["entry_price"], "SHORT", atr)
             if current_price >= stop or current_price <= tp or (
-                v_score >= config.SHORT_EXIT and t_score >= config.SHORT_EXIT
+                v_score >= config.SHORT_EXIT
             ):
                 await self.execute_order("FLATTEN", current_price)
                 if self.long_streak >= config.REQUIRED_STREAK:

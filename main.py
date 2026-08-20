@@ -156,9 +156,11 @@ from engine.config import (
     VIRTUE_SCORE_SHORT_EXIT,
     VIRTUE_STATE_PERSIST_INTERVAL_S,
     VIRTUE_TICK_POLL_S,
+    consecutive_loss_halt_limit,
     fixed_fractional_risk_pct,
     forward_test_force_paper,
     primary_data_source,
+    tactical_time_decay_enabled,
     virtue_session_mode,
 )
 
@@ -176,6 +178,7 @@ from engine.ui_state_bridge import (
 )
 from scripts.run_daily_session import (
     allow_new_entries,
+    rth_cash_close_flatten_due,
     virtue_entries_allowed,
     virtue_session_label,
     virtue_session_open,
@@ -264,6 +267,14 @@ class VirtueSession:
     # Trailing stop state (tactical sleeve; dollars scale with size = per contract × size)
     tactical_peak_open_pnl: float = 0.0
     tactical_trail_armed: bool = False
+    # Daily SMA regime — latched once per ET session (Wisdom). Field name kept for state files.
+    htf_regime: str = "UNKNOWN"  # BULLISH | BEARISH | UNKNOWN
+    htf_regime_date: str = ""  # ET date the latch belongs to
+    htf_daily_close: float = 0.0
+    htf_sma_200: float = 0.0  # latched SMA (period = VIRTUE_REGIME_SMA_PERIOD, now 20)
+    htf_close_date: str = ""
+    htf_regime_samples: int = 0
+    htf_regime_last_attempt_cycle: int = -10_000
     is_running: bool = True  # False stops background state writer (run.py pattern)
     cycles_since_heartbeat: int = 0
     last_heartbeat_ok: bool = True
@@ -399,6 +410,23 @@ def check_time_decay_exit(
     )
     notify_time_decay(elapsed=elapsed, open_pnl=float(open_pnl), exposure=exp)
     return True, reason
+
+
+def temperance_blocks_new_tactical_entry(session: VirtueSession) -> tuple[bool, str]:
+    """
+    Day cap + consecutive-loss halt (Temperance). Returns (blocked, reason).
+
+    Does not reset counters — a 17-loss morning stays blocked after deploy.
+    """
+    cap = int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY)
+    trades = int(getattr(session, "trades_today", 0) or 0)
+    if trades >= cap:
+        return True, f"tactical_day_cap trades_today={trades} >= {cap}"
+    halt = int(consecutive_loss_halt_limit())
+    losses = int(getattr(session, "consecutive_losses", 0) or 0)
+    if halt > 0 and losses >= halt:
+        return True, f"consecutive_loss_halt losses={losses} >= {halt}"
+    return False, ""
 
 
 def check_course_correct(current_position: str, blend: float) -> tuple[bool, str]:
@@ -931,6 +959,13 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     # Structural confirm streaks reset with the ET day (core position may still be open).
     session.structural_bull_streak = 0
     session.structural_bear_streak = 0
+    session.htf_regime = "UNKNOWN"
+    session.htf_regime_date = ""
+    session.htf_daily_close = 0.0
+    session.htf_sma_200 = 0.0
+    session.htf_close_date = ""
+    session.htf_regime_samples = 0
+    session.htf_regime_last_attempt_cycle = -10_000
     # Fresh RTH session VWAP/TWAP — sticky day anchor starts empty.
     try:
         session.strategy.reset_session_anchors()
@@ -947,6 +982,123 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
         float(session.broker.equity),
     )
     return True
+
+
+def apply_htf_regime_latch(
+    session: VirtueSession, latch: dict[str, Any], today_et: str
+) -> None:
+    """Write the daily SMA latch onto the session (unidirectional)."""
+    session.htf_regime = str(latch.get("regime") or "UNKNOWN").upper()
+    if session.htf_regime not in {"BULLISH", "BEARISH", "UNKNOWN"}:
+        session.htf_regime = "UNKNOWN"
+    session.htf_regime_date = str(today_et or "")
+    session.htf_daily_close = float(latch.get("daily_close") or 0.0)
+    sma_val = latch.get("sma")
+    session.htf_sma_200 = float(sma_val) if sma_val is not None else 0.0
+    session.htf_close_date = str(latch.get("close_date") or "")
+    session.htf_regime_samples = int(latch.get("samples") or 0)
+
+
+def htf_regime_blocks_new_entry(session: VirtueSession, side: str) -> bool:
+    """True when the daily SMA latch forbids a new tactical entry on this side."""
+    from engine.config import virtue_regime_filter_enabled
+    from engine.regime_filter import regime_allows_side
+
+    if not virtue_regime_filter_enabled():
+        return False
+    want = str(side or "").strip().upper()
+    if want not in {"LONG", "SHORT"}:
+        return False
+    return not regime_allows_side(str(session.htf_regime or ""), want)
+
+
+def log_regime_filter_block(session: VirtueSession, side: str) -> None:
+    logger.info(
+        "CYCLE %s REGIME_FILTER_BLOCK side=%s regime=%s close=%.2f sma=%.2f "
+        "close_date=%s — counter-trend / unknown (Wisdom)",
+        session.cycle,
+        str(side or "").upper(),
+        session.htf_regime,
+        float(session.htf_daily_close or 0.0),
+        float(session.htf_sma_200 or 0.0),
+        session.htf_close_date or "",
+    )
+
+
+async def refresh_htf_regime(session: VirtueSession, *, force: bool = False) -> str:
+    """
+    Latch daily close vs 20-SMA once per ET session (Wisdom).
+
+    Uses last *completed* daily bar (excludes today's in-progress RTH print).
+    Failed / short history → UNKNOWN and no new entries (Justice).
+    """
+    from engine.config import (
+        VIRTUE_REGIME_RETRY_CYCLES,
+        VIRTUE_REGIME_SMA_PERIOD,
+        virtue_regime_filter_enabled,
+    )
+    from engine.regime_filter import latch_from_daily_bars
+
+    if not virtue_regime_filter_enabled():
+        return str(session.htf_regime or "UNKNOWN")
+
+    today = et_session_date()
+    if (
+        not force
+        and session.htf_regime_date == today
+        and session.htf_regime in {"BULLISH", "BEARISH"}
+    ):
+        return session.htf_regime
+    retry_every = max(1, int(VIRTUE_REGIME_RETRY_CYCLES))
+    if (
+        not force
+        and session.htf_regime_date == today
+        and session.htf_regime == "UNKNOWN"
+        and (int(session.cycle) - int(session.htf_regime_last_attempt_cycle)) < retry_every
+    ):
+        return session.htf_regime
+
+    session.htf_regime_last_attempt_cycle = int(session.cycle)
+    bars: list[dict[str, Any]] = []
+    try:
+        feed = getattr(session.broker, "data", None)
+        if feed is not None and hasattr(feed, "fetch_spy_bars"):
+            bars = await feed.fetch_spy_bars(
+                timeframe="1Day",
+                limit=10_000,
+                lookback_days=420,
+                session_rth=False,
+            )
+    except Exception as exc:
+        logger.exception("htf_regime_fetch_failed err=%s", exc)
+        bars = []
+
+    latch = latch_from_daily_bars(
+        bars or [], today, period=int(VIRTUE_REGIME_SMA_PERIOD)
+    )
+    apply_htf_regime_latch(session, latch, today)
+    if session.htf_regime == "UNKNOWN" and session.htf_close_date:
+        logger.warning(
+            "HTF_REGIME_STALE_OR_UNKNOWN date=%s close_date=%s samples=%s "
+            "close=%.2f sma=%.2f — no new entries until a fresh daily close latches",
+            today,
+            session.htf_close_date,
+            session.htf_regime_samples,
+            session.htf_daily_close,
+            session.htf_sma_200,
+        )
+    logger.info(
+        "HTF_REGIME_LATCH date=%s regime=%s close=%.2f sma=%.2f "
+        "close_date=%s samples=%s force=%s",
+        today,
+        session.htf_regime,
+        session.htf_daily_close,
+        session.htf_sma_200,
+        session.htf_close_date,
+        session.htf_regime_samples,
+        bool(force),
+    )
+    return session.htf_regime
 
 
 def _local_paper_book() -> bool:
@@ -2130,8 +2282,26 @@ async def _rth_gate_or_flatten(
     """
     Return True if trading cycle may continue.
     Outside session (RTH or CME): flatten residual risk and return False (Temperance).
+    RTH mode: hard-kill at 15:59:55 ET with reason RTH_MARKET_CLOSE.
     """
-    if ignore_hours or virtue_session_open():
+    if ignore_hours:
+        return True
+    if virtue_session_mode() != "cme" and rth_cash_close_flatten_due():
+        session.last_regime = "RTH_MARKET_CLOSE"
+        session.last_signal_reason = "RTH_MARKET_CLOSE"
+        _, net_size = session.broker.net_exposure()
+        if net_size > 0:
+            await _flatten_until_flat(
+                session, stop_ticks=stop_ticks, reason="RTH_MARKET_CLOSE"
+            )
+        else:
+            logger.info(
+                "CYCLE %s RTH_MARKET_CLOSE — stand aside (cash close knife 15:59:55 ET)",
+                session.cycle,
+            )
+        session.last_action = "FLAT"
+        return False
+    if virtue_session_open():
         return True
     session.last_regime = "OUTSIDE_SESSION"
     session.last_signal_reason = "outside_session_stand_aside"
@@ -2198,7 +2368,11 @@ async def run_cycle(
     """One virtue cycle: hours → heartbeat → market → regime → exclusivity → Manus → fire."""
     session.cycle += 1
     # Temperance: new ET calendar day → clear yesterday's PnL/trade counters (Justice).
-    roll_daily_counters_if_needed(session)
+    rolled = roll_daily_counters_if_needed(session)
+    try:
+        await refresh_htf_regime(session, force=bool(rolled))
+    except Exception as exc:
+        logger.exception("htf_regime_refresh_failed err=%s", exc)
     _check_pipeline_stuck_alert(session)
     # Tick post-rebase entry cooldown every cycle (even while holding).
     cooldown_blocks_entry = session.entry_cooldown_cycles > 0
@@ -2436,7 +2610,6 @@ async def run_cycle(
     # Enables same-cycle flip when opposite streak is already ready (Courage).
     base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
     if virtue_simple_stack():
-        blend_buffer_raw = 0.0
         vel_penalty = 0.0
     else:
         vel_penalty = velocity_blend_penalty(adx=float(decision.adx))
@@ -2468,15 +2641,9 @@ async def run_cycle(
         float(VIRTUE_SCORE_SHORT_ENTER) - float(short_buf) - float(vel_penalty)
     )
     v_score = float(decision.vwap_score)
-    t_score = float(decision.twap_score)
-    blend_now = float(decision.blended_score)
-    # Simple stack: streak follows blend (matches strategy enter). Full stack: both scores.
-    if virtue_simple_stack():
-        is_raw_long = blend_now >= long_enter_thr
-        is_raw_short = blend_now <= short_enter_thr
-    else:
-        is_raw_long = v_score >= long_enter_thr and t_score >= long_enter_thr
-        is_raw_short = v_score <= short_enter_thr and t_score <= short_enter_thr
+    # Session VWAP only (Wisdom). TWAP is observational and cannot veto a streak.
+    is_raw_long = v_score >= long_enter_thr
+    is_raw_short = v_score <= short_enter_thr
     # Temperance: do not build confirmation streaks during pipeline lock
     # (prevents instant re-fire the moment cool-off ends).
     pipe_resume = int(getattr(session, "pipeline_resume_cycle", 0) or 0)
@@ -2808,8 +2975,12 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Time-decay — tactical sleeve only (core is structural, not time-decayed).
-    if bool(session.tactical_active) and int(session.tactical_size) > 0:
+    # Time-decay — full stack only. Simple stack exits via trail / $50 stop / thesis.
+    if (
+        bool(session.tactical_active)
+        and int(session.tactical_size) > 0
+        and tactical_time_decay_enabled()
+    ):
         td_hit, td_reason = check_time_decay_exit(
             session,
             session.cycle,
@@ -2978,14 +3149,21 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Temperance: hard daily tactical round-trip cap (counted on close).
-    if int(session.trades_today) >= int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY):
+    # Wisdom: daily 20-SMA direction before Temperance budget (and before fills).
+    # Counter-trend 5s setups log REGIME_FILTER_BLOCK even on a spent day cap.
+    _htf_side = str(decision.action.value).upper()
+    if htf_regime_blocks_new_entry(session, _htf_side):
+        log_regime_filter_block(session, _htf_side)
+        session.last_action = "FLAT"
+        return
+
+    # Temperance: hard daily tactical round-trip cap + consecutive-loss halt.
+    blocked, block_reason = temperance_blocks_new_tactical_entry(session)
+    if blocked:
         logger.info(
-            "CYCLE %s tactical_day_cap trades_today=%s >= %s — stand aside "
-            "(Temperance; no more satellite entries today)",
+            "CYCLE %s %s — stand aside (Temperance; no more satellite entries today)",
             session.cycle,
-            session.trades_today,
-            int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
+            block_reason,
         )
         session.last_action = "FLAT"
         return
@@ -3101,8 +3279,6 @@ async def run_cycle(
 
     # Temperance sizing / blend friction from last_trade_outcome (side-aware waiver).
     base_contracts, blend_buffer_raw = calculate_temperance_parameters(session=session)
-    if virtue_simple_stack():
-        blend_buffer_raw = 0.0
     side_buf = effective_temperance_blend_buffer(
         blend_buffer_raw,
         side=decision.action.value,
@@ -3145,11 +3321,11 @@ async def run_cycle(
     from engine.config import VIRTUE_EXTREME_ADX_OVERRIDE
 
     need_streak = max(1, int(VIRTUE_REQUIRED_STREAK))
+    if virtue_simple_stack():
+        need_streak = 1
     if int(session.consecutive_losses) >= 1:
         need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
     if float(decision.adx) >= float(VIRTUE_EXTREME_ADX_OVERRIDE):
-        need_streak = 1
-    if virtue_simple_stack():
         need_streak = 1
     side = decision.action.value
     if side == "LONG":
@@ -3182,6 +3358,11 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
+    if htf_regime_blocks_new_entry(session, side):
+        log_regime_filter_block(session, side)
+        session.last_action = "FLAT"
+        return
+
     # Wisdom: do not chase a move that already extended (late entry → stop / RTH flatten).
     blend = float(decision.blended_score)
 
@@ -3189,10 +3370,12 @@ async def run_cycle(
         # Simple stack: band signal already cleared — skip velocity/chase/pullback/bias gates.
         session.require_tp_pullback = False
         logger.info(
-            "CYCLE %s SIMPLE_STACK_ENTRY side=%s blend=%.1f streak=%s — "
-            "bands only (pipeline/chase/pullback/bias waived)",
+            "CYCLE %s SIMPLE_STACK_ENTRY side=%s vwap=%.1f twap=%.1f blend=%.1f "
+            "streak=%s — VWAP-only bands (pipeline/chase/pullback/bias waived)",
             session.cycle,
             side,
+            float(decision.vwap_score),
+            float(decision.twap_score),
             blend,
             session.long_streak if side == "LONG" else session.short_streak,
         )
@@ -3656,8 +3839,12 @@ async def run_loop(
 
     if _boot_simple_stack():
         logger.info(
-            "BOOT SIMPLE_STACK_ENABLED bands+stop+trail+peak_lock+time_decay — "
-            "ADX/EMA/macro/structure/velocity/streak/course_correct/chase/pullback waived"
+            "BOOT SIMPLE_STACK_ENABLED vwap-only+20sma+stop$50+trail$25+peak_lock+loss_halt "
+            "day_cap=%s loss_halt=%s time_decay=%s — "
+            "TWAP/ADX/EMA/macro/structure/velocity/course_correct/chase/pullback waived",
+            int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
+            int(consecutive_loss_halt_limit()),
+            bool(tactical_time_decay_enabled()),
         )
     else:
         logger.warning(
@@ -3728,6 +3915,14 @@ async def run_loop(
         session.consecutive_wins = int(day_bucket.get("consecutive_wins") or 0)
         session.consecutive_losses = int(day_bucket.get("consecutive_losses") or 0)
         session.last_trade_pnl = float(day_bucket.get("last_trade_pnl") or 0.0)
+        restored_regime = str(day_bucket.get("htf_regime") or "").upper()
+        if restored_regime in {"BULLISH", "BEARISH", "UNKNOWN"}:
+            session.htf_regime = restored_regime
+            session.htf_regime_date = str(session.session_date_et or "")
+            session.htf_daily_close = float(day_bucket.get("htf_daily_close") or 0.0)
+            session.htf_sma_200 = float(day_bucket.get("htf_sma_200") or 0.0)
+            session.htf_close_date = str(day_bucket.get("htf_close_date") or "")
+            session.htf_regime_samples = int(day_bucket.get("htf_regime_samples") or 0)
         logger.info(
             "BOOT restored_day_bucket et_date=%s realized_today=%.2f trades_today=%s "
             "tp_streak=%s last_tp=%.0f pullback=%s macro_bias=%s long_tps=%s short_tps=%s "
@@ -3814,6 +4009,10 @@ async def run_loop(
         await seed_wisdom_from_market(session)
     except Exception as exc:
         logger.exception("boot_seed_failed err=%s", exc)
+    try:
+        await refresh_htf_regime(session, force=True)
+    except Exception as exc:
+        logger.exception("boot_htf_regime_failed err=%s", exc)
 
     session.is_running = True
     await asyncio.to_thread(_publish_ui, session)

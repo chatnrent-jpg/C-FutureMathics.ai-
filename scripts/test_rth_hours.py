@@ -23,9 +23,11 @@ from scripts.run_daily_session import (
     allow_new_entries,
     extreme_trend_entry_ok,
     in_rth_hours,
+    rth_cash_close_flatten_due,
     virtue_entries_allowed,
     virtue_session_open,
 )
+from engine.rth_hours import filter_intraday_bars_to_rth, timestamp_in_rth
 
 
 def test_rth_hours() -> None:
@@ -49,8 +51,50 @@ def test_rth_hours() -> None:
     print("ALL RTH HOURS TESTS PASSED")
 
 
+def test_rth_cash_close_flatten() -> None:
+    tz = ZoneInfo("America/New_York")
+    cases = [
+        ("Monday 15:59:54", datetime(2026, 7, 27, 15, 59, 54, tzinfo=tz), False),
+        ("Monday 15:59:55", datetime(2026, 7, 27, 15, 59, 55, tzinfo=tz), True),
+        ("Monday 16:00:00", datetime(2026, 7, 27, 16, 0, 0, tzinfo=tz), True),
+        ("Monday 09:30", datetime(2026, 7, 27, 9, 30, tzinfo=tz), False),
+        ("Saturday 16:00", datetime(2026, 7, 25, 16, 0, tzinfo=tz), False),
+    ]
+    for desc, dt, expected in cases:
+        got = rth_cash_close_flatten_due(dt)
+        assert got == expected, f"flatten_due {desc}: expected {expected} got {got}"
+    knife = datetime(2026, 7, 27, 15, 59, 55, tzinfo=tz)
+    assert in_rth_hours(knife) is True  # session still open for a mark price
+    assert virtue_entries_allowed(knife) is False
+    assert virtue_entries_allowed(knife, adx=55.0, blend=29.0) is False
+    print("ALL RTH FLATTEN TESTS PASSED")
+
+
+def test_intraday_bars_between_time() -> None:
+    """Force-restrict stream: 09:30–16:00 ET inclusive; drop pre/post."""
+    bars = [
+        {"timestamp": "2026-07-27T13:29:00Z", "close": 1.0},  # 09:29 ET
+        {"timestamp": "2026-07-27T13:30:00Z", "close": 2.0},  # 09:30 ET
+        {"timestamp": "2026-07-27T16:00:00Z", "close": 3.0},  # 12:00 ET
+        {"timestamp": "2026-07-27T20:00:00Z", "close": 4.0},  # 16:00 ET
+        {"timestamp": "2026-07-27T20:01:00Z", "close": 5.0},  # 16:01 ET
+    ]
+    kept = filter_intraday_bars_to_rth(bars, timeframe="5Min")
+    closes = [row["close"] for row in kept]
+    assert closes == [2.0, 3.0, 4.0]
+    assert timestamp_in_rth("2026-07-27T13:29:00Z") is False
+    assert timestamp_in_rth("2026-07-27T20:00:00Z") is True
+    daily = filter_intraday_bars_to_rth(
+        [{"timestamp": "2026-07-27T04:00:00Z", "close": 10.0}],
+        timeframe="1Day",
+    )
+    assert len(daily) == 1
+    print("ALL RTH BAR FILTER TESTS PASSED")
+
+
 def test_entry_windows() -> None:
     """allow_new_entries True in 09:45–11:30 and 13:45–15:55 ET."""
+    os.environ["FM_VIRTUE_SIMPLE_STACK"] = "0"
     tz = ZoneInfo("America/New_York")
     cases = [
         ("Monday 09:30 open auction", datetime(2026, 7, 27, 9, 30, tzinfo=tz), False),
@@ -88,4 +132,6 @@ def test_entry_windows() -> None:
 
 if __name__ == "__main__":
     test_rth_hours()
+    test_rth_cash_close_flatten()
+    test_intraday_bars_between_time()
     test_entry_windows()

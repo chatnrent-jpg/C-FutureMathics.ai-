@@ -76,6 +76,8 @@ scp @ssh `
     "$Root\engine\entry_structure.py" `
     "$Root\engine\macromathics_core.py" `
     "$Root\engine\observability.py" `
+    "$Root\engine\regime_filter.py" `
+    "$Root\engine\rth_hours.py" `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `
     "$Root\engine\ui_state_bridge.py" `
