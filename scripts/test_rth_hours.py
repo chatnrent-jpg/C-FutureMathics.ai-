@@ -130,8 +130,28 @@ def test_entry_windows() -> None:
     print("ALL ENTRY WINDOW TESTS PASSED")
 
 
+def test_simple_stack_skips_open_auction() -> None:
+    """Simple stack: no new entries 09:30–09:45; rest of RTH until flatten is open."""
+    os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+    tz = ZoneInfo("America/New_York")
+    cases = [
+        ("Monday 09:30 auction", datetime(2026, 7, 27, 9, 30, tzinfo=tz), False),
+        ("Monday 09:44 auction", datetime(2026, 7, 27, 9, 44, tzinfo=tz), False),
+        ("Monday 09:45 VWAP live", datetime(2026, 7, 27, 9, 45, tzinfo=tz), True),
+        ("Monday lunch 12:00", datetime(2026, 7, 27, 12, 0, tzinfo=tz), True),
+        ("Monday 15:54", datetime(2026, 7, 27, 15, 54, tzinfo=tz), True),
+        ("Monday 15:59:54", datetime(2026, 7, 27, 15, 59, 54, tzinfo=tz), True),
+        ("Monday 15:59:55 flatten", datetime(2026, 7, 27, 15, 59, 55, tzinfo=tz), False),
+    ]
+    for desc, dt, expected in cases:
+        got = virtue_entries_allowed(dt)
+        assert got == expected, f"simple_stack entries {desc}: expected {expected} got {got}"
+    print("ALL SIMPLE STACK AUCTION SKIP TESTS PASSED")
+
+
 if __name__ == "__main__":
     test_rth_hours()
     test_rth_cash_close_flatten()
     test_intraday_bars_between_time()
     test_entry_windows()
+    test_simple_stack_skips_open_auction()

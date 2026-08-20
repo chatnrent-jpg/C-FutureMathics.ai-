@@ -3239,13 +3239,13 @@ async def run_cycle(
     if not entries_ok:
         logger.info(
             "CYCLE %s no_new_entry_window allow_new_entries=%s "
-            "adx=%.1f blend=%.1f vwap=%.1f — "
-            "manage/exit only (entries=09:45-11:30&13:45-15:55ET+extreme|+belowVWAP)",
+            "adx=%.1f blend=%.1f vwap=%.1f — manage/exit only (%s)",
             session.cycle,
             bool(session.allow_new_entries),
             float(decision.adx),
             float(decision.blended_score),
             float(decision.vwap_score),
+            virtue_session_label(),
         )
         session.last_action = "FLAT"
         return

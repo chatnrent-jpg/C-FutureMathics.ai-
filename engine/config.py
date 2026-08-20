@@ -228,6 +228,10 @@ VIRTUE_ENTRY_WINDOW_1_START = (9, 45)
 VIRTUE_ENTRY_WINDOW_1_END = (11, 30)
 VIRTUE_ENTRY_WINDOW_2_START = (13, 45)
 VIRTUE_ENTRY_WINDOW_2_END = (15, 55)
+# Simple stack: skip the cash open auction. Session VWAP has no sample at 09:30.
+# Manage/seed only until this stamp; then VWAP entries until RTH flatten.
+VIRTUE_SIMPLE_STACK_ENTRY_HOUR = 9
+VIRTUE_SIMPLE_STACK_ENTRY_MINUTE = 45
 # Extreme trend may enter outside windows while session still open (Courage).
 VIRTUE_EXTREME_ADX_OVERRIDE = 40.0
 VIRTUE_EXTREME_BLEND_LONG = 65.0

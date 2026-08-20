@@ -215,7 +215,8 @@ def virtue_entries_allowed(
     OR clear below-VWAP short structure).
     CME overnight mode additionally blocks 16:45–17:00 ET pre-maintenance.
     
-    Simple stack mode: allow entries ANY time session is open (full RTH / Globex).
+    Simple stack: skip the cash open auction (09:30–09:45 ET), then allow
+    new entries for the rest of RTH until flatten. TWAP/lunch windows stay off.
     """
     if not virtue_session_open(now):
         return False
@@ -223,10 +224,20 @@ def virtue_entries_allowed(
     if virtue_session_mode() != "cme" and rth_cash_close_flatten_due(now):
         return False
 
-    # Simple stack: full session trading (no window restrictions)
-    from engine.config import virtue_simple_stack
+    from engine.config import (
+        VIRTUE_SIMPLE_STACK_ENTRY_HOUR,
+        VIRTUE_SIMPLE_STACK_ENTRY_MINUTE,
+        virtue_simple_stack,
+    )
     if virtue_simple_stack():
         dt = _et_now(now)
+        if virtue_session_mode() != "cme":
+            auction_end = time(
+                int(VIRTUE_SIMPLE_STACK_ENTRY_HOUR),
+                int(VIRTUE_SIMPLE_STACK_ENTRY_MINUTE),
+            )
+            if dt.time() < auction_end:
+                return False
         if virtue_session_mode() == "cme" and live_allow_overnight():
             if dt.weekday() < 5:
                 t = dt.time()
@@ -264,7 +275,7 @@ def virtue_session_label() -> str:
     src = primary_data_source()
     from engine.config import virtue_simple_stack
     if virtue_simple_stack():
-        windows = "entries=FULL_SESSION (simple_stack)"
+        windows = "entries=09:45-15:59ET (simple_stack skip auction)"
     else:
         windows = "entries=09:45-11:30&13:45-15:55ET+extreme"
     if mode == "cme":
