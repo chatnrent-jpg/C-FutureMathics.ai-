@@ -27,7 +27,7 @@ import logging
 import math
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as clock_time
 from pathlib import Path
 from typing import Any
@@ -83,9 +83,11 @@ from engine.config import (
     EXECUTION_SYMBOL,
     FORWARD_TEST_TIMEZONE,
     GRADE_DAILY_PROFIT_LOCK,
+    HARD_DAILY_STOP,
     STARTING_NAV,
     TICK_SIZE,
     TICK_VALUE,
+    POINT_VALUE,
     VIRTUE_CORE_MAX_HOLD_CYCLES,
     VIRTUE_CORE_TP_DOLLARS,
     VIRTUE_PIPELINE_STUCK_ALERT_S,
@@ -128,6 +130,8 @@ from engine.config import (
     VIRTUE_VELOCITY_PENALTY_PER_ADX,
     VIRTUE_TACTICAL_ADX_MIN,
     VIRTUE_MAX_TACTICAL_TRADES_PER_DAY,
+    max_tactical_trades_per_day,
+    virtue_is_swing,
     VIRTUE_POST_TIME_DECAY_COOLDOWN_CYCLES,
     VIRTUE_TIME_DECAY_COOLDOWN_CYCLES,
     VIRTUE_TIME_DECAY_MAX_CYCLES,
@@ -272,6 +276,7 @@ class VirtueSession:
     htf_regime_date: str = ""  # ET date the latch belongs to
     htf_daily_close: float = 0.0
     htf_sma_200: float = 0.0  # latched SMA (period = VIRTUE_REGIME_SMA_PERIOD, now 20)
+    htf_atr: float = 0.0  # daily ATR on the same series as the SMA (SPY)
     htf_close_date: str = ""
     htf_regime_samples: int = 0
     htf_regime_last_attempt_cycle: int = -10_000
@@ -422,7 +427,7 @@ def temperance_blocks_new_tactical_entry(session: VirtueSession) -> tuple[bool, 
 
     Does not reset counters — a 17-loss morning stays blocked after deploy.
     """
-    cap = int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY)
+    cap = int(max_tactical_trades_per_day())
     trades = int(getattr(session, "trades_today", 0) or 0)
     if trades >= cap:
         return True, f"tactical_day_cap trades_today={trades} >= {cap}"
@@ -867,9 +872,32 @@ def position_stop_ticks(contracts: int) -> int:
     return max(1, int(math.ceil(float(VIRTUE_POSITION_STOP_DOLLARS) / tv)))
 
 
-def _tactical_dollar_limits(size: int) -> tuple[float, float, float, float]:
+def effective_stop_dollars(session: VirtueSession, mes_price: float = 0.0) -> float:
+    """Scalp $50 or swing 1.5× daily ATR (clipped)."""
+    if not virtue_is_swing():
+        return float(VIRTUE_POSITION_STOP_DOLLARS)
+    from engine.swing_policy import swing_stop_dollars
+
+    px = float(mes_price or getattr(session, "last_price", 0.0) or 0.0)
+    return swing_stop_dollars(
+        atr_spy=float(getattr(session, "htf_atr", 0.0) or 0.0),
+        spy_close=float(getattr(session, "htf_daily_close", 0.0) or 0.0),
+        mes_price=px,
+        point_value=float(POINT_VALUE),
+    )
+
+
+def _tactical_dollar_limits(
+    size: int, session: VirtueSession | None = None
+) -> tuple[float, float, float, float]:
     """Per-contract knobs × size → (stop, arm, trail_dist, floor) dollars."""
     n = max(1, int(size))
+    if session is not None and virtue_is_swing():
+        stop = float(effective_stop_dollars(session))
+        arm = stop  # trail after 1R
+        trail = round(stop * 0.5, 2)
+        floor = round(stop * 0.25, 2)
+        return stop * n, arm * n, trail * n, floor * n
     return (
         float(VIRTUE_POSITION_STOP_DOLLARS) * n,
         float(VIRTUE_TRAIL_ARM_DOLLARS) * n,
@@ -887,7 +915,7 @@ def update_tactical_trail(
     Returns (hit, trail_level). trail_level is -inf when not armed.
     """
     size = max(1, int(getattr(session, "tactical_size", 0) or 1))
-    _, arm_at, trail_dist, floor = _tactical_dollar_limits(size)
+    _, arm_at, trail_dist, floor = _tactical_dollar_limits(size, session)
     pnl = float(open_pnl)
     peak = float(getattr(session, "tactical_peak_open_pnl", 0.0) or 0.0)
     if pnl > peak:
@@ -967,6 +995,7 @@ def roll_daily_counters_if_needed(session: VirtueSession, *, now: datetime | Non
     session.htf_regime_date = ""
     session.htf_daily_close = 0.0
     session.htf_sma_200 = 0.0
+    session.htf_atr = 0.0
     session.htf_close_date = ""
     session.htf_regime_samples = 0
     session.htf_regime_last_attempt_cycle = -10_000
@@ -1002,6 +1031,11 @@ def apply_htf_regime_latch(
     session.htf_daily_close = float(latch.get("daily_close") or 0.0)
     sma_val = latch.get("sma")
     session.htf_sma_200 = float(sma_val) if sma_val is not None else 0.0
+    atr_val = latch.get("atr")
+    try:
+        session.htf_atr = float(atr_val) if atr_val is not None else 0.0
+    except (TypeError, ValueError):
+        session.htf_atr = 0.0
     session.htf_close_date = str(latch.get("close_date") or "")
     session.htf_regime_samples = int(latch.get("samples") or 0)
 
@@ -1200,10 +1234,23 @@ def tactical_wisdom_blocks_entry(
     price: float,
     vwap: float,
     vwap_score: float,
+    now: datetime | None = None,
 ) -> str:
     """Return a block tag, or empty if Wisdom allows this new entry."""
     if htf_regime_blocks_new_entry(session, side):
         return "sma"
+    if virtue_is_swing():
+        from engine.swing_policy import swing_entry_window_open, swing_pullback_ok
+
+        if float(getattr(session, "htf_atr", 0.0) or 0.0) <= 0:
+            return "swing_atr"
+        if not swing_entry_window_open(now):
+            return "swing_window"
+        if not swing_pullback_ok(
+            side, vwap_score=vwap_score, price=price, vwap=vwap
+        ):
+            return "swing_pullback"
+        return ""
     if vwap_disagrees_with_htf(
         session, side, price=price, vwap=vwap, vwap_score=vwap_score
     ):
@@ -1232,6 +1279,28 @@ def apply_tactical_wisdom_block(
     elif tag == "vwap_sma_disagree":
         log_vwap_sma_disagree_block(
             session, side, price=price, vwap=vwap, vwap_score=vwap_score
+        )
+    elif tag == "swing_window":
+        logger.info(
+            "CYCLE %s SWING_WINDOW_BLOCK side=%s — new entries 10:00–15:30 ET only",
+            session.cycle,
+            str(side or "").upper(),
+        )
+    elif tag == "swing_pullback":
+        logger.info(
+            "CYCLE %s SWING_PULLBACK_BLOCK side=%s px=%.2f vwap=%.2f score=%.1f — "
+            "need value, not a chase or breakdown (Wisdom)",
+            session.cycle,
+            str(side or "").upper(),
+            float(price),
+            float(vwap),
+            float(vwap_score),
+        )
+    elif tag == "swing_atr":
+        logger.warning(
+            "CYCLE %s SWING_ATR_BLOCK side=%s — no completed daily ATR, no new risk (Justice)",
+            session.cycle,
+            str(side or "").upper(),
         )
     else:
         log_vwap_reclaim_block(session, side)
@@ -1289,6 +1358,15 @@ async def refresh_htf_regime(session: VirtueSession, *, force: bool = False) -> 
     latch = latch_from_daily_bars(
         bars or [], today, period=int(VIRTUE_REGIME_SMA_PERIOD)
     )
+    try:
+        from engine.swing_policy import atr_from_completed_daily_bars
+
+        latch["atr"] = atr_from_completed_daily_bars(bars or [], today)
+    except Exception:
+        logger.exception("htf_atr_compute_failed")
+        latch["atr"] = None
+    if latch.get("atr") is None and float(getattr(session, "htf_atr", 0.0) or 0.0) > 0:
+        latch["atr"] = float(session.htf_atr)
     apply_htf_regime_latch(session, latch, today)
     if session.htf_regime == "UNKNOWN" and session.htf_close_date:
         logger.warning(
@@ -1301,12 +1379,13 @@ async def refresh_htf_regime(session: VirtueSession, *, force: bool = False) -> 
             session.htf_sma_200,
         )
     logger.info(
-        "HTF_REGIME_LATCH date=%s regime=%s close=%.2f sma=%.2f "
+        "HTF_REGIME_LATCH date=%s regime=%s close=%.2f sma=%.2f atr=%.4f "
         "close_date=%s samples=%s force=%s",
         today,
         session.htf_regime,
         session.htf_daily_close,
         session.htf_sma_200,
+        float(session.htf_atr or 0.0),
         session.htf_close_date,
         session.htf_regime_samples,
         bool(force),
@@ -1338,6 +1417,8 @@ def _normalize_outcome_reason(reason: str) -> str:
         return "virtue_pnl_lock"
     if "structured_exit" in r:
         return "structured_exit"
+    if "regime_flip" in r or "swing_daily_regime" in r:
+        return "regime_flip"
     if "thesis_invalid" in r or r.startswith("wisdom_flat"):
         return "thesis_invalid"
     if not r or r == "none":
@@ -1686,7 +1767,7 @@ def _persist_virtue_trade(
         sleeve_tag = str(sleeve or "UNK").upper()
         trade_id = f"{sleeve_tag}-{uuid.uuid4().hex[:12].upper()}"
         pos_id = f"POS-{sleeve_tag}-{int(session.cycle)}"
-        risk = abs(float(VIRTUE_POSITION_STOP_DOLLARS))
+        risk = abs(float(effective_stop_dollars(session)))
         if sleeve_tag == "CORE":
             reward = abs(float(VIRTUE_CORE_TP_DOLLARS))
         else:
@@ -2384,7 +2465,7 @@ def _open_risk_notional(session: VirtueSession, stop_ticks: int) -> float:
     _, size = session.broker.net_exposure()
     if size <= 0:
         return 0.0
-    return float(VIRTUE_POSITION_STOP_DOLLARS)
+    return float(effective_stop_dollars(session)) * max(1, int(size))
 
 
 async def _resolve_flatten_price(session: VirtueSession) -> float:
@@ -2486,6 +2567,27 @@ async def _flatten_until_flat(
     return True
 
 
+def swing_keep_book_outside_rth(session: VirtueSession) -> bool:
+    """True when a swing position must survive cash close / overnight (no fake marks)."""
+    if not virtue_is_swing():
+        return False
+    try:
+        _, net_size = session.broker.net_exposure()
+    except Exception:
+        net_size = 0
+    if int(net_size or 0) > 0:
+        return True
+    return bool(session.tactical_active) and int(session.tactical_size or 0) > 0
+
+
+def _swing_tactical_holding(session: VirtueSession) -> bool:
+    return (
+        virtue_is_swing()
+        and bool(session.tactical_active)
+        and int(session.tactical_size or 0) > 0
+    )
+
+
 async def _rth_gate_or_flatten(
     session: VirtueSession,
     *,
@@ -2495,10 +2597,34 @@ async def _rth_gate_or_flatten(
     """
     Return True if trading cycle may continue.
     Outside session (RTH or CME): flatten residual risk and return False (Temperance).
-    RTH mode: hard-kill at 15:59:55 ET with reason RTH_MARKET_CLOSE.
+    RTH scalp: hard-kill at 15:59:55 ET with reason RTH_MARKET_CLOSE.
+    Swing: keep an open book overnight; skip the cycle (no invented marks).
     """
     if ignore_hours:
         return True
+    close_due = virtue_session_mode() != "cme" and rth_cash_close_flatten_due()
+    in_session = bool(virtue_session_open())
+    if virtue_is_swing() and (close_due or not in_session):
+        if swing_keep_book_outside_rth(session):
+            logger.info(
+                "CYCLE %s SWING_HOLD_OVERNIGHT side=%s size=%s — "
+                "no 15:59 flatten, no fake marks (Wisdom)",
+                session.cycle,
+                str(session.tactical_side or "FLAT"),
+                int(session.tactical_size or 0),
+            )
+            session.last_regime = "SWING_HOLD_OVERNIGHT"
+            session.last_signal_reason = "swing_hold_overnight"
+            session.last_action = str(session.tactical_side or "FLAT")
+            return False
+        session.last_regime = "OUTSIDE_SESSION" if not in_session else "RTH_ENTRY_CUTOFF"
+        session.last_signal_reason = "swing_no_new_entries_outside_rth"
+        session.last_action = "FLAT"
+        logger.info(
+            "CYCLE %s swing flat — stand aside outside RTH (keep cash)",
+            session.cycle,
+        )
+        return False
     if virtue_session_mode() != "cme" and rth_cash_close_flatten_due():
         session.last_regime = "RTH_MARKET_CLOSE"
         session.last_signal_reason = "RTH_MARKET_CLOSE"
@@ -3024,10 +3150,42 @@ async def run_cycle(
     # ============================================================
     # PHASE 2 — TACTICAL IN-FLIGHT ESCAPES (core uses structural invalidation)
     # ============================================================
+    if _swing_tactical_holding(session):
+        from engine.swing_policy import swing_regime_flip_exit
+
+        if swing_regime_flip_exit(
+            str(session.tactical_side or ""), str(session.htf_regime or "")
+        ):
+            logger.warning(
+                "CYCLE %s SWING_DAILY_REGIME_FLIP holding=%s htf=%s — flatten (Wisdom)",
+                session.cycle,
+                str(session.tactical_side or "").upper(),
+                str(session.htf_regime or "").upper(),
+            )
+            ok, pnl = await _close_tactical_sleeve(
+                session,
+                price=price,
+                stop_ticks=stop_ticks,
+                reason="SWING_DAILY_REGIME_FLIP",
+            )
+            if ok:
+                logger.info(
+                    "CYCLE %s SWING_DAILY_REGIME_FLIP_FLAT tactical pnl≈%.2f",
+                    session.cycle,
+                    pnl,
+                )
+            else:
+                logger.error(
+                    "CYCLE %s SWING_DAILY_REGIME_FLIP_FAILED — tactical may remain",
+                    session.cycle,
+                )
+            session.last_action = "FLAT"
+            return
     if (
         bool(session.tactical_active)
         and int(session.tactical_size) > 0
         and not virtue_simple_stack()
+        and not virtue_is_swing()
     ):
         tac_side = str(session.tactical_side or "FLAT").upper()
         cc_hit, cc_reason = check_course_correct(
@@ -3068,7 +3226,10 @@ async def run_cycle(
 
     tactical_pnl = _tactical_open_pnl(session, price)
     tac_size = max(1, int(session.tactical_size or 1))
-    stop_limit, trail_arm, trail_dist, trail_floor = _tactical_dollar_limits(tac_size)
+    stop_limit, trail_arm, trail_dist, trail_floor = _tactical_dollar_limits(
+        tac_size, session
+    )
+    per_ct_stop = float(effective_stop_dollars(session, price))
 
     # Dollar stop — tactical sleeve only (Temperance). Per contract × size.
     if bool(session.tactical_active) and tactical_pnl <= -stop_limit:
@@ -3076,7 +3237,7 @@ async def run_cycle(
             session,
             price=price,
             stop_ticks=stop_ticks,
-            reason=f"stop_${float(VIRTUE_POSITION_STOP_DOLLARS):.0f}_x{tac_size}",
+            reason=f"stop_${per_ct_stop:.0f}_x{tac_size}",
         )
         if ok:
             logger.info(
@@ -3085,7 +3246,7 @@ async def run_cycle(
                 session.cycle,
                 pnl,
                 stop_limit,
-                float(VIRTUE_POSITION_STOP_DOLLARS),
+                per_ct_stop,
                 tac_size,
                 session.pipeline_resume_cycle,
             )
@@ -3241,6 +3402,16 @@ async def run_cycle(
             and str(session.tactical_side).upper() != want
         ):
             tac_dir = str(session.tactical_side).upper()
+            if virtue_is_swing():
+                logger.info(
+                    "CYCLE %s SWING_IGNORE_5S_REVERSAL holding=%s signal=%s — "
+                    "exit is ATR stop / daily SMA flip, not a 5s band (Wisdom)",
+                    session.cycle,
+                    tac_dir,
+                    want,
+                )
+                session.last_action = tac_dir
+                return
             logger.warning(
                 "CYCLE %s STRUCTURED_EXIT tactical=%s → signal=%s "
                 "(close tactical; core uses structural invalidation)",
@@ -3290,6 +3461,16 @@ async def run_cycle(
     # mid-band "STAND ASIDE" while the hold path should have kept the book.
     if decision.action == SignalAction.FLAT:
         if bool(session.tactical_active) and int(session.tactical_size) > 0:
+            if virtue_is_swing():
+                logger.info(
+                    "CYCLE %s SWING_HOLD_THROUGH_5S_FLAT tactical=%s — "
+                    "ignore VWAP thesis flatten (%s)",
+                    session.cycle,
+                    session.tactical_side,
+                    str(decision.reason or "")[:120],
+                )
+                session.last_action = str(session.tactical_side or "FLAT")
+                return
             reason_s = str(decision.reason or "")
             thesis_break = (
                 "FLATTEN SIGNAL" in reason_s
@@ -3327,8 +3508,36 @@ async def run_cycle(
                     "CYCLE %s THESIS_INVALID_FLAT_FAILED — tactical may remain",
                     session.cycle,
                 )
-        session.last_action = "FLAT"
-        return
+            session.last_action = "FLAT"
+            return
+        if virtue_is_swing():
+            from engine.swing_policy import swing_entry_side as _swing_entry_side
+
+            pull = _swing_entry_side(
+                str(session.htf_regime or ""),
+                vwap_score=float(decision.vwap_score),
+                price=float(price),
+                vwap=float(decision.vwap),
+            )
+            if pull == "LONG":
+                decision = replace(
+                    decision,
+                    action=SignalAction.LONG,
+                    reason=f"SWING_PULLBACK LONG vwap={float(decision.vwap_score):.1f}",
+                )
+            elif pull == "SHORT":
+                decision = replace(
+                    decision,
+                    action=SignalAction.SHORT,
+                    reason=f"SWING_PULLBACK SHORT vwap={float(decision.vwap_score):.1f}",
+                )
+            else:
+                session.last_action = "FLAT"
+                return
+            logger.info("CYCLE %s %s", session.cycle, decision.reason)
+        else:
+            session.last_action = "FLAT"
+            return
 
     # Tactical already in desired direction — hold satellite (core may already be aligned).
     if (
@@ -3548,17 +3757,24 @@ async def run_cycle(
     from engine.config import VIRTUE_EXTREME_ADX_OVERRIDE
 
     need_streak = max(1, int(VIRTUE_REQUIRED_STREAK))
-    if virtue_simple_stack():
+    if virtue_is_swing():
+        need_streak = 1
+    elif virtue_simple_stack():
         from engine.config import VIRTUE_VWAP_RECLAIM_CYCLES
 
         need_streak = max(need_streak, int(VIRTUE_VWAP_RECLAIM_CYCLES))
-    if int(session.consecutive_losses) >= 1:
+    if (not virtue_is_swing()) and int(session.consecutive_losses) >= 1:
         need_streak += max(0, int(VIRTUE_POST_LOSS_EXTRA_STREAK))
     if (not virtue_simple_stack()) and float(decision.adx) >= float(
         VIRTUE_EXTREME_ADX_OVERRIDE
     ):
         need_streak = 1
     side = decision.action.value
+    if virtue_is_swing() and side in {"LONG", "SHORT"}:
+        if side == "LONG":
+            session.long_streak = max(int(session.long_streak or 0), 1)
+        else:
+            session.short_streak = max(int(session.short_streak or 0), 1)
     if side == "LONG":
         if session.long_streak < need_streak:
             logger.info(
@@ -3857,7 +4073,7 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
     # Live exit is dollar stop on the tactical sleeve — Manus risk matches that (Temperance).
-    proposed_risk = float(VIRTUE_POSITION_STOP_DOLLARS)
+    proposed_risk = float(effective_stop_dollars(session, price))
     open_risk = _open_risk_notional(session, stop_ticks)
 
     # Sync Manus NAV from broker truth (including equity=0 → no fake STARTING_NAV)
@@ -3879,6 +4095,24 @@ async def run_cycle(
     session.last_risk_verdict = verdict.value
     session.last_risk_reason = reason
 
+    if verdict == RiskVerdict.HALT:
+        if (
+            virtue_is_swing()
+            and "exceeds_fixed_fractional" in reason
+            and proposed_risk <= float(HARD_DAILY_STOP) + 1e-9
+            and int(contracts) <= 1
+        ):
+            verdict = RiskVerdict.APPROVED
+            reason = "swing_irreducible_atr_unit"
+            session.last_risk_verdict = verdict.value
+            session.last_risk_reason = reason
+            logger.info(
+                "CYCLE %s SWING_IRREDUCIBLE_ATR_UNIT proposed=$%.0f hard_daily=$%.0f "
+                "— 1 MES ATR stop is the unit (Temperance)",
+                session.cycle,
+                proposed_risk,
+                float(HARD_DAILY_STOP),
+            )
     if verdict == RiskVerdict.HALT:
         # Hard daily / concurrent: session halt. Sizing band mismatch: cycle stand-aside only.
         soft_halt = (
@@ -3907,7 +4141,7 @@ async def run_cycle(
             )
         else:
             contracts = max(1, contracts // 2)
-            proposed_risk = float(VIRTUE_POSITION_STOP_DOLLARS)
+            proposed_risk = float(effective_stop_dollars(session, price)) * int(contracts)
             logger.warning(
                 "CYCLE %s MANUS_REDUCE_SIZE reason=%s contracts=%s risk=%.2f",
                 session.cycle,
@@ -4071,20 +4305,34 @@ async def run_loop(
             int(paper_max_mes_contracts()),
         )
 
-    from engine.config import virtue_simple_stack as _boot_simple_stack
+    from engine.config import (
+        max_tactical_trades_per_day as _boot_day_cap,
+        virtue_simple_stack as _boot_simple_stack,
+        virtue_trade_horizon as _boot_horizon,
+    )
 
-    if _boot_simple_stack():
+    if virtue_is_swing():
         logger.info(
-            "BOOT SIMPLE_STACK_ENABLED vwap-only+20sma+reclaim12+stop$50+trail$25 "
+            "BOOT TRADE_HORIZON=swing hold_overnight atr_stop=1.5x_daily "
+            "pullback_vwap 10:00-15:30ET day_cap=%s loss_halt=%s — "
+            "no 15:59 flatten, no 5s VWAP thesis exit (Wisdom)",
+            int(_boot_day_cap()),
+            int(consecutive_loss_halt_limit()),
+        )
+    elif _boot_simple_stack():
+        logger.info(
+            "BOOT SIMPLE_STACK_ENABLED horizon=%s vwap-only+20sma+reclaim12+stop$50+trail$25 "
             "day_cap=%s loss_halt=%s time_decay=%s — "
             "auction streak reset 09:45; VWAP/SMA disagree stands aside",
+            _boot_horizon(),
             int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
             int(consecutive_loss_halt_limit()),
             bool(tactical_time_decay_enabled()),
         )
     else:
         logger.warning(
-            "BOOT SIMPLE_STACK_DISABLED — full MacroMathics indicator stack active"
+            "BOOT SIMPLE_STACK_DISABLED horizon=%s — full MacroMathics indicator stack active",
+            _boot_horizon(),
         )
 
     # Absolute pipeline_resume from a prior process is meaningless after cycle→0.
@@ -4191,8 +4439,8 @@ async def run_loop(
         float(VIRTUE_TRAIL_ARM_DOLLARS),
         float(VIRTUE_TRAIL_DISTANCE_DOLLARS),
         float(VIRTUE_TRAIL_FLOOR_DOLLARS),
-        float(VIRTUE_POSITION_STOP_DOLLARS),
-        int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY),
+        float(effective_stop_dollars(session)),
+        int(max_tactical_trades_per_day()),
         float(GRADE_DAILY_PROFIT_LOCK),
         int(VIRTUE_BASE_TP_COOLDOWN_CYCLES),
         int(VIRTUE_POST_COURSE_CORRECT_COOLDOWN_CYCLES),

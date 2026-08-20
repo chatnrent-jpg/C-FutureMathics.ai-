@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import time
+
+# Scalp knobs for the existing unit suite. Swing coverage is explicit in
+# test_swing_policy_atr_stop_pullback_and_hold.
+os.environ["FM_VIRTUE_TRADE_HORIZON"] = "scalp"
 
 from broker import Order, calculate_max_contracts, reject_if_over_risk, validate_order
 from engine.config import FIXED_FRACTIONAL_RISK_PCT, TICK_VALUE
@@ -237,7 +242,7 @@ def test_temperance_blocks_day_cap_and_loss_halt() -> None:
     assert blocked is True
     assert "day_cap" in reason
 
-    s.trades_today = 2
+    s.trades_today = 0
     s.consecutive_losses = 3
     blocked, reason = temperance_blocks_new_tactical_entry(s)
     assert blocked is True
@@ -332,12 +337,14 @@ def test_apply_htf_regime_latch_session() -> None:
             "regime": "BULLISH",
             "daily_close": 640.0,
             "sma": 610.0,
+            "atr": 8.5,
             "samples": 20,
             "close_date": "2026-08-14",
         },
         "2026-08-17",
     )
     assert s.htf_regime == "BULLISH"
+    assert abs(float(s.htf_atr) - 8.5) < 1e-9
     assert s.htf_regime_date == "2026-08-17"
     assert regime_allows_side(s.htf_regime, "LONG") is True
     assert regime_allows_side(s.htf_regime, "SHORT") is False
@@ -2338,6 +2345,129 @@ def test_sleeve_pnl_uses_sleeve_entry_not_broker_avg() -> None:
     asyncio.run(_run())
 
 
+def test_swing_policy_atr_stop_pullback_and_hold() -> None:
+    """Daily swing: ATR stop clip, VWAP pullback, overnight keep-book (Wisdom/Temperance)."""
+    import os
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from engine.config import HARD_DAILY_STOP, POINT_VALUE, virtue_is_swing
+    from engine.swing_policy import (
+        swing_entry_side,
+        swing_entry_window_open,
+        swing_pullback_ok,
+        swing_regime_flip_exit,
+        swing_stop_dollars,
+        wilder_atr,
+    )
+    from main import (
+        VirtueSession,
+        effective_stop_dollars,
+        swing_keep_book_outside_rth,
+        tactical_wisdom_blocks_entry,
+    )
+
+    prev = os.environ.get("FM_VIRTUE_TRADE_HORIZON")
+    os.environ["FM_VIRTUE_TRADE_HORIZON"] = "swing"
+    try:
+        assert virtue_is_swing() is True
+
+        highs = [float(i + 2) for i in range(16)]
+        lows = [float(i) for i in range(16)]
+        closes = [float(i + 1) for i in range(16)]
+        atr = wilder_atr(highs, lows, closes, period=14)
+        assert atr is not None and atr > 0
+
+        # Large mapped ATR → clip to hard daily stop (Temperance).
+        big = swing_stop_dollars(
+            atr_spy=8.0, spy_close=640.0, mes_price=6400.0, point_value=float(POINT_VALUE)
+        )
+        assert abs(big - float(HARD_DAILY_STOP)) < 1e-9
+        # Small mapped ATR → floor $100.
+        small = swing_stop_dollars(
+            atr_spy=1.0, spy_close=640.0, mes_price=6400.0, point_value=float(POINT_VALUE)
+        )
+        assert abs(small - 100.0) < 1e-9
+
+        assert swing_pullback_ok("LONG", vwap_score=55.0, price=9590.0, vwap=9588.0) is True
+        assert swing_pullback_ok("LONG", vwap_score=75.0, price=9590.0, vwap=9588.0) is False
+        assert swing_pullback_ok("LONG", vwap_score=55.0, price=9584.0, vwap=9588.0) is False
+        assert swing_pullback_ok("SHORT", vwap_score=45.0, price=9584.0, vwap=9588.0) is True
+        assert swing_entry_side(
+            "BULLISH", vwap_score=55.0, price=9590.0, vwap=9588.0
+        ) == "LONG"
+        assert swing_entry_side(
+            "BULLISH", vwap_score=75.0, price=9590.0, vwap=9588.0
+        ) == ""
+        assert swing_regime_flip_exit("LONG", "BEARISH") is True
+        assert swing_regime_flip_exit("LONG", "BULLISH") is False
+        assert swing_regime_flip_exit("LONG", "UNKNOWN") is False
+
+        tz = ZoneInfo("America/New_York")
+        assert swing_entry_window_open(datetime(2026, 7, 27, 10, 0, tzinfo=tz)) is True
+        assert swing_entry_window_open(datetime(2026, 7, 27, 9, 59, tzinfo=tz)) is False
+        assert swing_entry_window_open(datetime(2026, 7, 27, 15, 30, tzinfo=tz)) is False
+
+        s = VirtueSession()
+        s.htf_regime = "BULLISH"
+        s.htf_atr = 8.0
+        s.htf_daily_close = 640.0
+        s.last_price = 6400.0
+        noon = datetime(2026, 7, 27, 12, 0, tzinfo=tz)
+        # Pullback is allowed even though a scalp VWAP-disagree would block a VWAP loss.
+        assert (
+            tactical_wisdom_blocks_entry(
+                s,
+                "LONG",
+                price=9590.0,
+                vwap=9588.0,
+                vwap_score=55.0,
+                now=noon,
+            )
+            == ""
+        )
+        assert (
+            tactical_wisdom_blocks_entry(
+                s,
+                "LONG",
+                price=9590.0,
+                vwap=9588.0,
+                vwap_score=75.0,
+                now=noon,
+            )
+            == "swing_pullback"
+        )
+        assert (
+            tactical_wisdom_blocks_entry(
+                s,
+                "LONG",
+                price=9590.0,
+                vwap=9588.0,
+                vwap_score=55.0,
+                now=datetime(2026, 7, 27, 9, 50, tzinfo=tz),
+            )
+            == "swing_window"
+        )
+
+        stop = effective_stop_dollars(s, 6400.0)
+        assert 100.0 - 1e-9 <= stop <= float(HARD_DAILY_STOP) + 1e-9
+
+        s.tactical_active = True
+        s.tactical_size = 1
+        s.tactical_side = "LONG"
+        s.broker.open_positions = [{"direction": "LONG", "size": 1, "price": 6400.0}]
+        assert swing_keep_book_outside_rth(s) is True
+        s.tactical_active = False
+        s.tactical_size = 0
+        s.broker.open_positions = []
+        assert swing_keep_book_outside_rth(s) is False
+    finally:
+        if prev is None:
+            os.environ.pop("FM_VIRTUE_TRADE_HORIZON", None)
+        else:
+            os.environ["FM_VIRTUE_TRADE_HORIZON"] = prev
+
+
 if __name__ == "__main__":
     test_wisdom_bull_regime()
     test_wisdom_bear_regime()
@@ -2413,5 +2543,6 @@ if __name__ == "__main__":
     test_pipeline_stuck_alert_debounce()
     test_simplify_tactical_only_1mes()
     test_sleeve_pnl_uses_sleeve_entry_not_broker_avg()
+    test_swing_policy_atr_stop_pullback_and_hold()
     print("ALL VIRTUE BRAIN TESTS PASSED")
 

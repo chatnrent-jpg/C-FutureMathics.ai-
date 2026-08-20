@@ -236,6 +236,8 @@ def test_rth_mode_still_blocks_overnight(monkeypatch) -> None:
     monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
     monkeypatch.delenv("VIRTUE_SESSION_MODE", raising=False)
     monkeypatch.setenv("FM_DATA_SOURCE", "alpaca")
+    monkeypatch.setenv("FM_VIRTUE_TRADE_HORIZON", "scalp")
+    monkeypatch.setenv("FM_VIRTUE_SIMPLE_STACK", "0")
     from scripts.run_daily_session import virtue_entries_allowed, virtue_session_open
 
     tz = ZoneInfo("America/New_York")

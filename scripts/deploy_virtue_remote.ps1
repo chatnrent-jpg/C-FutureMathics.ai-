@@ -40,7 +40,8 @@ try {
         "FM_MAX_ACCOUNT_CONTRACT_CEILING=1",
         "FM_PAPER_MAX_MES_CONTRACTS=1",
         # MacroMathics: bands + stop/TP/lock only (kill overlapping indicator gates)
-        "FM_VIRTUE_SIMPLE_STACK=1"
+        "FM_VIRTUE_SIMPLE_STACK=1",
+        "FM_VIRTUE_TRADE_HORIZON=swing"
     )
     if ($dbKey) {
         $envLines += "DATABENTO_API_KEY=$dbKey"
@@ -77,6 +78,7 @@ scp @ssh `
     "$Root\engine\macromathics_core.py" `
     "$Root\engine\observability.py" `
     "$Root\engine\regime_filter.py" `
+    "$Root\engine\swing_policy.py" `
     "$Root\engine\rth_hours.py" `
     "$Root\engine\futures_broker_adapter.py" `
     "$Root\engine\env_loader.py" `

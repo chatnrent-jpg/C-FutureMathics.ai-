@@ -270,8 +270,16 @@ VIRTUE_MARKET_LIFT_LONG_MIN = 40.0
 VIRTUE_VOL_CONVICTION_SHORT_MIN = 40.0
 VIRTUE_MARKET_LIFT_SHORT_MAX = 45.0  # shorts need lift in bear/neutral zone
 VIRTUE_VOL_DEAD_MAX = 35.0  # below → stand aside both ways (no participation)
-# Hard daily round-trip cap for tactical sleeve (Temperance). Counters increment on close.
-# 3 MES round-trips / RTH session — do not raise to chase fills.
+# Trade horizon. swing = daily 20-SMA bias, VWAP pullback, ATR stop, hold overnight.
+# scalp = 5-second RTH day-trade (legacy). Override: FM_VIRTUE_TRADE_HORIZON=swing|scalp
+VIRTUE_TRADE_HORIZON = "swing"
+VIRTUE_SWING_ENTRY_HOUR = 10
+VIRTUE_SWING_ENTRY_MINUTE = 0
+VIRTUE_SWING_ENTRY_END_HOUR = 15
+VIRTUE_SWING_ENTRY_END_MINUTE = 30
+# Swing: one new entry per ET day (position holds across sessions).
+VIRTUE_SWING_MAX_TRADES_PER_DAY = 1
+# Scalp-mode round-trip cap (unused while horizon=swing).
 VIRTUE_MAX_TACTICAL_TRADES_PER_DAY = 3
 # No new tactical entries after this many consecutive losses (Temperance). 0 = disabled.
 # Override: FM_VIRTUE_CONSECUTIVE_LOSS_HALT.
@@ -578,6 +586,27 @@ def virtue_simple_stack() -> bool:
     Default True. Override: FM_VIRTUE_SIMPLE_STACK=0|1.
     """
     return _env_bool_override("FM_VIRTUE_SIMPLE_STACK", bool(VIRTUE_SIMPLE_STACK))
+
+
+def virtue_trade_horizon() -> str:
+    """'swing' or 'scalp'. Override: FM_VIRTUE_TRADE_HORIZON."""
+    raw = os.getenv("FM_VIRTUE_TRADE_HORIZON", "").strip().lower()
+    if raw in {"swing", "daily", "position", "hold"}:
+        return "swing"
+    if raw in {"scalp", "intraday", "rth", "day"}:
+        return "scalp"
+    hz = str(VIRTUE_TRADE_HORIZON or "swing").strip().lower()
+    return "scalp" if hz in {"scalp", "intraday", "rth", "day"} else "swing"
+
+
+def virtue_is_swing() -> bool:
+    return virtue_trade_horizon() == "swing"
+
+
+def max_tactical_trades_per_day() -> int:
+    if virtue_is_swing():
+        return max(1, int(VIRTUE_SWING_MAX_TRADES_PER_DAY))
+    return max(1, int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY))
 
 
 def tactical_time_decay_enabled() -> bool:

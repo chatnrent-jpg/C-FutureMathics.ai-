@@ -227,8 +227,13 @@ def virtue_entries_allowed(
     from engine.config import (
         VIRTUE_SIMPLE_STACK_ENTRY_HOUR,
         VIRTUE_SIMPLE_STACK_ENTRY_MINUTE,
+        virtue_is_swing,
         virtue_simple_stack,
     )
+    if virtue_is_swing():
+        from engine.swing_policy import swing_entry_window_open
+
+        return bool(swing_entry_window_open(now))
     if virtue_simple_stack():
         dt = _et_now(now)
         if virtue_session_mode() != "cme":
@@ -273,8 +278,10 @@ def virtue_session_label() -> str:
     """Human-readable timetable for boot logs / dashboard."""
     mode = virtue_session_mode()
     src = primary_data_source()
-    from engine.config import virtue_simple_stack
-    if virtue_simple_stack():
+    from engine.config import virtue_is_swing, virtue_simple_stack
+    if virtue_is_swing():
+        windows = "entries=10:00-15:30ET hold_overnight flatten=ATR_stop|SMA_flip"
+    elif virtue_simple_stack():
         windows = "entries=09:45-15:59ET (simple_stack skip auction)"
     else:
         windows = "entries=09:45-11:30&13:45-15:55ET+extreme"

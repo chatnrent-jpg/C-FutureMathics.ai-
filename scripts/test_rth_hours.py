@@ -95,6 +95,7 @@ def test_intraday_bars_between_time() -> None:
 def test_entry_windows() -> None:
     """allow_new_entries True in 09:45–11:30 and 13:45–15:55 ET."""
     os.environ["FM_VIRTUE_SIMPLE_STACK"] = "0"
+    os.environ["FM_VIRTUE_TRADE_HORIZON"] = "scalp"
     tz = ZoneInfo("America/New_York")
     cases = [
         ("Monday 09:30 open auction", datetime(2026, 7, 27, 9, 30, tzinfo=tz), False),
@@ -133,6 +134,7 @@ def test_entry_windows() -> None:
 def test_simple_stack_skips_open_auction() -> None:
     """Simple stack: no new entries 09:30–09:45; rest of RTH until flatten is open."""
     os.environ.pop("FM_VIRTUE_SIMPLE_STACK", None)
+    os.environ["FM_VIRTUE_TRADE_HORIZON"] = "scalp"
     tz = ZoneInfo("America/New_York")
     cases = [
         ("Monday 09:30 auction", datetime(2026, 7, 27, 9, 30, tzinfo=tz), False),
@@ -149,9 +151,29 @@ def test_simple_stack_skips_open_auction() -> None:
     print("ALL SIMPLE STACK AUCTION SKIP TESTS PASSED")
 
 
+def test_swing_entry_window() -> None:
+    """Daily swing: new entries 10:00–15:30 ET only (hold overnight; no 15:59 flatten)."""
+    os.environ["FM_VIRTUE_TRADE_HORIZON"] = "swing"
+    tz = ZoneInfo("America/New_York")
+    cases = [
+        ("Monday 09:59", datetime(2026, 7, 27, 9, 59, tzinfo=tz), False),
+        ("Monday 10:00", datetime(2026, 7, 27, 10, 0, tzinfo=tz), True),
+        ("Monday lunch 12:00", datetime(2026, 7, 27, 12, 0, tzinfo=tz), True),
+        ("Monday 15:29", datetime(2026, 7, 27, 15, 29, tzinfo=tz), True),
+        ("Monday 15:30 cutoff", datetime(2026, 7, 27, 15, 30, tzinfo=tz), False),
+        ("Monday 15:59:55", datetime(2026, 7, 27, 15, 59, 55, tzinfo=tz), False),
+        ("Saturday 12:00", datetime(2026, 7, 25, 12, 0, tzinfo=tz), False),
+    ]
+    for desc, dt, expected in cases:
+        got = virtue_entries_allowed(dt)
+        assert got == expected, f"swing entries {desc}: expected {expected} got {got}"
+    print("ALL SWING ENTRY WINDOW TESTS PASSED")
+
+
 if __name__ == "__main__":
     test_rth_hours()
     test_rth_cash_close_flatten()
     test_intraday_bars_between_time()
     test_entry_windows()
     test_simple_stack_skips_open_auction()
+    test_swing_entry_window()

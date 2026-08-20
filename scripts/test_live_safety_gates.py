@@ -52,6 +52,8 @@ def test_live_no_overnight_day_window(monkeypatch) -> None:
     monkeypatch.setenv("DATABENTO_API_KEY", "db-test")
     monkeypatch.setenv("FM_DATA_SOURCE", "databento")
     monkeypatch.setenv("VIRTUE_SESSION_MODE", "cme")
+    monkeypatch.setenv("FM_VIRTUE_TRADE_HORIZON", "scalp")
+    monkeypatch.setenv("FM_VIRTUE_SIMPLE_STACK", "0")
 
     tz = ZoneInfo("America/New_York")
     # Sunday Globex open — blocked for live cash daytime-only
