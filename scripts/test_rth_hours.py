@@ -18,6 +18,7 @@ os.environ.pop("DATABENTO_API_KEY", None)
 os.environ.pop("VIRTUE_SESSION_MODE", None)
 os.environ["FM_DATA_SOURCE"] = "alpaca"
 os.environ["VIRTUE_SESSION_MODE"] = "rth"
+os.environ["FM_BRACKET_ENGINE"] = "0"
 
 from scripts.run_daily_session import (
     allow_new_entries,

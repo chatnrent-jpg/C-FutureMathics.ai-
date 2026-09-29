@@ -8,6 +8,7 @@ import time
 # Scalp knobs for the existing unit suite. Swing coverage is explicit in
 # test_swing_policy_atr_stop_pullback_and_hold.
 os.environ["FM_VIRTUE_TRADE_HORIZON"] = "scalp"
+os.environ["FM_BRACKET_ENGINE"] = "0"
 
 from broker import Order, calculate_max_contracts, reject_if_over_risk, validate_order
 from engine.config import FIXED_FRACTIONAL_RISK_PCT, TICK_VALUE

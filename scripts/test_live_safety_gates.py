@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+os.environ["FM_BRACKET_ENGINE"] = "0"
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:

@@ -432,6 +432,12 @@ def temperance_blocks_new_tactical_entry(session: VirtueSession) -> tuple[bool, 
     if trades >= cap:
         return True, f"tactical_day_cap trades_today={trades} >= {cap}"
     halt = int(consecutive_loss_halt_limit())
+    from engine.config import bracket_engine_enabled
+
+    if bracket_engine_enabled():
+        from main_engine import schema_day_limits
+
+        _loss, _gain, halt = schema_day_limits()
     losses = int(getattr(session, "consecutive_losses", 0) or 0)
     if halt > 0 and losses >= halt:
         return True, f"consecutive_loss_halt losses={losses} >= {halt}"
@@ -1237,6 +1243,11 @@ def tactical_wisdom_blocks_entry(
     now: datetime | None = None,
 ) -> str:
     """Return a block tag, or empty if Wisdom allows this new entry."""
+    from engine.config import bracket_engine_enabled
+
+    if bracket_engine_enabled():
+        # 20-SMA and the VWAP 48-62 band are not entry gates on the bracket path.
+        return ""
     if htf_regime_blocks_new_entry(session, side):
         return "sma"
     if virtue_is_swing():
@@ -1699,6 +1710,12 @@ def _mark_tactical_open(
     session.entry_cycle_marker = int(cycle)
     session.tactical_peak_open_pnl = 0.0
     session.tactical_trail_armed = False
+    from engine.config import bracket_engine_enabled
+
+    if bracket_engine_enabled():
+        from main_engine import remember_bracket
+
+        remember_bracket(session)
 
 
 def _mark_tactical_flat(session: VirtueSession) -> None:
@@ -1709,6 +1726,7 @@ def _mark_tactical_flat(session: VirtueSession) -> None:
     session.entry_cycle_marker = None
     session.tactical_peak_open_pnl = 0.0
     session.tactical_trail_armed = False
+    session.bracket_position = None
 
 
 def _mark_core_open(
@@ -2604,7 +2622,9 @@ async def _rth_gate_or_flatten(
         return True
     close_due = virtue_session_mode() != "cme" and rth_cash_close_flatten_due()
     in_session = bool(virtue_session_open())
-    if virtue_is_swing() and (close_due or not in_session):
+    from engine.config import bracket_engine_enabled
+
+    if virtue_is_swing() and not bracket_engine_enabled() and (close_due or not in_session):
         if swing_keep_book_outside_rth(session):
             logger.info(
                 "CYCLE %s SWING_HOLD_OVERNIGHT side=%s size=%s — "
@@ -2890,6 +2910,18 @@ async def run_cycle(
     else:
         holding = None
     decision = session.strategy.evaluate(holding=holding)
+    from engine.config import bracket_engine_enabled
+
+    if bracket_engine_enabled():
+        from main_engine import overlay_bracket_decision
+
+        try:
+            decision = await overlay_bracket_decision(session, decision, price)
+        except Exception as exc:
+            logger.exception("bracket_overlay_failed err=%s", exc)
+            from dataclasses import replace as _replace
+
+            decision = _replace(decision, action=SignalAction.FLAT, reason="bracket_overlay_error")
     session.last_regime = decision.regime.value
     session.last_signal_reason = decision.reason
     session.last_adx = float(decision.adx)
@@ -3230,9 +3262,39 @@ async def run_cycle(
         tac_size, session
     )
     per_ct_stop = float(effective_stop_dollars(session, price))
+    from engine.config import bracket_engine_enabled
+
+    bracket_target = 0.0
+    if bracket_engine_enabled():
+        from main_engine import CONTRACTS, bracket_exit, bracket_risk_dollars, remember_bracket
+
+        per_ct_stop, bracket_target, _contracts = bracket_risk_dollars()
+        tac_size = min(tac_size, int(CONTRACTS))
+        stop_limit = per_ct_stop * tac_size
+        if bool(session.tactical_active):
+            held = getattr(session, "bracket_position", None) or remember_bracket(session)
+            hit = bracket_exit(held, price)
+            if hit in {"STOP", "TARGET"}:
+                ok, pnl = await _close_tactical_sleeve(
+                    session,
+                    price=price,
+                    stop_ticks=stop_ticks,
+                    reason=f"bracket_{hit.lower()}_10pt_stop_20pt_target",
+                )
+                if ok:
+                    logger.info(
+                        "CYCLE %s BRACKET_%s tactical pnl≈%.2f",
+                        session.cycle,
+                        hit,
+                        pnl,
+                    )
+                else:
+                    logger.error("CYCLE %s BRACKET_%s_FAILED — tactical may remain", session.cycle, hit)
+                session.last_action = "FLAT"
+                return
 
     # Dollar stop — tactical sleeve only (Temperance). Per contract × size.
-    if bool(session.tactical_active) and tactical_pnl <= -stop_limit:
+    if not bracket_engine_enabled() and bool(session.tactical_active) and tactical_pnl <= -stop_limit:
         ok, pnl = await _close_tactical_sleeve(
             session,
             price=price,
@@ -3255,8 +3317,38 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
-    # Trailing stop — tactical sleeve only (no fixed TP when TP dollars <= 0).
-    if bool(session.tactical_active) and float(VIRTUE_POSITION_TP_DOLLARS) <= 0:
+    if (
+        bool(session.tactical_active)
+        and bracket_engine_enabled()
+        and bracket_target > 0
+        and tactical_pnl >= bracket_target * tac_size
+    ):
+        tac_dir = str(session.tactical_side or "FLAT").upper()
+        ok, pnl = await _close_tactical_sleeve(
+            session,
+            price=price,
+            stop_ticks=stop_ticks,
+            reason=f"bracket_target_20pt_${bracket_target:.0f}_x{tac_size}",
+        )
+        if ok:
+            logger.info(
+                "CYCLE %s BRACKET_TARGET tactical %s pnl≈%.2f target=$%.0f",
+                session.cycle,
+                tac_dir,
+                pnl,
+                bracket_target * tac_size,
+            )
+        else:
+            logger.error("CYCLE %s BRACKET_TARGET_FAILED — tactical may remain", session.cycle)
+        session.last_action = "FLAT"
+        return
+
+    # Trailing stop — legacy path only. Bracket uses the 20-point target.
+    if (
+        bool(session.tactical_active)
+        and not bracket_engine_enabled()
+        and float(VIRTUE_POSITION_TP_DOLLARS) <= 0
+    ):
         trail_hit, trail_level = update_tactical_trail(session, tactical_pnl)
         if trail_hit:
             tac_dir = str(session.tactical_side or "FLAT").upper()
@@ -3645,8 +3737,32 @@ async def run_cycle(
         session.last_action = "FLAT"
         return
 
+    # Temperance: schema day bounds — stop new entries at -$300 or +$500 realized.
+    if bracket_engine_enabled():
+        from main_engine import schema_day_limits
+
+        day_loss, day_gain, _streak = schema_day_limits()
+        if session.realized_pnl_today <= float(day_loss):
+            logger.info(
+                "CYCLE %s schema_daily_loss pnl=%.2f <= %.2f — stand aside",
+                session.cycle,
+                session.realized_pnl_today,
+                day_loss,
+            )
+            session.last_action = "FLAT"
+            return
+        if session.realized_pnl_today >= float(day_gain):
+            logger.info(
+                "CYCLE %s schema_daily_gain pnl=%.2f >= %.2f — stand aside",
+                session.cycle,
+                session.realized_pnl_today,
+                day_gain,
+            )
+            session.last_action = "FLAT"
+            return
+
     # Temperance: hard daily profit lock — day is done; bank the win, no new entries.
-    if session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK):
+    if not bracket_engine_enabled() and session.realized_pnl_today >= float(GRADE_DAILY_PROFIT_LOCK):
         logger.info(
             "CYCLE %s daily_profit_lock pnl=%.2f >= %.2f — work done for the day (stand aside)",
             session.cycle,

@@ -230,10 +230,22 @@ def virtue_entries_allowed(
         virtue_is_swing,
         virtue_simple_stack,
     )
-    if virtue_is_swing():
+    from engine.config import bracket_engine_enabled
+
+    if virtue_is_swing() and not bracket_engine_enabled():
         from engine.swing_policy import swing_entry_window_open
 
         return bool(swing_entry_window_open(now))
+    if bracket_engine_enabled():
+        dt = _et_now(now)
+        if virtue_session_mode() != "cme":
+            auction_end = time(
+                int(VIRTUE_SIMPLE_STACK_ENTRY_HOUR),
+                int(VIRTUE_SIMPLE_STACK_ENTRY_MINUTE),
+            )
+            if dt.time() < auction_end:
+                return False
+        return True
     if virtue_simple_stack():
         dt = _et_now(now)
         if virtue_session_mode() != "cme":

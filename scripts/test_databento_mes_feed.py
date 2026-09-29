@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ["FM_BRACKET_ENGINE"] = "0"
 
 
 def test_primary_data_source_auto_and_forced(monkeypatch) -> None:

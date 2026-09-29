@@ -1,0 +1,14 @@
+{
+  "bot_name": "futuremathics_virtue_v2",
+  "instrument": "MES",
+  "contract_size": 1,
+  "risk_params": {
+    "stop_points": 10.0,
+    "target_points": 20.0,
+    "max_daily_loss_realized": -300.0,
+    "max_daily_gain_realized": 500.0,
+    "max_consecutive_losses": 3
+  },
+  "execution_mode": "paper",
+  "state": "IDLE"
+}

@@ -298,8 +298,12 @@ VIRTUE_SCORE_SHORT_CHASE_MIN = 15.0
 VIRTUE_SCORE_PRICE_PCT = 0.004
 # After anchor rebase, skip new entries for N cycles (scores are artificially near 50)
 VIRTUE_POST_REBASE_ENTRY_COOLDOWN_CYCLES = 3
-# Fixed dollar TP disabled (0) — winners run under trailing stop (Courage + Temperance).
+# Fixed dollar TP disabled (0) on the legacy trail path.
+# Bracket engine uses its own 10-point stop / 20-point target (see main_engine.py).
 VIRTUE_POSITION_TP_DOLLARS = 0.0
+# Production bracket: 1 MES, no trail, no 20-SMA, no VWAP 48-62 band.
+# Override: FM_BRACKET_ENGINE=0 to restore the previous swing brain.
+BRACKET_ENGINE = True
 # Hard stop per contract (full flatten when open PnL <= -stop × size).
 VIRTUE_POSITION_STOP_DOLLARS = 50.0
 # Trailing stop (per contract): arm after open profit, then trail peak open PnL.
@@ -601,6 +605,16 @@ def virtue_trade_horizon() -> str:
 
 def virtue_is_swing() -> bool:
     return virtue_trade_horizon() == "swing"
+
+
+def bracket_engine_enabled() -> bool:
+    """True → fixed 10/20 MES bracket. FM_BRACKET_ENGINE=0 keeps the old swing brain."""
+    raw = os.getenv("FM_BRACKET_ENGINE", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return bool(BRACKET_ENGINE)
 
 
 def max_tactical_trades_per_day() -> int:
