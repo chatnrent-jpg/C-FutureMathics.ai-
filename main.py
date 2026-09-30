@@ -2923,6 +2923,10 @@ async def run_cycle(
 
             decision = _replace(decision, action=SignalAction.FLAT, reason="bracket_overlay_error")
     session.last_regime = decision.regime.value
+    if bracket_engine_enabled():
+        bracket_label = str(getattr(session, "bracket_gamma", "") or "")
+        if bracket_label and bracket_label != "UNKNOWN":
+            session.last_regime = bracket_label
     session.last_signal_reason = decision.reason
     session.last_adx = float(decision.adx)
     session.last_atr_pct = float(decision.atr_pct)
@@ -3066,7 +3070,7 @@ async def run_cycle(
         "open_pnl=%.2f trail_armed=%s peak_pnl=%.2f long_streak=%s short_streak=%s "
         "macro_bias=%s temperance_buf=%.1f velocity=%.1f reason=%s exposure=%s",
         session.cycle,
-        decision.regime.value,
+        session.last_regime,
         decision.action.value,
         decision.vwap_score,
         decision.twap_score,
@@ -3602,7 +3606,7 @@ async def run_cycle(
                 )
             session.last_action = "FLAT"
             return
-        if virtue_is_swing():
+        if virtue_is_swing() and not bracket_engine_enabled():
             from engine.swing_policy import swing_entry_side as _swing_entry_side
 
             pull = _swing_entry_side(
@@ -4219,7 +4223,11 @@ async def run_cycle(
             and int(contracts) <= 1
         ):
             verdict = RiskVerdict.APPROVED
-            reason = "swing_irreducible_atr_unit"
+            reason = (
+                "bracket_1mes_10pt"
+                if bracket_engine_enabled()
+                else "swing_irreducible_atr_unit"
+            )
             session.last_risk_verdict = verdict.value
             session.last_risk_reason = reason
             logger.info(

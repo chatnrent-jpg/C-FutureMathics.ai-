@@ -34,7 +34,16 @@ def get_market_regime(spot_price: float, gamma_flip: float) -> str:
 class GammaRegime(str, Enum):
     POSITIVE = "POSITIVE_GAMMA"
     NEGATIVE = "NEGATIVE_GAMMA"
+    MEAN_REVERT = "MEAN_REVERT"
+    MOMENTUM = "MOMENTUM"
     UNKNOWN = "UNKNOWN"
+
+
+# Short ATR versus the last 20 true ranges. Ratio is scale-free.
+ATR_SHORT_BARS = 6
+ATR_LONG_BARS = 20
+ATR_MOMENTUM_RATIO = 1.15
+ATR_CHAOS_RATIO = 1.80
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,48 @@ def snapshot_from_flip(
     label = get_market_regime(spot, flip)
     regime = GammaRegime.POSITIVE if label == "POSITIVE_GAMMA" else GammaRegime.NEGATIVE
     return GammaSnapshot(regime, net_gex, flip, age_seconds, label)
+
+
+def _true_ranges(bars: list) -> list[float]:
+    ranges: list[float] = []
+    prev_close: float | None = None
+    for row in bars:
+        if not isinstance(row, dict):
+            continue
+        try:
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if high <= 0 or low <= 0 or close <= 0 or high < low:
+            continue
+        span = high - low
+        if prev_close is not None:
+            span = max(span, abs(high - prev_close), abs(low - prev_close))
+        ranges.append(span)
+        prev_close = close
+    return ranges
+
+
+def classify_volatility_regime(bars: list) -> GammaSnapshot:
+    """Mean-revert, momentum, or stand aside from 15-minute true range. No invented flip."""
+    ranges = _true_ranges(bars)
+    if len(ranges) < ATR_LONG_BARS:
+        return GammaSnapshot(GammaRegime.UNKNOWN, None, None, None, "atr_insufficient_bars")
+    short = sum(ranges[-ATR_SHORT_BARS:]) / float(ATR_SHORT_BARS)
+    baseline = sum(ranges[-ATR_LONG_BARS:]) / float(ATR_LONG_BARS)
+    if baseline <= 0:
+        return GammaSnapshot(GammaRegime.UNKNOWN, None, None, None, "atr_baseline_invalid")
+    ratio = short / baseline
+    if ratio >= ATR_CHAOS_RATIO:
+        logger.info(f"Regime: ATR CHAOS ratio {ratio:.2f}. Stand aside.")
+        return GammaSnapshot(GammaRegime.UNKNOWN, None, None, None, "atr_chaos_stand_aside")
+    if ratio >= ATR_MOMENTUM_RATIO:
+        logger.info(f"Regime: ATR MOMENTUM ratio {ratio:.2f}. POC continuation only.")
+        return GammaSnapshot(GammaRegime.MOMENTUM, None, None, None, "atr_expanding_momentum")
+    logger.info(f"Regime: ATR MEAN REVERT ratio {ratio:.2f}. Fade value extremes.")
+    return GammaSnapshot(GammaRegime.MEAN_REVERT, None, None, None, "atr_compressed_mean_revert")
 
 
 def read_gamma_file(

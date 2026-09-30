@@ -14,6 +14,36 @@ from modules.regime import GammaRegime, get_market_regime, read_gamma_file, snap
 from modules.strategy import evaluate_entry_signal, value_area_from_bars
 
 
+def test_atr_regime_without_gamma_flip() -> None:
+    from modules.regime import classify_volatility_regime
+
+    quiet = [{"high": 10.2, "low": 9.8, "close": 10.0} for _ in range(20)]
+    calm = classify_volatility_regime(quiet)
+    assert calm.regime == GammaRegime.MEAN_REVERT
+    assert calm.reason == "atr_compressed_mean_revert"
+
+    expanding = [{"high": 11.0, "low": 10.0, "close": 10.5} for _ in range(14)]
+    expanding.extend({"high": 12.0, "low": 10.5, "close": 11.5} for _ in range(6))
+    hot = classify_volatility_regime(expanding)
+    assert hot.regime == GammaRegime.MOMENTUM
+
+    chaos = [{"high": 11.0, "low": 10.0, "close": 10.5} for _ in range(14)]
+    chaos.extend({"high": 16.0, "low": 10.0, "close": 15.0} for _ in range(6))
+    wild = classify_volatility_regime(chaos)
+    assert wild.regime == GammaRegime.UNKNOWN
+    assert wild.reason == "atr_chaos_stand_aside"
+    assert classify_volatility_regime(quiet[:5]).reason == "atr_insufficient_bars"
+
+    levels = _levels()
+    long_df = pd.DataFrame(
+        [
+            {"close": 101.0, "low": 100.5, "high": 102.0, **levels},
+            {"close": 100.5, "low": 99.0, "high": 101.0, **levels},
+        ]
+    )
+    assert evaluate_entry_signal(long_df, "MEAN_REVERT")["reason"] == "VAL_REJECTION"
+
+
 def test_schema_is_v2() -> None:
     from main_engine import SCHEMA_PATH, load_state_schema
 
@@ -194,6 +224,7 @@ def test_virtue_engine_v2_bracket() -> None:
 
 
 def main() -> None:
+    test_atr_regime_without_gamma_flip()
     test_schema_is_v2()
     test_no_unmonitored_hold()
     test_gamma_flip_regime()

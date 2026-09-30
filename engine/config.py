@@ -618,6 +618,8 @@ def bracket_engine_enabled() -> bool:
 
 
 def max_tactical_trades_per_day() -> int:
+    if bracket_engine_enabled():
+        return max(1, int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY))
     if virtue_is_swing():
         return max(1, int(VIRTUE_SWING_MAX_TRADES_PER_DAY))
     return max(1, int(VIRTUE_MAX_TACTICAL_TRADES_PER_DAY))

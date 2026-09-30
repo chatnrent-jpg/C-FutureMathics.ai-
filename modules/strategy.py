@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Sequence
 from zoneinfo import ZoneInfo
 
@@ -137,6 +137,33 @@ def scale_value_area(area: ValueArea, *, spy_reference: float, mes_price: float)
     return scaled if scaled.valid() else None
 
 
+def drop_forming_bar(
+    bars: Sequence[dict],
+    *,
+    minutes: int = 15,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Drop the current unfinished bar so a live wick cannot look like a closed rejection."""
+    rows = [row for row in bars if isinstance(row, dict)]
+    if not rows:
+        return []
+    raw = str(rows[-1].get("timestamp") or rows[-1].get("t") or "").strip()
+    if not raw:
+        return rows
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return rows
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ET)
+    clock = now or datetime.now(ET)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=ET)
+    if ts.astimezone(ET) + timedelta(minutes=int(minutes)) > clock.astimezone(ET):
+        return rows[:-1]
+    return rows
+
+
 def session_bars(bars: Sequence[dict], session_date: str) -> list[dict]:
     """Bars whose ET date equals session_date."""
     want = str(session_date)
@@ -211,7 +238,7 @@ def evaluate_entry_signal(df: pd.DataFrame, gamma_regime: str) -> dict:
     poc = latest["poc"]  # Point of Control
 
     # Rule 1: Positive Gamma -> Mean reversion at Value Area extremes
-    if gamma_regime == "POSITIVE_GAMMA":
+    if gamma_regime in {"POSITIVE_GAMMA", "MEAN_REVERT"}:
         # Long entry: Price dipped below VAL and rejected back inside
         if low <= val and close > val:
             logger.info(f"Signal Generated: Long bounce off VAL ({val})")
@@ -223,7 +250,7 @@ def evaluate_entry_signal(df: pd.DataFrame, gamma_regime: str) -> dict:
             return {"action": "SELL", "order_type": "LIMIT", "price": vah, "reason": "VAH_REJECTION"}
 
     # Rule 2: Negative Gamma -> Breakout / POC continuation
-    elif gamma_regime == "NEGATIVE_GAMMA":
+    elif gamma_regime in {"NEGATIVE_GAMMA", "MOMENTUM"}:
         if prev["close"] < poc and close > poc:
             logger.info(f"Signal Generated: POC Momentum Breakout Long ({poc})")
             return {"action": "BUY", "order_type": "MARKET", "reason": "POC_MOMENTUM"}
