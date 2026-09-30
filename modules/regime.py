@@ -105,7 +105,7 @@ def _true_ranges(bars: list) -> list[float]:
 
 
 def classify_volatility_regime(bars: list) -> GammaSnapshot:
-    """Mean-revert, momentum, or stand aside from 15-minute true range. No invented flip."""
+    """Mean-revert, momentum, or stand aside from completed daily true range. No invented flip."""
     ranges = _true_ranges(bars)
     if len(ranges) < ATR_LONG_BARS:
         return GammaSnapshot(GammaRegime.UNKNOWN, None, None, None, "atr_insufficient_bars")

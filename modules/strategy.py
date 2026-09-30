@@ -1,9 +1,8 @@
 """
-Previous-day value area entries on 15-minute bars.
+Completed daily-bar entries.
 
-Positive gamma: long a VAL rejection, short a VAH rejection.
-Negative gamma: long only when price crosses up through the POC.
-A short frame or an unknown regime holds.
+The signal is yesterday's daily bar against the prior day's low, midpoint, and high.
+Today's unfinished session does not open a trade.
 """
 
 from __future__ import annotations
@@ -164,6 +163,36 @@ def drop_forming_bar(
     return rows
 
 
+def bar_et_date(timestamp: object) -> str:
+    """ET calendar date for a bar timestamp."""
+    return _bar_et_date(timestamp)
+
+
+def completed_daily_bars(bars: Sequence[dict], today_et: str) -> list[dict]:
+    """Completed daily bars only. Today's unfinished session is excluded."""
+    out: list[dict] = []
+    for row in bars:
+        if not isinstance(row, dict):
+            continue
+        day = _bar_et_date(row.get("timestamp") or row.get("t"))
+        if day and day < str(today_et):
+            out.append(row)
+    return out
+
+
+def daily_reference_area(bar: dict, session_date: str) -> ValueArea | None:
+    """Prior completed day: low, midpoint, high. No intraday profile."""
+    try:
+        high = float(bar["high"])
+        low = float(bar["low"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if high <= low or low <= 0:
+        return None
+    area = ValueArea(str(session_date), round((high + low) / 2.0, 2), round(low, 2), round(high, 2))
+    return area if area.valid() else None
+
+
 def session_bars(bars: Sequence[dict], session_date: str) -> list[dict]:
     """Bars whose ET date equals session_date."""
     want = str(session_date)
@@ -201,7 +230,7 @@ def scale_ohlc_bars(bars: Sequence[dict], *, spy_reference: float, mes_price: fl
 
 
 def entry_bars_frame(bars: Sequence[dict], area: ValueArea) -> pd.DataFrame:
-    """15-minute rows with yesterday's VAL, VAH, and POC on each bar."""
+    """Completed daily rows with the prior day's low, midpoint, and high."""
     rows: list[dict[str, float]] = []
     for row in bars:
         try:
@@ -222,7 +251,7 @@ def entry_bars_frame(bars: Sequence[dict], area: ValueArea) -> pd.DataFrame:
 
 def evaluate_entry_signal(df: pd.DataFrame, gamma_regime: str) -> dict:
     """
-    Evaluates 15-minute price action against Previous Day Value Area levels.
+    Evaluates the last completed daily bar against the prior day's range.
     """
     if df.empty or len(df) < 2:
         return {"action": "HOLD", "reason": "Insufficient data"}

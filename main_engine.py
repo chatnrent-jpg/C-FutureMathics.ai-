@@ -22,14 +22,13 @@ from modules.strategy import (
     BracketSignal,
     ValueArea,
     bracket_from_entry,
+    completed_daily_bars,
+    daily_reference_area,
+    bar_et_date,
     entry_bars_frame,
     evaluate_entry_signal,
-    previous_session_bars,
     scale_ohlc_bars,
     scale_value_area,
-    session_bars,
-    drop_forming_bar,
-    value_area_from_bars,
 )
 from strategy import SignalAction
 
@@ -97,8 +96,12 @@ def must_flatten(*, session_monitored: bool, price_fresh: bool, has_position: bo
 
 
 async def resolve_bracket_signal(session: Any, price: float) -> BracketSignal:
-    """Value area plus a real flip when one exists. Otherwise 15-minute ATR."""
-    area, today_bars, history = await _entry_context(session, price)
+    """One signal from completed daily bars. Intraday bars do not open a trade."""
+    if int(getattr(session, "trades_today", 0) or 0) >= 1:
+        session.bracket_gamma = "DAILY"
+        session.bracket_gamma_reason = "daily_trade_already_taken"
+        return BracketSignal("FLAT", "daily_trade_already_taken")
+    area, signal_bars, history = await _entry_context(session, price)
     gamma = read_gamma_file(
         GAMMA_PATH,
         now=datetime.now(timezone.utc),
@@ -111,12 +114,12 @@ async def resolve_bracket_signal(session: Any, price: float) -> BracketSignal:
     if gamma.regime == GammaRegime.UNKNOWN:
         return BracketSignal("FLAT", gamma.reason)
     if area is None:
-        return BracketSignal("FLAT", "value_area_unavailable")
+        return BracketSignal("FLAT", "daily_range_unavailable")
     session.bracket_val = area.val
     session.bracket_poc = area.poc
     session.bracket_vah = area.vah
     session.bracket_value_date = area.session_date
-    signal = bracket_from_entry(evaluate_entry_signal(entry_bars_frame(today_bars, area), gamma.regime.value))
+    signal = bracket_from_entry(evaluate_entry_signal(entry_bars_frame(signal_bars, area), gamma.regime.value))
     session.bracket_order_type = signal.order_type
     session.bracket_limit = signal.limit_price
     return signal
@@ -145,34 +148,34 @@ async def overlay_bracket_decision(session: Any, decision: Any, price: float) ->
 
 
 async def _entry_context(session: Any, mes_price: float) -> tuple[ValueArea | None, list[dict], list[dict]]:
-    """Yesterday's value area, today's 15-minute bars, and the raw history used for ATR."""
+    """Completed daily bars only. Today's session cannot create a new signal."""
     today = datetime.now(ET).strftime("%Y-%m-%d")
     feed = getattr(getattr(session, "broker", None), "data", None)
     if feed is None or not hasattr(feed, "fetch_spy_bars"):
         return None, [], []
     try:
-        bars = await feed.fetch_spy_bars(timeframe="15Min", limit=500, lookback_days=5, session_rth=False)
+        bars = await feed.fetch_spy_bars(timeframe="1Day", limit=80, lookback_days=120, session_rth=False)
     except Exception:
         return None, [], []
-    rows = drop_forming_bar(list(bars or []))
-    if not rows:
-        return None, [], []
+    rows = completed_daily_bars(list(bars or []), today)
+    if len(rows) < 2:
+        return None, [], rows
     try:
         spy_ref = float(rows[-1].get("close") or 0)
     except (TypeError, ValueError):
         return None, [], rows
-    day, prev_rows = previous_session_bars(rows, today)
-    if not prev_rows:
-        return None, [], rows
-    spy_area = value_area_from_bars(prev_rows, session_date=day, bin_size=0.25)
+    reference = rows[-2]
+    signal_day = rows[-1]
+    ref_day = bar_et_date(reference.get("timestamp") or reference.get("t"))
+    spy_area = daily_reference_area(reference, ref_day or "prior-day")
     if spy_area is None:
         return None, [], rows
     scaled = scale_value_area(spy_area, spy_reference=spy_ref, mes_price=float(mes_price))
     if scaled is None:
         return None, [], rows
     session._bracket_area = scaled
-    today_rows = scale_ohlc_bars(session_bars(rows, today), spy_reference=spy_ref, mes_price=float(mes_price))
-    return scaled, today_rows, rows
+    scaled_pair = scale_ohlc_bars([reference, signal_day], spy_reference=spy_ref, mes_price=float(mes_price))
+    return scaled, scaled_pair, rows
 
 
 def _positive_price(value: object) -> float | None:

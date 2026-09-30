@@ -44,7 +44,22 @@ def test_atr_regime_without_gamma_flip() -> None:
     assert evaluate_entry_signal(long_df, "MEAN_REVERT")["reason"] == "VAL_REJECTION"
 
 
-def test_schema_is_v2() -> None:
+def test_completed_daily_bars_skip_today() -> None:
+    from modules.strategy import completed_daily_bars, daily_reference_area
+
+    bars = [
+        {"high": 110, "low": 100, "close": 108, "timestamp": "2026-09-28T04:00:00+00:00"},
+        {"high": 112, "low": 104, "close": 106, "timestamp": "2026-09-29T04:00:00+00:00"},
+        {"high": 120, "low": 90, "close": 115, "timestamp": "2026-09-30T14:00:00+00:00"},
+    ]
+    done = completed_daily_bars(bars, "2026-09-30")
+    assert len(done) == 2
+    assert done[-1]["close"] == 106
+    area = daily_reference_area(done[-2], "2026-09-28")
+    assert area is not None
+    assert area.val == 100
+    assert area.vah == 110
+    assert area.poc == 105
     from main_engine import SCHEMA_PATH, load_state_schema
 
     raw = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -225,7 +240,7 @@ def test_virtue_engine_v2_bracket() -> None:
 
 def main() -> None:
     test_atr_regime_without_gamma_flip()
-    test_schema_is_v2()
+    test_completed_daily_bars_skip_today()
     test_no_unmonitored_hold()
     test_gamma_flip_regime()
     test_stale_gamma_file()
